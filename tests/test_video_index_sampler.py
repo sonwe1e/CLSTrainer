@@ -49,6 +49,16 @@ class VideoIndexSamplerTests(unittest.TestCase):
         requests = [request for batch in sampler for request in batch]
         counts = Counter(request.delta for request in requests)
         self.assertAlmostEqual(counts[2] / len(requests), 0.70, delta=0.03)
+        self.assertEqual(
+            sum(sampler.last_epoch_game_label_delta_counts.values()),
+            len(requests),
+        )
+        self.assertTrue(
+            all(
+                len(key) == 3
+                for key in sampler.last_epoch_game_label_delta_counts
+            )
+        )
 
     def test_resume_start_step_matches_uninterrupted_sequence(self) -> None:
         entries = videos()
@@ -91,4 +101,3 @@ class VideoIndexSamplerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

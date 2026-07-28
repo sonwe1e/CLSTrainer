@@ -105,6 +105,36 @@ def _seed_everything(seed: int) -> None:
 def validate_training_config(config: dict) -> None:
     data_cfg = config["data"]
     model_cfg = config["model"]
+    evaluation_cfg = config["evaluation"]
+    evaluation_amp_dtype = str(
+        evaluation_cfg.get(
+            "amp_dtype", config["device"].get("amp_dtype", "bfloat16")
+        )
+    )
+    if evaluation_amp_dtype not in {"float16", "bfloat16"}:
+        raise ValueError(
+            "evaluation.amp_dtype must be float16 or bfloat16"
+        )
+    selection_metric = evaluation_cfg.get(
+        "selection_metric", "global_f1_tau099"
+    )
+    supported_selection_metrics = {
+        "global_f1_tau099",
+        "macro_game_f1_tau099",
+        "worst_game_f1_tau099",
+        "composite",
+    }
+    if selection_metric not in supported_selection_metrics:
+        raise ValueError(
+            f"Unsupported evaluation.selection_metric: {selection_metric}"
+        )
+    if selection_metric == "composite" and sum(
+        float(value)
+        for value in evaluation_cfg.get("selection_weights", {}).values()
+    ) <= 0:
+        raise ValueError(
+            "Composite model selection requires positive selection weights"
+        )
     if not data_cfg.get("synthetic", False):
         factory = str(model_cfg.get("factory", ""))
         checkpoint_path = model_cfg.get("checkpoint_path")
@@ -126,6 +156,8 @@ def validate_training_config(config: dict) -> None:
                 f"Production checkpoint does not exist: {checkpoint_path}"
             )
         if data_cfg.get("backend", "png") == "packed_uint8":
+            if int(data_cfg.get("packed_max_open_shards", 16)) <= 0:
+                raise ValueError("data.packed_max_open_shards must be positive")
             for key in ("train_packed_index", "test_packed_index"):
                 packed_index = data_cfg.get(key)
                 if not packed_index or not Path(packed_index).is_file():
@@ -133,6 +165,26 @@ def validate_training_config(config: dict) -> None:
                         f"Packed backend requires existing data.{key}: "
                         f"{packed_index}"
                     )
+            for split in ("train", "test"):
+                packed_index = Path(data_cfg[f"{split}_packed_index"])
+                packed_video_index = data_cfg.get(
+                    f"{split}_packed_video_index"
+                ) or str(
+                    packed_index.with_name("packed_video_entries.parquet")
+                )
+                if not Path(packed_video_index).is_file():
+                    raise FileNotFoundError(
+                        "Packed backend requires the integer video index: "
+                        f"{packed_video_index}"
+                    )
+    if (
+        config.get("distributed", {}).get("enabled", False)
+        and not model_cfg.get("freeze_cls_batchnorm_stats", True)
+    ):
+        raise RuntimeError(
+            "Distributed training with trainable cls BatchNorm statistics "
+            "requires SyncBatchNorm; keep freeze_cls_batchnorm_stats=true."
+        )
 
 
 def _set_train_mode(model, model_config: dict) -> None:
@@ -263,13 +315,39 @@ def _make_dataloaders(
             require_content_hash=bool(
                 data_cfg.get("require_content_hash_audit", False)
             ),
+            require_unique_video_keys=bool(
+                data_cfg.get(
+                    "require_unique_video_keys_across_splits", False
+                )
+            ),
+            minimum_pairs_per_game_label_delta={
+                int(key): int(value)
+                for key, value in data_cfg.get(
+                    "minimum_pairs_per_game_label_delta", {}
+                ).items()
+            },
         )
     delta_probability = {
         int(key): float(value)
         for key, value in config["pair"]["train_delta_probability"].items()
     }
-    train_video_index = data_cfg.get("train_video_index")
-    test_video_index = data_cfg.get("test_video_index")
+    backend_name = data_cfg.get("backend", "png")
+    if backend_name == "packed_uint8":
+        train_video_index = data_cfg.get(
+            "train_packed_video_index"
+        ) or str(
+            Path(data_cfg["train_packed_index"]).with_name(
+                "packed_video_entries.parquet"
+            )
+        )
+        test_video_index = data_cfg.get("test_packed_video_index") or str(
+            Path(data_cfg["test_packed_index"]).with_name(
+                "packed_video_entries.parquet"
+            )
+        )
+    else:
+        train_video_index = data_cfg.get("train_video_index")
+        test_video_index = data_cfg.get("test_video_index")
     train_videos = read_video_entries_parquet(
         train_video_index
         if train_video_index and Path(train_video_index).is_file()
@@ -286,7 +364,6 @@ def _make_dataloaders(
     transform = None
     if config.get("augmentation", {}).get("enabled", True):
         transform = ConsistentPairAugment(config["augmentation"])
-    backend_name = data_cfg.get("backend", "png")
     if backend_name == "png":
         train_decoder = None
         test_decoder = None
@@ -298,12 +375,18 @@ def _make_dataloaders(
             channels=3,
             height=int(data_cfg["height"]),
             width=int(data_cfg["width"]),
+            max_open_shards=int(
+                data_cfg.get("packed_max_open_shards", 16)
+            ),
         )
         test_decoder = PackedUint8Backend(
             data_cfg["test_packed_index"],
             channels=3,
             height=int(data_cfg["height"]),
             width=int(data_cfg["width"]),
+            max_open_shards=int(
+                data_cfg.get("packed_max_open_shards", 16)
+            ),
         )
     else:
         raise ValueError(f"Unsupported data backend: {backend_name}")
@@ -483,6 +566,83 @@ def _save_all_ranks(
         )
 
 
+def _selection_score(metrics: dict, evaluation_config: dict) -> tuple[float, bool]:
+    metric_name = evaluation_config.get(
+        "selection_metric", "global_f1_tau099"
+    )
+    minimum_worst = evaluation_config.get("minimum_worst_game_f1")
+    eligible = (
+        minimum_worst is None
+        or float(metrics.get("worst_game_f1_tau099", 0.0))
+        >= float(minimum_worst)
+    )
+    if metric_name == "composite":
+        weights = evaluation_config.get("selection_weights", {})
+        components = {
+            "global_f1": float(metrics.get("global_f1_tau099", 0.0)),
+            "macro_game_f1": float(
+                metrics.get("macro_game_f1_tau099", 0.0)
+            ),
+            "worst_game_f1": float(
+                metrics.get("worst_game_f1_tau099", 0.0)
+            ),
+        }
+        total_weight = sum(float(weights.get(key, 0.0)) for key in components)
+        if total_weight <= 0:
+            raise ValueError(
+                "evaluation.selection_weights must contain a positive weight"
+            )
+        score = sum(
+            components[key] * float(weights.get(key, 0.0))
+            for key in components
+        ) / total_weight
+    else:
+        if metric_name not in metrics:
+            raise KeyError(
+                f"Selection metric is absent from evaluation output: {metric_name}"
+            )
+        score = float(metrics[metric_name])
+    return score, eligible
+
+
+def _annotate_selection(metrics: dict, evaluation_config: dict) -> dict:
+    score, eligible = _selection_score(metrics, evaluation_config)
+    metrics["selection_metric"] = evaluation_config.get(
+        "selection_metric", "global_f1_tau099"
+    )
+    metrics["selection_score"] = score
+    metrics["selection_eligible"] = eligible
+    metrics["minimum_worst_game_f1"] = evaluation_config.get(
+        "minimum_worst_game_f1"
+    )
+    return metrics
+
+
+def _is_better_model(
+    candidate: dict, incumbent: dict, evaluation_config: dict
+) -> bool:
+    candidate_score, candidate_eligible = _selection_score(
+        candidate, evaluation_config
+    )
+    if not candidate_eligible:
+        return False
+    if not incumbent:
+        return True
+    incumbent_score, incumbent_eligible = _selection_score(
+        incumbent, evaluation_config
+    )
+    return not incumbent_eligible or candidate_score > incumbent_score
+
+
+def _save_best_enabled(checkpoint_config: dict) -> bool:
+    return bool(
+        checkpoint_config.get(
+            "save_best_selection",
+            checkpoint_config.get("save_best_test_f1", True),
+        )
+    )
+
+
 def _run_evaluation(
     *,
     kind: str,
@@ -516,6 +676,17 @@ def _run_evaluation(
         quick_error_limit=int(
             config["evaluation"].get("quick_save_error_limit", 200)
         ),
+        amp=bool(
+            config["evaluation"].get(
+                "amp", config["device"].get("amp", False)
+            )
+        ),
+        amp_dtype=str(
+            config["evaluation"].get(
+                "amp_dtype",
+                config["device"].get("amp_dtype", "bfloat16"),
+            )
+        ),
     )
     distributed_barrier()
     if rank == 0:
@@ -525,8 +696,22 @@ def _run_evaluation(
                 "evaluation_kind": kind,
                 "evaluation_role": "observed_dev_test",
                 "checkpoint_step": global_step,
+                "evaluation_amp": bool(
+                    config["evaluation"].get(
+                        "amp", config["device"].get("amp", False)
+                    )
+                ),
+                "evaluation_amp_dtype": str(
+                    config["evaluation"].get(
+                        "amp_dtype",
+                        config["device"].get(
+                            "amp_dtype", "bfloat16"
+                        ),
+                    )
+                ),
             }
         )
+        _annotate_selection(metrics, config["evaluation"])
         write_evaluation_report(
             report_dir,
             metrics,
@@ -569,11 +754,6 @@ def run_training(config: dict[str, Any]) -> dict:
                     report,
                     trainable_name_contains=config["model"].get(
                         "trainable_name_contains", "cls"
-                    ),
-                    minimum_non_cls_coverage=float(
-                        config["model"].get(
-                            "minimum_non_cls_coverage", 0.99
-                        )
                     ),
                 )
             else:
@@ -833,7 +1013,9 @@ def run_training(config: dict[str, Any]) -> dict:
                     evaluation_state["full_test_count"] += 1
                     metrics = _broadcast_object(result.metrics, rank)
                     evaluation_state["last_full_metrics"] = metrics
-                    is_best = metrics.get("f1", -1.0) > best_metrics.get("f1", -1.0)
+                    is_best = _is_better_model(
+                        metrics, best_metrics, config["evaluation"]
+                    )
                     if is_best:
                         best_metrics = metrics
                         evaluation_state["best_observed_dev_test_metrics"] = metrics
@@ -845,9 +1027,7 @@ def run_training(config: dict[str, Any]) -> dict:
                 save_last_due = bool(
                     save_every and global_step % save_every == 0
                 )
-                if is_best and config["checkpoint"].get(
-                    "save_best_test_f1", True
-                ):
+                if is_best and _save_best_enabled(config["checkpoint"]):
                     _save_all_ranks(
                         output_dir=output_dir,
                         tag="last",
@@ -870,7 +1050,7 @@ def run_training(config: dict[str, Any]) -> dict:
                         clone_checkpoint_pair(
                             output_dir / "checkpoints",
                             "last",
-                            "best_observed_dev_test_f1_tau099",
+                            "best_observed_dev_test_selection",
                         )
                 elif save_last_due:
                     _save_all_ranks(
@@ -910,6 +1090,25 @@ def run_training(config: dict[str, Any]) -> dict:
                             "epoch": epoch,
                             "counts": dict(delta_counts),
                             "distribution": distribution,
+                            "by_game_label_delta": [
+                                {
+                                    "game": game,
+                                    "label": label,
+                                    "delta": delta,
+                                    "count": count,
+                                }
+                                for (
+                                    game,
+                                    label,
+                                    delta,
+                                ), count in sorted(
+                                    getattr(
+                                        loaders.sampler,
+                                        "last_epoch_game_label_delta_counts",
+                                        {},
+                                    ).items()
+                                )
+                            ],
                         }
                     )
                     if rank == 0:
@@ -943,7 +1142,9 @@ def run_training(config: dict[str, Any]) -> dict:
                     result.metrics, rank
                 )
                 evaluation_state["last_full_metrics"] = final_metrics
-                if final_metrics.get("f1", -1.0) > best_metrics.get("f1", -1.0):
+                if _is_better_model(
+                    final_metrics, best_metrics, config["evaluation"]
+                ):
                     best_metrics = final_metrics
                     evaluation_state["best_observed_dev_test_metrics"] = final_metrics
                     final_is_best = True
@@ -969,13 +1170,13 @@ def run_training(config: dict[str, Any]) -> dict:
         )
         if (
             final_is_best
-            and config["checkpoint"].get("save_best_test_f1", True)
+            and _save_best_enabled(config["checkpoint"])
             and rank == 0
         ):
             clone_checkpoint_pair(
                 output_dir / "checkpoints",
                 "last",
-                "best_observed_dev_test_f1_tau099",
+                "best_observed_dev_test_selection",
             )
         distributed_barrier()
         if rank == 0:
@@ -991,6 +1192,21 @@ def run_training(config: dict[str, Any]) -> dict:
                     "full": evaluation_state["full_test_count"],
                 },
                 "data_pipeline": loaders.data_summary,
+                "train_sampling_snapshot": [
+                    {
+                        "game": game,
+                        "label": label,
+                        "delta": delta,
+                        "count": count,
+                    }
+                    for (game, label, delta), count in sorted(
+                        getattr(
+                            loaders.sampler,
+                            "last_epoch_game_label_delta_counts",
+                            {},
+                        ).items()
+                    )
+                ],
             }
             (output_dir / "training_summary.json").write_text(
                 json.dumps(summary_payload, ensure_ascii=False, indent=2),

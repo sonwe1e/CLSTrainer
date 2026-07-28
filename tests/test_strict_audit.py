@@ -12,6 +12,11 @@ def valid_audit() -> dict:
         "parse_or_file_issues": [],
         "games_missing_labels": {},
         "valid_pairs": {"1": 1, "2": 1, "3": 1},
+        "valid_pairs_by_game_label_delta": [
+            {"game": "game_A", "label": label, "delta": delta, "count": 1}
+            for label in (0, 1)
+            for delta in (1, 2, 3)
+        ],
     }
     return {"splits": {"train": dict(split), "test": dict(split)}}
 
@@ -28,17 +33,38 @@ class StrictAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Strict dataset audit failed"):
             validate_audit(audit)
 
-    def test_rejects_split_leakage_and_missing_hash_audit(self) -> None:
+    def test_video_key_overlap_is_optional_but_hash_leakage_is_fatal(self) -> None:
         audit = valid_audit()
         audit["leakage"] = {
             "video_keys_across_splits": [
                 {"game": "game_A", "label": 1, "video_id": "01"}
             ],
-            "content_hashes_across_splits": [{"sha256": "abc"}],
-            "content_hash_check_enabled": False,
+            "content_hashes_across_splits": [],
+            "content_hash_check_enabled": True,
         }
+        validate_audit(audit, require_content_hash=True)
         with self.assertRaisesRegex(RuntimeError, "share video keys"):
+            validate_audit(
+                audit,
+                require_content_hash=True,
+                require_unique_video_keys=True,
+            )
+        audit["leakage"]["content_hashes_across_splits"] = [
+            {"sha256": "abc"}
+        ]
+        with self.assertRaisesRegex(RuntimeError, "identical file hashes"):
             validate_audit(audit, require_content_hash=True)
+
+    def test_rejects_insufficient_game_label_delta_coverage(self) -> None:
+        audit = valid_audit()
+        audit["splits"]["train"][
+            "valid_pairs_by_game_label_delta"
+        ][4]["count"] = 0
+        with self.assertRaisesRegex(RuntimeError, "label=1/delta=2"):
+            validate_audit(
+                audit,
+                minimum_pairs_per_game_label_delta={2: 1},
+            )
 
 
 if __name__ == "__main__":

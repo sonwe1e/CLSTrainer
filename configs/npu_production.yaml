@@ -12,6 +12,8 @@ data:
   synthetic: false
   strict_audit: true
   require_content_hash_audit: true
+  require_unique_video_keys_across_splits: false
+  minimum_pairs_per_game_label_delta: {2: 1}
   audit_path: indexes/audit.json
   train_video_index: indexes/train_video_entries.parquet
   test_video_index: indexes/test_video_entries.parquet
@@ -20,6 +22,9 @@ data:
   backend: png
   train_packed_index: null
   test_packed_index: null
+  train_packed_video_index: null
+  test_packed_video_index: null
+  packed_max_open_shards: 16
   width: 208
   height: 448
 
@@ -41,6 +46,8 @@ augmentation:
     translate: [0.02, 0.02]
     scale: [0.98, 1.02]
     shear: [-1.0, 1.0]
+    interpolation: bilinear
+    fill: 0
   color_jitter:
     enabled: true
     probability: 0.80
@@ -63,7 +70,7 @@ model:
   freeze_backbone_batchnorm_stats: true
   freeze_cls_batchnorm_stats: true
   require_pretrained_backbone: true
-  minimum_non_cls_coverage: 0.99
+  require_complete_non_cls_state: true
 
 loss:
   cross_entropy_weight: 1.0
@@ -103,6 +110,8 @@ dataloader:
 
 evaluation:
   threshold: 0.99
+  amp: true
+  amp_dtype: bfloat16
   quick_test_every_steps: 1000
   quick_test_pairs_per_video: 128
   full_test_every_steps: 5000
@@ -111,9 +120,15 @@ evaluation:
   auc_histogram_bins: 4096
   quick_save_error_limit: 200
   html_max_errors_per_group: 200
+  selection_metric: composite
+  selection_weights:
+    global_f1: 0.40
+    macro_game_f1: 0.40
+    worst_game_f1: 0.20
+  minimum_worst_game_f1: 0.0
 
 checkpoint:
   save_last_every_steps: 1000
-  save_best_test_f1: true
+  save_best_selection: true
   periodic_state_mode: trainable_only
   full_model_every_steps: 5000

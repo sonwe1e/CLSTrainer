@@ -138,6 +138,20 @@ def make_audit(
     for split, frames in frames_by_split.items():
         dimensions = Counter((f.width, f.height, f.channels) for f in frames)
         videos = summarize_videos(frames)
+        pair_grid = []
+        for video in videos:
+            for delta in (1, 2, 3):
+                pair_grid.append(
+                    (
+                        video.game,
+                        video.label,
+                        delta,
+                        getattr(video, f"valid_pair_count_delta{delta}"),
+                    )
+                )
+        pair_grid_counts = Counter()
+        for game, label, delta, count in pair_grid:
+            pair_grid_counts[(game, label, delta)] += count
         split_reports[split] = {
             "frame_count": len(frames),
             "video_count": len(videos),
@@ -163,6 +177,17 @@ def make_audit(
                 )
                 for delta in (1, 2, 3)
             },
+            "valid_pairs_by_game_label_delta": [
+                {
+                    "game": game,
+                    "label": label,
+                    "delta": delta,
+                    "count": count,
+                }
+                for (game, label, delta), count in sorted(
+                    pair_grid_counts.items()
+                )
+            ],
         }
     train_frames = frames_by_split.get("train", [])
     test_frames = frames_by_split.get("test", [])
@@ -200,6 +225,9 @@ def make_audit(
             ],
             "content_hashes_across_splits": duplicate_hashes,
             "content_hash_check_enabled": bool(train_hashes),
+            "video_key_check_note": (
+                "Informational unless video IDs are declared globally unique"
+            ),
         },
     }
 
@@ -209,6 +237,8 @@ def validate_audit(
     *,
     require_test_delta: int = 2,
     require_content_hash: bool = False,
+    require_unique_video_keys: bool = False,
+    minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
 ) -> None:
     problems: list[str] = []
     for split in ("train", "test"):
@@ -228,13 +258,41 @@ def validate_audit(
             problems.append(f"{split} games missing labels: {report['games_missing_labels']}")
         if report.get("frame_count", 0) == 0:
             problems.append(f"{split} has no valid frames")
+        requirements = minimum_pairs_per_game_label_delta or {}
+        if requirements:
+            grid = {
+                (str(row["game"]), int(row["label"]), int(row["delta"])): int(
+                    row["count"]
+                )
+                for row in report.get(
+                    "valid_pairs_by_game_label_delta", []
+                )
+            }
+            games = {
+                str(row["game"])
+                for row in report.get(
+                    "valid_pairs_by_game_label_delta", []
+                )
+            }
+            for game in sorted(games):
+                for label in (0, 1):
+                    for delta, minimum in sorted(requirements.items()):
+                        actual = grid.get((game, label, int(delta)), 0)
+                        if actual < int(minimum):
+                            problems.append(
+                                f"{split} {game}/label={label}/delta={delta} "
+                                f"has {actual} pairs, requires {minimum}"
+                            )
     test_report = audit.get("splits", {}).get("test", {})
     if int(test_report.get("valid_pairs", {}).get(str(require_test_delta), 0)) <= 0:
         problems.append(f"test has no legal delta={require_test_delta} pairs")
     leakage = audit.get("leakage", {})
     if require_content_hash and not leakage.get("content_hash_check_enabled", False):
         problems.append("content-hash leakage check was not performed")
-    if leakage.get("video_keys_across_splits"):
+    if (
+        require_unique_video_keys
+        and leakage.get("video_keys_across_splits")
+    ):
         problems.append(
             "train/test share video keys: "
             f"{leakage['video_keys_across_splits'][:20]}"
@@ -253,6 +311,8 @@ def validate_audit_file(
     *,
     require_test_delta: int = 2,
     require_content_hash: bool = False,
+    require_unique_video_keys: bool = False,
+    minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
 ) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -264,6 +324,8 @@ def validate_audit_file(
         audit,
         require_test_delta=require_test_delta,
         require_content_hash=require_content_hash,
+        require_unique_video_keys=require_unique_video_keys,
+        minimum_pairs_per_game_label_delta=minimum_pairs_per_game_label_delta,
     )
     return audit
 

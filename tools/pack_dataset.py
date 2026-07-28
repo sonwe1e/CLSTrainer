@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -26,7 +27,21 @@ def main() -> None:
         expected_width=args.width,
         expected_height=args.height,
     )
-    print(index_path)
+    print(
+        json.dumps(
+            {
+                "packed_frame_index": str(index_path),
+                "packed_video_index": str(
+                    index_path.with_name("packed_video_entries.parquet")
+                ),
+                "manifest": str(
+                    index_path.with_name("packed_manifest.json")
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

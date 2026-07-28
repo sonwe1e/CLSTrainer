@@ -52,7 +52,13 @@ class EvaluationScheduleTests(unittest.TestCase):
             self.assertTrue(
                 (
                     checkpoints
-                    / "checkpoint_best_observed_dev_test_f1_tau099.pth"
+                    / "checkpoint_best_observed_dev_test_selection.pth"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    checkpoints
+                    / "model_best_observed_dev_test_selection_full.pth"
                 ).is_file()
             )
 

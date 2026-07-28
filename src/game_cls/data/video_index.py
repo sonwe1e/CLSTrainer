@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -15,10 +15,29 @@ class VideoEntry:
     label: int
     video_id: str
     frame_ids: np.ndarray
-    frame_paths: tuple[str, ...]
     valid_start_positions: dict[int, np.ndarray]
+    frame_paths: tuple[str, ...] = ()
+    frame_locations: np.ndarray | None = None
+    video_directory: str = ""
 
-    def pair_paths(self, delta: int, start_position: int) -> tuple[int, int, str, str]:
+    def _reference(self, position: int) -> str | int:
+        if self.frame_locations is not None:
+            return int(self.frame_locations[position])
+        if self.frame_paths:
+            return self.frame_paths[position]
+        if self.video_directory:
+            frame_id = int(self.frame_ids[position])
+            return str(
+                Path(self.video_directory)
+                / f"{self.video_id}{frame_id:05d}.png"
+            )
+        raise RuntimeError(
+            f"Video entry has no frame references: {self.game}/{self.video_id}"
+        )
+
+    def pair_paths(
+        self, delta: int, start_position: int
+    ) -> tuple[int, int, str | int, str | int]:
         frame0_id = int(self.frame_ids[start_position])
         frame1_id = frame0_id + delta
         target = int(np.searchsorted(self.frame_ids, frame1_id))
@@ -30,8 +49,8 @@ class VideoEntry:
         return (
             frame0_id,
             frame1_id,
-            self.frame_paths[start_position],
-            self.frame_paths[target],
+            self._reference(start_position),
+            self._reference(target),
         )
 
 
@@ -45,7 +64,20 @@ def build_video_entries(
     for (game, label, video_id), group in sorted(grouped.items()):
         ordered = sorted(group, key=lambda item: item.frame_id)
         frame_ids = np.asarray([item.frame_id for item in ordered], dtype=np.int32)
-        frame_paths = tuple(item.path for item in ordered)
+        expected_names = [
+            f"{video_id}{int(item.frame_id):05d}.png" for item in ordered
+        ]
+        parents = {str(Path(item.path).parent) for item in ordered}
+        compact_paths = len(parents) == 1 and all(
+            Path(item.path).name == expected
+            for item, expected in zip(ordered, expected_names)
+        )
+        frame_paths = (
+            ()
+            if compact_paths
+            else tuple(item.path for item in ordered)
+        )
+        video_directory = next(iter(parents)) if compact_paths else ""
         id_set = set(frame_ids.tolist())
         valid = {
             int(delta): np.asarray(
@@ -64,8 +96,9 @@ def build_video_entries(
                 label=label,
                 video_id=video_id,
                 frame_ids=frame_ids,
-                frame_paths=frame_paths,
                 valid_start_positions=valid,
+                frame_paths=frame_paths,
+                video_directory=video_directory,
             )
         )
     return entries
@@ -96,8 +129,16 @@ def read_video_entries_parquet(
                         label=int(row["label"]),
                         video_id=row["video_id"],
                         frame_ids=np.asarray(row["frame_ids"], dtype=np.int32),
-                        frame_paths=tuple(row["frame_paths"]),
                         valid_start_positions=valid,
+                        frame_paths=tuple(row.get("frame_paths") or ()),
+                        frame_locations=(
+                            np.asarray(
+                                row["frame_locations"], dtype=np.int64
+                            )
+                            if row.get("frame_locations") is not None
+                            else None
+                        ),
+                        video_directory=row.get("video_directory") or "",
                     )
                 )
         return entries
@@ -139,7 +180,15 @@ def write_video_entries_parquet(
             "label": entry.label,
             "video_id": entry.video_id,
             "frame_ids": entry.frame_ids.tolist(),
-            "frame_paths": list(entry.frame_paths),
+            "frame_paths": (
+                list(entry.frame_paths) if entry.frame_paths else None
+            ),
+            "frame_locations": (
+                entry.frame_locations.tolist()
+                if entry.frame_locations is not None
+                else None
+            ),
+            "video_directory": entry.video_directory or None,
         }
         for delta in (1, 2, 3):
             row[f"valid_starts_delta{delta}"] = entry.valid_start_positions.get(
@@ -159,6 +208,12 @@ def video_index_memory_bytes(entries: Iterable[VideoEntry]) -> int:
     return sum(
         entry.frame_ids.nbytes
         + sum(array.nbytes for array in entry.valid_start_positions.values())
+        + (
+            entry.frame_locations.nbytes
+            if entry.frame_locations is not None
+            else 0
+        )
         + sum(len(path.encode("utf-8")) for path in entry.frame_paths)
+        + len(entry.video_directory.encode("utf-8"))
         for entry in entries
     )

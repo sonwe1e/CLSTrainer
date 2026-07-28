@@ -17,7 +17,6 @@ def validate_production_load(
     report: LoadReport,
     *,
     trainable_name_contains: str = "cls",
-    minimum_non_cls_coverage: float = 0.99,
 ) -> float:
     state_keys = set(model.state_dict())
     non_cls_keys = {
@@ -35,9 +34,10 @@ def validate_production_load(
     coverage = (
         len(loaded_non_cls) / len(non_cls_keys) if non_cls_keys else 1.0
     )
-    if missing_non_cls or mismatch_non_cls or coverage < minimum_non_cls_coverage:
+    if missing_non_cls or mismatch_non_cls or coverage < 1.0:
         raise RuntimeError(
-            "Production checkpoint did not fully load the frozen backbone: "
+            "Production checkpoint must load 100% of the frozen backbone "
+            "parameters and buffers: "
             f"coverage={coverage:.2%}, "
             f"missing_non_cls={sorted(missing_non_cls)}, "
             f"shape_mismatch_non_cls={sorted(mismatch_non_cls)}"

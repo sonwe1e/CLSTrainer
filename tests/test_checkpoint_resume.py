@@ -35,8 +35,16 @@ class CheckpointTests(unittest.TestCase):
                 best_metrics={"f1": 0.5},
                 config={"test": True},
             )
-            self.assertTrue((Path(directory) / "model_last.pth").is_file())
+            model_path = Path(directory) / "model_last_full.pth"
+            self.assertTrue(model_path.is_file())
             self.assertTrue((Path(directory) / "checkpoint_last.pth").is_file())
+            model_payload = torch.load(
+                model_path, map_location="cpu", weights_only=False
+            )
+            self.assertEqual(model_payload["global_step"], 17)
+            self.assertEqual(
+                model_payload["artifact_role"], "full_model_snapshot"
+            )
             with torch.no_grad():
                 model.weight.zero_()
             state = restore_training_checkpoint(
@@ -52,4 +60,3 @@ class CheckpointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

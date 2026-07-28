@@ -35,6 +35,8 @@ augmentation:
     translate: [0.02, 0.02]
     scale: [0.98, 1.02]
     shear: [-1.0, 1.0]
+    interpolation: bilinear
+    fill: 0
   color_jitter:
     enabled: true
     probability: 0.80
@@ -95,6 +97,8 @@ dataloader:
 
 evaluation:
   threshold: 0.99
+  amp: false
+  amp_dtype: bfloat16
   quick_test_every_steps: 50
   quick_test_pairs_per_video: 16
   full_test_every_steps: 100
@@ -104,4 +108,4 @@ evaluation:
 
 checkpoint:
   save_last_every_steps: 50
-  save_best_test_f1: true
+  save_best_selection: true

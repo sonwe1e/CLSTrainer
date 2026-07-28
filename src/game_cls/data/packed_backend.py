@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import json
 from pathlib import Path
 from typing import Any
 
 
 class PackedUint8Backend:
-    """Reads fixed-size CHW uint8 images from memory-mapped shard files."""
+    """Read fixed-size CHW uint8 frames by compact integer location."""
 
     def __init__(
         self,
@@ -14,57 +16,132 @@ class PackedUint8Backend:
         channels: int = 3,
         height: int = 448,
         width: int = 208,
+        max_open_shards: int = 16,
     ) -> None:
         try:
+            import numpy as np
             import pyarrow.parquet as pq
         except ImportError as exc:
-            raise RuntimeError("Packed backend requires pyarrow") from exc
+            raise RuntimeError(
+                "Packed backend requires NumPy and pyarrow"
+            ) from exc
+        if max_open_shards <= 0:
+            raise ValueError("max_open_shards must be positive")
+        self.index_path = Path(index_path).resolve()
         self.channels = channels
         self.height = height
         self.width = width
         self.image_bytes = channels * height * width
-        rows = pq.read_table(
-            index_path,
-            columns=["path", "shard_path", "offset", "length"],
-        ).to_pylist()
-        self.locations = {
-            row["path"]: (
-                row["shard_path"],
-                int(row["offset"]),
-                int(row["length"]),
+        self.max_open_shards = int(max_open_shards)
+        schema_names = set(pq.read_schema(self.index_path).names)
+        required = {"frame_index", "shard_id", "offset", "length"}
+        if not required.issubset(schema_names):
+            raise RuntimeError(
+                "Legacy path-keyed packed index is unsupported; repack the "
+                "dataset to create the integer-index format."
             )
-            for row in rows
-        }
-        self._memory_maps: dict[str, Any] = {}
+        table = pq.read_table(
+            self.index_path,
+            columns=["frame_index", "shard_id", "offset", "length"],
+        )
+        frame_indices = (
+            table["frame_index"].combine_chunks().to_numpy(zero_copy_only=False)
+        )
+        expected = np.arange(len(frame_indices), dtype=frame_indices.dtype)
+        if not np.array_equal(frame_indices, expected):
+            raise ValueError(
+                "Packed frame_index must be contiguous and start at zero"
+            )
+        self.shard_ids = (
+            table["shard_id"]
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int32, copy=False)
+        )
+        self.offsets = (
+            table["offset"]
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64, copy=False)
+        )
+        self.lengths = (
+            table["length"]
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64, copy=False)
+        )
+        manifest_path = self.index_path.with_name("packed_manifest.json")
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Packed shard manifest is missing: {manifest_path}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.shard_paths = tuple(
+            (manifest_path.parent / path).resolve()
+            for path in manifest["shards"]
+        )
+        manifest_shape = (
+            int(manifest["channels"]),
+            int(manifest["height"]),
+            int(manifest["width"]),
+        )
+        if manifest_shape != (channels, height, width):
+            raise ValueError(
+                f"Packed shape {manifest_shape} does not match configured "
+                f"shape {(channels, height, width)}"
+            )
+        self._memory_maps: OrderedDict[int, Any] = OrderedDict()
 
-    def _map(self, path: str):
+    def _close_map(self, memory_map) -> None:
+        mmap_handle = getattr(memory_map, "_mmap", None)
+        if mmap_handle is not None:
+            mmap_handle.close()
+
+    def _map(self, shard_id: int):
         import numpy as np
 
-        if path not in self._memory_maps:
-            self._memory_maps[path] = np.memmap(path, mode="r", dtype=np.uint8)
-        return self._memory_maps[path]
+        if shard_id in self._memory_maps:
+            memory_map = self._memory_maps.pop(shard_id)
+            self._memory_maps[shard_id] = memory_map
+            return memory_map
+        if not 0 <= shard_id < len(self.shard_paths):
+            raise IndexError(f"Packed shard id is out of range: {shard_id}")
+        memory_map = np.memmap(
+            self.shard_paths[shard_id], mode="r", dtype=np.uint8
+        )
+        self._memory_maps[shard_id] = memory_map
+        while len(self._memory_maps) > self.max_open_shards:
+            _, evicted = self._memory_maps.popitem(last=False)
+            self._close_map(evicted)
+        return memory_map
 
-    def __call__(self, path: str):
+    def __call__(self, frame_index: int):
         import numpy as np
         import torch
 
-        if path not in self.locations:
-            raise KeyError(f"Image path is absent from packed index: {path}")
-        shard_path, offset, length = self.locations[path]
+        location = int(frame_index)
+        if not 0 <= location < len(self.offsets):
+            raise IndexError(f"Packed frame index is out of range: {location}")
+        shard_id = int(self.shard_ids[location])
+        offset = int(self.offsets[location])
+        length = int(self.lengths[location])
         if length != self.image_bytes:
             raise ValueError(
-                f"Packed image has {length} bytes, expected {self.image_bytes}: {path}"
+                f"Packed image has {length} bytes, expected "
+                f"{self.image_bytes}: frame={location}"
             )
         array = np.asarray(
-            self._map(shard_path)[offset : offset + length]
+            self._map(shard_id)[offset : offset + length]
         ).reshape(self.channels, self.height, self.width)
         return torch.from_numpy(array.copy())
 
+    @property
+    def open_shard_count(self) -> int:
+        return len(self._memory_maps)
+
     def close(self) -> None:
         for memory_map in self._memory_maps.values():
-            mmap_handle = getattr(memory_map, "_mmap", None)
-            if mmap_handle is not None:
-                mmap_handle.close()
+            self._close_map(memory_map)
         self._memory_maps.clear()
 
     def __enter__(self):
@@ -75,7 +152,7 @@ class PackedUint8Backend:
 
     def __getstate__(self):
         state = dict(self.__dict__)
-        state["_memory_maps"] = {}
+        state["_memory_maps"] = OrderedDict()
         return state
 
     def __del__(self):
@@ -110,8 +187,8 @@ def pack_frame_index(
     index_path = output_dir / "packed_frames.parquet"
     index_schema = pa.schema(
         [
-            pa.field("path", pa.string()),
-            pa.field("shard_path", pa.string()),
+            pa.field("frame_index", pa.int64()),
+            pa.field("shard_id", pa.int32()),
             pa.field("offset", pa.int64()),
             pa.field("length", pa.int64()),
         ]
@@ -122,6 +199,10 @@ def pack_frame_index(
     row_buffer = []
     shard_stream = None
     shard_path = None
+    shard_names: list[str] = []
+    packed_groups: dict[
+        tuple[str, int, str], list[tuple[int, int]]
+    ] = {}
     try:
         index = 0
         for batch in parquet_file.iter_batches(batch_size=1024):
@@ -130,14 +211,20 @@ def pack_frame_index(
                     if shard_stream is not None:
                         shard_stream.flush()
                         shard_stream.close()
-                    shard_path = (
-                        output_dir
-                        / f"shard_{index // images_per_shard:06d}.bin"
-                    )
+                    shard_id = index // images_per_shard
+                    shard_name = f"shard_{shard_id:06d}.bin"
+                    shard_names.append(shard_name)
+                    shard_path = output_dir / shard_name
                     shard_stream = shard_path.open("wb")
+                else:
+                    shard_id = index // images_per_shard
                 with Image.open(row["path"]) as image:
                     array = np.asarray(image.convert("RGB"), dtype=np.uint8)
-                if tuple(array.shape) != (expected_height, expected_width, 3):
+                if tuple(array.shape) != (
+                    expected_height,
+                    expected_width,
+                    3,
+                ):
                     raise ValueError(
                         f"Unexpected image shape {array.shape}: {row['path']}"
                     )
@@ -146,15 +233,29 @@ def pack_frame_index(
                 shard_stream.write(chw.tobytes())
                 row_buffer.append(
                     {
-                        "path": row["path"],
-                        "shard_path": str(shard_path),
+                        "frame_index": index,
+                        "shard_id": shard_id,
                         "offset": offset,
                         "length": chw.nbytes,
                     }
                 )
+                if all(
+                    key in row
+                    for key in ("game", "label", "video_id", "frame_id")
+                ):
+                    packed_groups.setdefault(
+                        (
+                            str(row["game"]),
+                            int(row["label"]),
+                            str(row["video_id"]),
+                        ),
+                        [],
+                    ).append((int(row["frame_id"]), index))
                 if len(row_buffer) >= 4096:
                     index_writer.write_table(
-                        pa.Table.from_pylist(row_buffer, schema=index_schema)
+                        pa.Table.from_pylist(
+                            row_buffer, schema=index_schema
+                        )
                     )
                     row_buffer.clear()
                 index += 1
@@ -167,4 +268,59 @@ def pack_frame_index(
                 pa.Table.from_pylist(row_buffer, schema=index_schema)
             )
         index_writer.close()
+    manifest = {
+        "format_version": 2,
+        "channels": 3,
+        "height": expected_height,
+        "width": expected_width,
+        "image_bytes": 3 * expected_height * expected_width,
+        "frame_count": index,
+        "shards": shard_names,
+    }
+    (output_dir / "packed_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if packed_groups:
+        from game_cls.data.video_index import (
+            VideoEntry,
+            write_video_entries_parquet,
+        )
+
+        entries = []
+        for (game, label, video_id), values in sorted(
+            packed_groups.items()
+        ):
+            ordered = sorted(values)
+            frame_ids = np.asarray(
+                [frame_id for frame_id, _ in ordered], dtype=np.int32
+            )
+            locations = np.asarray(
+                [location for _, location in ordered], dtype=np.int64
+            )
+            id_set = set(frame_ids.tolist())
+            valid = {
+                delta: np.asarray(
+                    [
+                        position
+                        for position, frame_id in enumerate(frame_ids)
+                        if int(frame_id) + delta in id_set
+                    ],
+                    dtype=np.int32,
+                )
+                for delta in (1, 2, 3)
+            }
+            entries.append(
+                VideoEntry(
+                    game=game,
+                    label=label,
+                    video_id=video_id,
+                    frame_ids=frame_ids,
+                    valid_start_positions=valid,
+                    frame_locations=locations,
+                )
+            )
+        write_video_entries_parquet(
+            entries, output_dir / "packed_video_entries.parquet"
+        )
     return index_path

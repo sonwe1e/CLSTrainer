@@ -49,14 +49,25 @@ class EvaluationContractTests(unittest.TestCase):
                 }
 
         class Model(torch.nn.Module):
-            def forward(self, image0, image1):
-                return torch.zeros(len(image0), 2)
+            def __init__(self):
+                super().__init__()
+                self.seen_dtype = None
 
+            def forward(self, image0, image1):
+                self.seen_dtype = image0.dtype
+                return torch.zeros(
+                    len(image0), 2, dtype=image0.dtype, device=image0.device
+                )
+
+        model = Model()
         result = evaluate(
-            Model(),
+            model,
             DataLoader(Dataset(), batch_size=2, collate_fn=pair_collate),
             torch.device("cpu"),
+            amp=True,
+            amp_dtype="bfloat16",
         )
+        self.assertEqual(model.seen_dtype, torch.bfloat16)
         rows = result.grouped_metrics["by_video"]
         self.assertEqual(
             {(row["game"], row["label"], row["video_id"]) for row in rows},
@@ -65,6 +76,38 @@ class EvaluationContractTests(unittest.TestCase):
         self.assertIn("brier_score", result.metrics)
         self.assertIn("ece_20_bins", result.metrics)
         self.assertNotIn("macro_video_f1_tau099", result.metrics)
+        by_label = result.grouped_metrics["by_game_label"]
+        self.assertTrue(all(row["f1"] is None for row in by_label))
+        self.assertEqual(
+            {row["primary_metric"] for row in by_label},
+            {"positive_recall", "negative_specificity"},
+        )
+
+    def test_composite_selection_and_worst_game_floor(self) -> None:
+        from game_cls.engine.trainer import (
+            _annotate_selection,
+            _is_better_model,
+        )
+
+        config = {
+            "selection_metric": "composite",
+            "selection_weights": {
+                "global_f1": 0.4,
+                "macro_game_f1": 0.4,
+                "worst_game_f1": 0.2,
+            },
+            "minimum_worst_game_f1": 0.5,
+        }
+        candidate = {
+            "global_f1_tau099": 0.9,
+            "macro_game_f1_tau099": 0.8,
+            "worst_game_f1_tau099": 0.6,
+        }
+        annotated = _annotate_selection(candidate, config)
+        self.assertAlmostEqual(annotated["selection_score"], 0.8)
+        self.assertTrue(annotated["selection_eligible"])
+        rejected = dict(candidate, worst_game_f1_tau099=0.4)
+        self.assertFalse(_is_better_model(rejected, {}, config))
 
 
 if __name__ == "__main__":

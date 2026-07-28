@@ -76,6 +76,7 @@ class ConsistentPairAugment:
     def __init__(self, config: dict[str, Any]) -> None:
         try:
             from torchvision.transforms import v2
+            from torchvision.transforms import InterpolationMode
         except ImportError as exc:
             raise RuntimeError("Augmentation requires torchvision") from exc
 
@@ -90,6 +91,14 @@ class ConsistentPairAugment:
                             translate=affine.get("translate", [0.02, 0.02]),
                             scale=affine.get("scale", [0.98, 1.02]),
                             shear=affine.get("shear", [-1.0, 1.0]),
+                            interpolation=InterpolationMode[
+                                str(
+                                    affine.get(
+                                        "interpolation", "bilinear"
+                                    )
+                                ).upper()
+                            ],
+                            fill=affine.get("fill", 0),
                         )
                     ],
                     p=affine.get("probability", 0.5),

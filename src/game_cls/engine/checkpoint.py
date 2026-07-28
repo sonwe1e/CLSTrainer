@@ -29,11 +29,19 @@ def clone_checkpoint_pair(
 ) -> None:
     """Create best aliases from an already serialized checkpoint pair."""
     output_dir = Path(output_dir)
-    for prefix in ("model", "checkpoint"):
-        source = output_dir / f"{prefix}_{source_tag}.pth"
+    pairs = (
+        (
+            output_dir / f"model_{source_tag}_full.pth",
+            output_dir / f"model_{target_tag}_full.pth",
+        ),
+        (
+            output_dir / f"checkpoint_{source_tag}.pth",
+            output_dir / f"checkpoint_{target_tag}.pth",
+        ),
+    )
+    for source, target in pairs:
         if not source.is_file():
             continue
-        target = output_dir / f"{prefix}_{target_tag}.pth"
         temporary = target.with_suffix(target.suffix + ".tmp")
         if temporary.exists():
             temporary.unlink()
@@ -115,21 +123,33 @@ def save_checkpoint_pair(
     full_state_dict = unwrapped.state_dict()
     if state_mode == "trainable_only":
         trainable_names = {
-            name for name, parameter in unwrapped.named_parameters()
+            name
+            for name, parameter in unwrapped.named_parameters()
             if parameter.requires_grad
         }
         checkpoint_state_dict = {
             key: value
             for key, value in full_state_dict.items()
             if key in trainable_names
-            or any(key.startswith(name.rsplit(".", 1)[0] + ".") for name in trainable_names)
+            or any(
+                key.startswith(name.rsplit(".", 1)[0] + ".")
+                for name in trainable_names
+            )
         }
     elif state_mode == "full":
         checkpoint_state_dict = full_state_dict
     else:
         raise ValueError(f"Unsupported checkpoint state mode: {state_mode}")
     if write_model_only:
-        _atomic_torch_save(full_state_dict, output_dir / f"model_{tag}.pth")
+        _atomic_torch_save(
+            {
+                "model": full_state_dict,
+                "artifact_role": "full_model_snapshot",
+                "global_step": global_step,
+                "epoch": epoch,
+            },
+            output_dir / f"model_{tag}_full.pth",
+        )
     base_checkpoint = config.get("model", {}).get("checkpoint_path")
     base_hash = (
         _file_sha256(str(Path(base_checkpoint).resolve()))
@@ -142,6 +162,11 @@ def save_checkpoint_pair(
         {
             "model": checkpoint_state_dict,
             "model_state_mode": state_mode,
+            "expected_trainable_state_keys": (
+                sorted(checkpoint_state_dict)
+                if state_mode == "trainable_only"
+                else None
+            ),
             "base_checkpoint": base_checkpoint,
             "base_checkpoint_sha256": base_hash,
             "optimizer": optimizer.state_dict(),
@@ -191,12 +216,42 @@ def restore_training_checkpoint(
                 raise RuntimeError(
                     "Resume base checkpoint hash does not match the checkpoint state."
                 )
-        result = unwrap_model(model).load_state_dict(
-            checkpoint["model"], strict=False
+        target = unwrap_model(model)
+        trainable_names = {
+            name
+            for name, parameter in target.named_parameters()
+            if parameter.requires_grad
+        }
+        current_expected = {
+            key
+            for key in target.state_dict()
+            if key in trainable_names
+            or any(
+                key.startswith(name.rsplit(".", 1)[0] + ".")
+                for name in trainable_names
+            )
+        }
+        stored_expected = set(
+            checkpoint.get(
+                "expected_trainable_state_keys", checkpoint["model"].keys()
+            )
         )
-        if result.unexpected_keys:
+        actual_keys = set(checkpoint["model"])
+        if stored_expected != current_expected or actual_keys != current_expected:
             raise RuntimeError(
-                f"Unexpected trainable checkpoint keys: {result.unexpected_keys}"
+                "Trainable checkpoint key set does not match the current model: "
+                f"missing={sorted(current_expected - actual_keys)}, "
+                f"unexpected={sorted(actual_keys - current_expected)}, "
+                f"manifest_mismatch={sorted(stored_expected ^ current_expected)}"
+            )
+        result = target.load_state_dict(checkpoint["model"], strict=False)
+        unexpected = set(result.unexpected_keys)
+        relevant_missing = current_expected & set(result.missing_keys)
+        if unexpected or relevant_missing:
+            raise RuntimeError(
+                "Trainable checkpoint restore was incomplete: "
+                f"missing={sorted(relevant_missing)}, "
+                f"unexpected={sorted(unexpected)}"
             )
     else:
         unwrap_model(model).load_state_dict(checkpoint["model"])

@@ -1,652 +1,589 @@
 # 结论
 
-这次修改是一次**实质性升级**。上次提出的大部分结构性问题已经解决：训练入口可导入、CPU CI 已通过、NPU 设备初始化顺序正确、quick/full test 分离、评估支持多 rank 分片、训练 pair 改为懒生成、严格数据审计和精确恢复框架也已加入。该分支的提交 `b992446...` 已通过 CPU checks。
+我基于当前分支最新提交 `9e1b1787` 重新检查了完整训练链路。该提交的 CPU CI 已通过，包括 pytest、分布式 Gloo 评估和训练 smoke test。
 
-但目前仍然**不建议直接进行长时间八卡训练**。存在两个优先级最高的问题：
+**上次指出的确定性阻断问题已经基本全部解决。** 当前版本已经从“生产化候选框架”推进到“可以接入真实模型进行 NPU 单卡和八卡短跑验证”的阶段，但还不能仅凭 CPU CI 认定八卡 A3 长跑已经可靠。
 
-1. 八卡第一次分布式评估很可能因 `float64 HCCL AllReduce` 失败。
-2. NPU 正式配置仍继承 CUDA 调试配置中的 demo 模型和空 checkpoint，直接运行脚本可能训练错模型。
+当前综合判断：
 
-整体成熟度可以从上次的约 **3～4/10 提升到 6/10**。修复下面的 P0 问题并完成一次真实模型的八卡 smoke test 后，才能进入长跑性能调优。
+| 维度           |         评价 |
+| ------------ | ---------: |
+| 代码架构         | **8.5/10** |
+| CUDA/CPU 完整性 | **8.5/10** |
+| 百万帧数据适应性     |   **7/10** |
+| 八卡 A3 代码就绪度  |   **7/10** |
+| 八卡 A3 实测就绪度  | **4.5/10** |
+| 指标与精度可信度     |   **7/10** |
 
 ---
 
 # 一、上次问题的解决情况
 
-| 上次问题                           | 当前状态                                             | 判断                           |
-| ------------------------------ | ------------------------------------------------ | ---------------------------- |
-| `reports` 模块缺失，训练入口可能直接导入失败    | 已增加 `reports/__init__.py` 和完整的 `error_writer.py` | **已解决**                      |
-| HCCL 初始化早于 `torch_npu` 导入和设备绑定 | 现在先导入 `torch_npu`、调用 `set_device`，再初始化进程组        | **已解决**                      |
-| 没有 CI，无法发现主链路错误                | 已增加 pytest 和 2-step 训练 smoke test，CI 已成功         | **已解决，但仅覆盖 CPU**             |
-| quick test 实际跑完整 test          | 已创建独立 quick/full dataset 和独立触发频率                 | **已解决**                      |
-| 只有 rank 0 测试，其余 7 卡等待          | 每个 rank 处理不重复的测试分片                               | **基本解决**                     |
-| 数百万 `PairSample` 全量物化          | 训练改为视频索引和 `PairRequest` 懒采样                      | **主要问题已解决**                  |
-| 游戏、视频指标缺失                      | 已增加 by-game、by-video、by-game-label               | **实现了，但指标定义有新问题**            |
-| checkpoint 不能恢复 epoch 内位置      | 已保存 `step_in_epoch`、sampler 和各 rank RNG          | **机制基本解决**                   |
-| 数据审计只报告、不阻止训练                  | 错误尺寸和非法文件不再写入索引，正式训练默认严格检查                       | **基本解决**                     |
-| 项目安装可能替换 Ascend PyTorch        | PyTorch 已移到 `cuda/dev` 可选依赖                      | **已解决**                      |
-| CPU 将图像变成 FP32 后再传 NPU         | 增强后保持 uint8，在设备端转换和归一化                           | **已解决，但引入 RandomErasing 问题** |
-| 游戏视频数会因不同类别相同 video ID 而少计     | 新 sampler 使用不同 label 下的视频索引数量求和                  | **已解决**                      |
-| delta 实际比例偏离 15/70/15          | 新 sampler 改为 delta-first，并记录实际比例                 | **已解决**                      |
+| 上次问题                             | 当前状态                                              | 结论                |
+| -------------------------------- | ------------------------------------------------- | ----------------- |
+| HCCL 对 `float64` AllReduce 不支持   | 混淆矩阵改为 `int64`，CE/Brier 改为 `float32`              | **已解决**           |
+| NPU 配置继承 demo 模型                 | 新增独立 `npu_production.yaml`，占位工厂和空 checkpoint 会被拒绝 | **已解决**           |
+| full test 汇总百万 Python 分数到 rank 0 | full 默认使用 4096-bin 直方图计算 AUC                      | **已解决**           |
+| 错例全部存入内存                         | 改为 batch 级 Parquet 流式写入                           | **已解决**           |
+| `p>=0.999` 全部保存到 near-threshold  | 只保存 `0.98～0.995`，高置信度仅计数                          | **已解决**           |
+| 视频指标把不同标签的同名视频合并                 | 键改成 `(game,label,video_id)`                       | **已解决**           |
+| 负类视频被纳入 macro-video F1           | 删除 macro-video F1，按标签报告 recall 或 specificity      | **已解决**           |
+| uint8 RandomErasing 语义不正确        | 实现 uint8 专用擦除，生产配置默认填 0                           | **已解决**           |
+| quick/full 同一步重复执行               | full 优先，同一步跳过 quick                               | **已解决**           |
+| final full 不参与最佳模型选择             | final full 也会比较并更新 best                           | **已解决**           |
+| checkpoint 重复序列化完整主干             | 周期 checkpoint 可只保存可训练状态，best 通过硬链接或复制形成别名         | **主要解决**          |
+| 每个 rank 从百万帧表创建百万个 `FrameRecord` | 增加视频级 Parquet，按视频行读取                              | **主要解决**          |
+| 主干权重加载过于宽松                       | 正式训练检查非 `cls` 权重覆盖率和形状                            | **已解决但策略过严**      |
+| train/test 泄漏不检查                 | 增加视频键和 SHA-256 重复检测                               | **已增加，但视频键规则需修正** |
+| cls 与 backbone BN 无法分别控制         | 已拆成两个配置项                                          | **已解决**           |
+| AdamW 对 bias/BN 施加衰减             | 一维参数和 bias 放入无衰减组                                 | **已解决**           |
 
-相关实现可见运行时初始化、懒数据集和 sampler。
+分布式评估现在确实使用 `int64 + float32` 归约。
 
----
-
-# 二、当前新增或仍未解决的 P0 问题
-
-## 1. 分布式评估的 `float64 AllReduce` 会阻断 A3 评估
-
-评估代码创建了一个位于 NPU 上的 `torch.float64` 张量：
-
-```python
-numeric = torch.tensor(
-    [tp, fp, fn, tn, cross_entropy_sum, sample_count],
-    dtype=torch.float64,
-    device=device,
-)
-dist.all_reduce(numeric)
-```
-
-Atlas A3 的 HCCL AllReduce 支持 `int8/int16/int32/int64/float16/float32/bfloat16`，不支持 `float64`。因此八卡训练可能正常运行，直到第一次 quick/full test 才报错。([hiascend.com][1])
-
-建议立即拆成两个统计张量：
-
-```python
-counts = torch.tensor(
-    [tp, fp, fn, tn, sample_count],
-    dtype=torch.int64,
-    device=device,
-)
-loss_sum = torch.tensor(
-    [cross_entropy_sum],
-    dtype=torch.float32,
-    device=device,
-)
-
-dist.all_reduce(counts)
-dist.all_reduce(loss_sum)
-```
-
-只有修复这一项后，分布式评估链路才具备基本可运行性。
+独立生产配置也已建立，真实模型工厂、checkpoint 和主干加载覆盖率都有启动门禁。
 
 ---
 
-## 2. NPU 配置仍然会默认构建 demo 模型
+# 二、现在最需要处理的问题
 
-`npu_1p.yaml` 继承：
+## 1. 测试阶段仍然强制使用 FP32，与 BF16 训练和部署路径不一致
+
+生产配置启用了：
 
 ```yaml
-base: cuda_debug.yaml
+amp: true
+amp_dtype: bfloat16
 ```
 
-但没有覆盖 `model.factory` 和 `checkpoint_path`。
+但 evaluator 会把 uint8 输入直接转换成 FP32，并且模型前向不在 autocast 中：
 
-而基础配置仍然是：
+```python
+images = images.to(torch.float32).div_(255.0)
+logits = model(images[:, 0], images[:, 1])
+```
+
+这会产生两类影响：
+
+* **效率影响**：完整测试走 FP32，NPU 测试吞吐可能显著低于训练吞吐。
+* **精度影响**：模型选择依据 FP32 下的 `F1@0.99`，但实际部署若使用 BF16、FP16 或其他低精度，阈值附近样本可能发生翻转。
+
+建议在配置中增加：
 
 ```yaml
-model:
-  factory: game_cls.model.builder:build_demo_model
-  checkpoint_path: null
+evaluation:
+  amp: true
+  amp_dtype: bfloat16
 ```
 
-这个 demo 模型只是一个 6 通道深度卷积、全局池化和 Linear。
+评估模型前向与部署精度保持一致。可以另外低频运行一次 FP32 诊断测试，但不应让 FP32 指标决定最终部署模型。
 
-因此直接执行：
-
-```bash
-bash scripts/run_npu_8p.sh
-```
-
-并不会训练你的真实模型。
-
-正式配置应该与 debug 配置分离，并增加强制校验：
-
-```python
-if not data_cfg["synthetic"]:
-    if model_cfg["factory"].endswith(":build_demo_model"):
-        raise RuntimeError("Production training cannot use build_demo_model")
-    if not model_cfg.get("checkpoint_path"):
-        raise RuntimeError("Production training requires checkpoint_path")
-```
-
-同时应覆盖输出目录和 scheduler 等调试默认值。当前 NPU 配置还继承了 CUDA debug 的 `warmup_steps: 10`，这对于 10,000 step 的正式训练通常过短。
+这是当前对训练精度和测试效率影响最大的问题之一。
 
 ---
 
-# 三、会影响训练效率的主要问题
+## 2. CPU/Gloo CI 仍不能证明 A3 上的 evaluator 算子链可运行
 
-## 1. 完整评估仍然具有 O(N) 的 Python 内存和中心化通信
-
-每个 rank 在完整测试期间保存：
+当前分布式测试使用：
 
 ```python
-margins: list[float]
-targets: list[int]
-errors: list[dict]
-near_threshold: list[dict]
+dist.init_process_group("gloo")
+device = cpu
 ```
 
-随后通过：
-
-```python
-dist.gather_object((margins, targets), ...)
-```
-
-把所有预测分数和标签集中到 rank 0。
-
-在百万级测试 pair 下，这会产生：
-
-* 每个 rank 的大量 Python float、int 和 dict 对象；
-* rank 0 同时保存所有 rank 的列表；
-* Python pickle 序列化和反序列化；
-* rank 0 对全量分数进行排序，计算 ROC-AUC 和 PR-AUC；
-* 其他 NPU 在 rank 0 聚合和写报告期间等待。
-
-这虽然比“rank 0 单卡完成全部前向”更好，但仍可能成为完整测试时的主要内存和时间瓶颈。
-
-### 推荐调整
-
-固定阈值指标只需要：
+而实际 evaluator 在 NPU 上使用了：
 
 ```text
-TP / FP / FN / TN / CE sum / count
+torch.bincount
+scatter_add_
+int64 HCCL AllReduce
+float32 HCCL AllReduce
+多个直方图 AllReduce
 ```
 
-直接 AllReduce 即可，不应汇聚全部样本。
+当前代码选择的 dtype 已合理，但还没有真实验证：
 
-ROC-AUC 和 PR-AUC 可以采用两种模式：
+* TorchNPU 2.10 对这些输入 dtype 的支持；
+* 4096-bin `bincount` 和多个 AllReduce 是否产生异常；
+* BF16 模型前向与 FP32统计组合是否正常；
+* 八卡 gather-object、报告合并和 checkpoint 是否会死锁。
 
-* quick test：继续精确汇总，数据量小；
-* full test：各 rank 把 `float32 margin + uint8 label` 写入 Arrow/NumPy 分片，由 rank 0 流式合并，或者用固定直方图区间近似计算。
-
-错误样本也应在评估 batch 内流式写 Parquet，而不是全部放进 `errors` 列表后才落盘。
+因此现在不存在已知的确定性 HCCL 阻断，但仍存在**未经过实际设备验证的兼容性风险**。
 
 ---
 
-## 2. `near_threshold` 可能保存几乎全部高置信度正样本
+## 3. 最佳模型仍然只按全局 F1 选择
 
-当前 `_threshold_band()` 将：
+代码已经计算：
+
+```text
+global_f1_tau099
+macro_game_f1_tau099
+worst_game_f1_tau099
+```
+
+但保存最佳模型时仍然只比较：
 
 ```python
-probability >= 0.999
+metrics["f1"]
 ```
 
-也定义为 near-threshold。
+这与“每个游戏都有较好识别效果”的目标并不完全一致。一个大游戏的样本可能显著提高 global F1，同时某个小游戏性能下降，但该模型仍会被选为最佳。
 
-如果模型训练良好，大量类别 1 样本都会高于 0.999，于是 `near_threshold` 文件可能比真正的错误文件还大。
-
-更合理的设计是：
-
-```text
-样本级 near-threshold：
-0.98 <= p <= 0.995
-
-只统计数量、不保存逐样本：
-p >= 0.995
-p >= 0.999
-```
-
-置信度分布应保存计数直方图，而不是保存所有高置信度样本路径。
-
-另外，恰好等于 `0.990` 的样本当前不属于任何区间，因为第二段使用了 `0.990 < probability`，应改为 `0.990 <= probability`。
-
----
-
-## 3. 视频级索引仍会在每个 rank 瞬间物化百万 Python 行
-
-训练 pair 已不再物化，这是明显进步。但 `read_video_entries_parquet()` 仍执行：
-
-```python
-table = pq.read_table(...)
-table.to_pylist()
-FrameRecord(**row)
-```
-
-对于一百万帧，每个 rank 都会暂时创建：
-
-```text
-100万 Python dict
-100万 FrameRecord
-100万路径字符串引用
-```
-
-然后再转换为 `VideoEntry`。八个 rank 同时启动时，这可能形成很高的 CPU 内存峰值。
-
-`video_index_memory_bytes()` 只统计数组字节和字符串 UTF-8 长度，没有统计：
-
-* Python string、tuple、dict、list 对象头；
-* NumPy 对象自身；
-* DataLoader worker 的数据集副本；
-* PyArrow `to_pylist()` 的瞬时内存。
-
-所以日志中的 `video_index_bytes_per_rank` 会显著低估真实 RSS。
-
-更适合生产环境的是在索引阶段直接生成一个真正的视频级文件：
-
-```text
-train_video_entries.parquet
-test_video_entries.parquet
-```
-
-每行包含：
-
-```text
-game_id
-label
-video_id
-frame_ids: list<int32>
-frame_paths: list<string>
-valid_starts_delta1: list<int32>
-valid_starts_delta2: list<int32>
-valid_starts_delta3: list<int32>
-```
-
-训练进程直接读取该文件，不再从 frame 表重新分组。
-
----
-
-## 4. PNG 解码仍可能是核心吞吐瓶颈
-
-每个训练样本仍然执行两次：
-
-```python
-Image.open(...)
-image.convert("RGB")
-```
-
-在你约 300 MB/s 的远程链路以及百万小文件场景下，即使消除了 pair 对象，仍然存在：
-
-```text
-远程随机小文件访问
-+ PNG 解压
-+ 两次文件打开
-+ CPU 数据增强
-```
-
-当前分支还没有 packed dataset、tar shard、LMDB 或预解码 uint8 后端。因此它解决的是**索引内存问题**，还没有解决主要的数据吞吐问题。
-
-执行顺序仍应是：
-
-```text
-本地 NVMe
-→ 调 worker/batch
-→ PNG tar 分片
-→ 仍慢时预解码 uint8 分片
-```
-
----
-
-## 5. quick 和 full 在同一步会重复执行
-
-NPU 配置为：
+建议支持可配置的模型选择分数，例如：
 
 ```yaml
-quick_test_every_steps: 1000
-full_test_every_steps: 5000
+evaluation:
+  selection_metric: composite
+  selection_weights:
+    global_f1: 0.40
+    macro_game_f1: 0.40
+    worst_game_f1: 0.20
 ```
 
-在 step 5000、10000 时，代码会先运行 quick，再立即运行 full。
+或者第一版直接使用：
 
-应改为：
-
-```python
-run_full = full_every and step % full_every == 0
-run_quick = quick_every and step % quick_every == 0 and not run_full
+```yaml
+selection_metric: macro_game_f1_tau099
 ```
+
+至少同时设置 `worst_game_f1` 下限，防止某个游戏出现灾难性退化。
 
 ---
 
-## 6. checkpoint 会产生严重重复 I/O
+## 4. 视频泄漏检查可能错误拒绝合法数据
 
-每次保存会连续写：
-
-```text
-model_<tag>.pth                 完整模型
-checkpoint_<tag>.pth            再包含一次完整模型
-```
-
-如果某个 step 同时是：
-
-```text
-full test 最佳
-+ save_last_every_steps
-```
-
-则会保存：
-
-```text
-best model-only
-best full checkpoint
-last model-only
-last full checkpoint
-```
-
-相当于连续序列化四次完整模型。只有 `cls` 在变化，但冻结主干仍然被重复保存。
-
-这是典型的利用率锯齿来源。
-
-建议：
-
-* 周期性恢复 checkpoint 只保存 `cls` 参数、优化器和基础权重哈希；
-* `model_last.pth` 和 `model_best.pth` 保存完整模型；
-* 同一步的 best 和 last 复用同一个临时 state dict；
-* 不要让 quick test 写完整错误报告和 checkpoint；
-* 降低完整模型保存频率。
-
----
-
-## 7. 当前分段计时在 NPU 上不准确
-
-代码使用 `time.perf_counter()` 包围 H2D、forward、backward 和 optimizer。
-
-NPU 操作是异步下发的，因此这些时间主要是 Python enqueue 时间，实际设备耗时可能在后续 `.item()`、评估、保存或其他同步点才体现出来。当前打印的 `forward/backward/h2d` 不能可靠定位锯齿根因。
-
-建议：
-
-* 正常训练不加同步；
-* 专门的 profile 模式使用 NPU Event 或 Profiler；
-* 同时报告 `train_only_samples/s` 和包含评估、checkpoint 的 `wall_samples/s`。
-
----
-
-# 四、会影响训练精度和指标可信度的问题
-
-## 1. 当前“每视频 F1”定义不正确
-
-视频分组键为：
-
-```python
-(game, video_id)
-```
-
-没有包含 label。
-
-如果类别 0 和类别 1 文件夹中都存在 `video_id="01"`，两组完全不同的视频会被合并。
-
-即使不存在重号，每个视频通常只有一个真实类别：
-
-* 类别 0 视频没有正样本，它的 positive-class F1 永远为 0；
-* 类别 1 视频没有负样本，无法评价 specificity。
-
-因此：
-
-```python
-macro_video_f1 = mean(每个视频的pair级F1)
-```
-
-在统计上没有合理含义，会让所有负类视频贡献 0 分。
-
-### 正确做法
-
-分组键至少改为：
+当前将以下键在 train/test 中重复视为泄漏：
 
 ```python
 (game, label, video_id)
 ```
 
-然后每视频报告：
+但你的 `video_id` 只有两位。假如 train 和 test 各自都从 `01` 开始编号，即使它们是完全不同的原始视频，也会被判定为泄漏。正式配置又要求严格审计，因此可能直接阻止训练。
+
+需要先明确视频 ID 是否在整个项目中全局唯一：
+
+* 若全局唯一，现有规则正确。
+* 若每个 split 或每次采集重新编号，应删除该强制条件，或者引入真正的 `recording_uid`。
+* SHA-256 重复检查可以继续保留。
+
+此外，SHA-256 只能检测字节完全相同的图片，不能识别重新编码、轻微裁剪或颜色变化后的近重复帧。
+
+---
+
+# 三、仍会影响训练效率的问题
+
+## 1. evaluator 每个 batch 发生多次 NPU 同步
+
+当前每个测试 batch 都执行：
+
+```python
+cross_entropy(...).item()
+brier.sum().item()
+tp.sum().item()
+fp.sum().item()
+fn.sum().item()
+tn.sum().item()
+```
+
+每次 `.item()` 都可能迫使主机等待 NPU 计算完成。随后又分别执行：
+
+```python
+logits.cpu()
+margins.cpu()
+labels.cpu()
+probabilities.cpu()
+```
+
+因此虽然 full test 已不再把所有分数保存在内存里，但设备流水仍然被频繁同步。
+
+建议：
+
+1. CE、Brier 和四个计数都保留为设备 tensor。
+2. 整个评估结束后再统一 AllReduce 和 `.cpu()`。
+3. 每个 batch 只拷贝一次紧凑的统计 tensor。
+4. 只有错误或临界样本才复制完整 logits。
+
+这会明显提升完整 test 的 NPU 利用率。
+
+---
+
+## 2. packed backend 仍可能占用大量 CPU 内存
+
+新的 packed backend 确实消除了 PNG 解码，但初始化时仍然：
+
+```python
+rows = pq.read_table(...).to_pylist()
+self.locations = {
+    path: (shard_path, offset, length)
+    for row in rows
+}
+```
+
+一百万帧就意味着：
+
+* 每个 rank 一个约百万项的 Python 字典；
+* 每项含原始绝对路径字符串、shard 路径、offset 和 length；
+* train 和 test 分别一份；
+* 视频索引中又保存一份每帧路径字符串；
+* 八个 rank 各自重复。
+
+这可能重新把“pair 对象内存问题”变成“路径字典内存问题”。
+
+更合适的结构是：
 
 ```text
-label=1：recall、FN rate、平均/最小置信度
-label=0：specificity、FP rate、最大置信度
+VideoEntry:
+  frame_ids
+  packed_shard_ids
+  packed_offsets
 ```
 
-如果确实需要“视频级 F1”，应先把一个视频的多个 pair 聚合为一个视频预测，再在所有视频之间计算一次 F1，而不是平均每个单类视频的 F1。
-
-`by_game_label` 同样不应把单类分组的 F1 作为主要指标。
+Dataset 直接通过整数索引读取，不再以完整路径作为 packed backend 的主键。
 
 ---
 
-## 2. uint8 优化改变了 RandomErasing 的实际语义
+## 3. packed backend 会长期打开所有访问过的 shard
 
-当前增强链保持 uint8，并直接执行：
-
-```python
-v2.RandomErasing(value="random")
-```
-
-Torchvision 的 `value="random"` 实现生成的是均值为 0、标准差为 1 的 `float32` 正态噪声，并直接赋值到输入张量。([PyTorch Documentation][2])
-
-在 uint8 图像上，这并不是预期的 `[0,255]` 随机 RGB 噪声，而会被转换为少数接近 0 或发生整数转换后的值。它可能不会报错，但增强语义已经发生变化。
-
-建议选择以下一种：
-
-```yaml
-random_erasing:
-  value: 0
-```
-
-或者：
-
-```yaml
-random_erasing:
-  value: [127, 127, 127]
-```
-
-若确实需要随机 RGB 噪声，应实现 uint8 专用版本：
+每个 shard 第一次访问后都会保存在：
 
 ```python
-torch.randint(0, 256, size, dtype=torch.uint8)
+self._memory_maps
 ```
 
-或者将 RandomErasing 移到转换为 `[0,1]` 浮点之后。
+直到 Dataset 销毁。
+
+按默认每 shard 4096 张图片，一个百万帧数据集大约有 245 个 shard。随机均衡采样经过足够长时间后，每个 worker 可能打开大量 shard。
+
+建议实现 8～32 个 shard 的 LRU memmap 缓存，并关闭被淘汰 shard，避免文件描述符和虚拟地址空间持续增长。
+
+packed index 中的 shard 路径还是绝对路径，整体移动 packed 目录后索引会失效，也建议改为相对于 index 文件的路径。
 
 ---
 
-## 3. 平衡采样会改变概率先验，0.99 不再天然是“99%概率”
+## 4. 正式配置默认仍使用 PNG
 
-训练阶段强制每个游戏内部类别约 50/50，但真实部署数据中的类别 1 比例可能远低于 50%。同时阈值辅助损失主动推动正样本 margin 超过 `log(99)`。
+生产配置当前为：
 
-这能帮助提高固定阈值召回，但会改变输出概率的校准性。换言之：
+```yaml
+backend: png
+```
 
-> 训练后的 `Softmax=0.99` 更接近业务分数 0.99，而不一定代表真实发生概率为 99%。
+因此这次新增的 packed backend **不会自动提升正式训练吞吐**。除非手动完成 train/test 打包并修改配置，热路径仍是：
 
-建议增加：
+```text
+Image.open
+→ PNG 解码
+→ RGB 转换
+→ 两次文件读取
+```
+
+若目前约 200 samples/s 的瓶颈来自数据读取和 PNG 解码，当前默认配置不会改变这一点。
+
+建议先在本地 NVMe 上分别测试：
+
+```text
+PNG backend
+packed_uint8 backend
+```
+
+保持模型、batch 和 worker 数完全一致，比较纯训练吞吐。
+
+---
+
+## 5. 视频索引仍保存每一帧的完整路径
+
+视频级 Parquet 已避免百万个 `FrameRecord`，这是正确优化。但读取后仍保留：
+
+```python
+frame_paths: tuple[str, ...]
+```
+
+所以每个 rank 仍有约一百万个 Python 字符串。当前日志中的内存估算只统计字符串 UTF-8 内容和 NumPy 数组，没有统计 Python 对象、tuple 和 dict 的额外开销。
+
+更紧凑的方式是存储：
+
+```text
+video_directory
+frame_ids
+```
+
+运行时按命名规则生成文件路径；packed 模式则完全使用整数 offset。
+
+---
+
+## 6. checkpoint 的 `model_last.pth` 可能不是最新 step
+
+生产配置：
+
+```yaml
+save_last_every_steps: 1000
+periodic_state_mode: trainable_only
+full_model_every_steps: 5000
+```
+
+因此：
+
+* `checkpoint_last.pth` 每 1000 step 更新；
+* `model_last.pth` 可能只在第 5000、10000 step 或最佳模型时更新。
+
+如果训练在第 9000 step 中断：
+
+```text
+checkpoint_last.pth → step 9000
+model_last.pth      → 可能还是 step 5000
+```
+
+最终训练正常结束时会写最新完整模型，因此最终产物没有问题；但训练中途查看或部署 `model_last.pth` 可能拿到旧权重。
+
+建议改名为：
+
+```text
+model_last_full.pth
+checkpoint_last.pth
+```
+
+并在 metadata 中明确各自的 global step。也可以每 1000 step 额外保存很小的：
+
+```text
+cls_last.pth
+```
+
+---
+
+# 四、仍会影响训练精度和指标可信度的问题
+
+## 1. 平衡采样导致的概率校准问题仍然存在
+
+这次已经增加：
 
 ```text
 Brier Score
-ECE
-正负样本置信度直方图
-自然分布下的校准偏置
+20-bin ECE
+置信度直方图
+threshold_is_business_score
 ```
 
-最佳方案仍然是从训练视频中保留一个自然分布的 calibration split，仅拟合一个：
+这解决了“无法观察校准状态”的问题，但没有解决校准本身。
+
+由于训练采用：
+
+```text
+类别 0/1 约 50/50
++ 阈值间隔损失
+```
+
+而真实部署的类别 1 先验可能远低于 50%，Softmax 的 `0.99` 仍不能解释为真实概率 99%。
+
+现阶段将其定义为“业务分数阈值”是合理的，但若希望该分数在不同游戏和后续新增数据上稳定，仍建议预留一个自然分布 calibration 集，拟合一个轻量的：
 
 [
-d_{calibrated}=d/T+b
+d_{\text{calibrated}}=d/T+b
 ]
 
-若坚持不设 calibration，则不要把 0.99 解释为概率，只将其定义为固定业务阈值。
+---
+
+## 2. `by_game_label` 中的 F1 仍不适合作为解释指标
+
+视频行已经增加了正确的主指标：
+
+* 正类视频：recall、FN rate；
+* 负类视频：specificity、FP rate。
+
+但 `by_game_label` 仍调用普通二分类指标。负类分组不含任何正样本，所以该分组的 F1 固定没有实际解释价值。
+
+建议：
+
+* 正类 game-label 行只突出 recall/FN rate；
+* 负类 game-label 行只突出 specificity/FP rate；
+* 单类分组中的 F1、ROC-AUC、PR-AUC 留空，而不是显示 0。
+
+这不会影响模型训练，但会影响人工判断和实验结论。
 
 ---
 
-## 4. 权重加载仍然过于宽松
+## 3. 数据审计缺少 game × label × delta 覆盖检查
 
-当前权重加载会静默跳过形状不匹配参数，并使用 `strict=False` 继续训练。
+当前审计只检查：
 
-训练代码只是打印：
+* 每个游戏是否同时有类别 0 和 1；
+* 全局是否有合法 delta pair；
+* test 是否有 delta=2。
+
+它没有检查：
 
 ```text
-Missing
-Unexpected
-Shape mismatch
+某个游戏的类别1是否有delta=2 pair
+某个游戏的类别0是否只有delta=1 pair
 ```
 
-不会中止。
+sampler 会自动只从存在合法 pair 的组合中采样，因此训练不会报错，但实际采样分布可能偏离业务目标。
 
-因为你只训练 `cls`，如果 backbone 大量权重未正确加载，模型几乎没有机会修复，最终精度会灾难性下降。
-
-应设置生产模式规则：
+建议审计输出：
 
 ```text
-所有非 cls 权重必须成功加载
-只允许最后分类层因输出维度不同而 shape mismatch
-基础模型加载覆盖率必须接近 100%
-checkpoint 不允许为空
+game × label × delta 的合法pair数量
 ```
 
----
+并设置最低要求，尤其确保每个游戏、每个标签都有足够的 `delta=2` 样本。
 
-## 5. 数据审计还没有检查 train/test 泄漏
-
-当前严格审计覆盖：
-
-* 路径结构；
-* 文件名；
-* 尺寸和通道；
-* 每个游戏是否有两个类别；
-* test 是否存在合法 delta=2 pair。
-
-但没有检查：
+当前训练只记录全局 delta 分布，还应记录：
 
 ```text
-同一个视频是否同时存在于 train 和 test
-同一图片内容是否跨集合重复
-近重复帧是否被复制到不同集合
-```
-
-视频泄漏会让 test F1 虚高，尤其相邻帧高度相似。
-
-建议至少检查：
-
-```text
-(game, label, video_id) 跨 split 重复
-文件哈希重复
-每个视频抽样帧的感知哈希重复
+game × label × delta 的实际采样分布
 ```
 
 ---
 
-## 6. 所有 BatchNorm 都被强制冻结，包括 cls 内部的 BatchNorm
+## 4. RandomAffine 应明确插值方法
 
-当前代码先把 `cls` 模块设为 train，然后又把整个模型中的所有 BatchNorm 设为 eval。
-
-如果你的多个 `cls` 卷积中包含 BatchNorm：
-
-* affine weight/bias 可以训练；
-* running mean/variance 不会更新。
-
-这可能是你想要的，也可能限制新游戏数据的适应能力。
-
-建议拆成两个配置：
-
-```yaml
-freeze_backbone_batchnorm_stats: true
-freeze_cls_batchnorm_stats: true/false
-```
-
-分别做消融实验，而不是全局一刀切。
-
----
-
-## 7. 最终 full test 不参与最佳模型更新
-
-训练末尾如果额外运行 `full_final`，代码只更新：
+当前没有显式指定：
 
 ```python
-evaluation_state["last_full_metrics"]
+interpolation
+fill
 ```
 
-没有与 `best_metrics` 比较，也没有保存 final-best checkpoint。
+为了避免不同 torchvision 版本的默认行为差异，并减少 RGB 游戏画面旋转、缩放后的锯齿，建议明确使用双线性插值和固定边界填充值。
 
-因此最后一个 checkpoint 即使取得最高 F1，也不会成为：
+例如：
 
-```text
-best_observed_dev_test_f1_tau099
+```python
+interpolation=InterpolationMode.BILINEAR
+fill=0
 ```
 
-应把周期性 full 和 final full 的最佳模型判断抽成同一个函数。
+同时应做一次无增强、轻增强、当前增强的消融实验。你的训练视频数量相对有限，增强过强可能比增强不足更容易损害精度。
 
 ---
 
-# 五、当前测试覆盖仍缺少什么
+## 5. 主干加载策略实际上是 100% key 严格，而不是 99%
 
-CPU CI 的建立是非常正确的，且当前 workflow 已完成 pytest 和训练 smoke test。
+配置写的是：
 
-但以下关键路径尚未真正验证：
-
-```text
-2进程或8进程 DDP
-分布式 evaluator
-HCCL dtype
-百万级索引内存
-多 worker + augmentation 精确恢复
-真实 NPU BF16
-真实模型 checkpoint 加载覆盖率
+```yaml
+minimum_non_cls_coverage: 0.99
 ```
 
-精确恢复测试目前只覆盖：
+但代码只要有任意非 `cls` missing 或 shape mismatch 就直接报错。
+
+因此当前真实语义是：
 
 ```text
-CPU
-synthetic dataset
-num_workers=0
-无真实数据增强
-单进程
-4 steps
+非cls key必须100%加载
 ```
 
-所以“恢复位置和 sampler 序列正确”已经得到证明，但“八卡 NPU bitwise 精确恢复”目前还不能作出这一结论。
+这对于主干参数是安全的，但可能因为无关 buffer，例如某些 BatchNorm 追踪计数不同，而错误拒绝有效 checkpoint。
+
+建议二选一：
+
+* 要求真正的 100%，删除 `minimum_non_cls_coverage`，逻辑更明确；
+* 允许显式白名单 buffer 缺失，并按参数元素数或字节数计算覆盖率，而不是按 key 数量。
 
 ---
 
-# 六、推荐修改顺序
+## 6. 解冻 cls BatchNorm 时，八卡统计量可能不一致
 
-## P0：八卡运行前必须完成
+虽然现在可以分别配置 cls BN，但 DDP 仍固定：
 
-1. 将评估 AllReduce 从 `float64` 改成 `int64 + float32`。
-2. 新建独立 production 配置，禁止 demo model 和空 checkpoint。
-3. 启动时强制校验非 `cls` 权重加载完整。
-4. 八卡运行 100 step，并确保至少触发一次 quick 和一次 full test。
+```python
+broadcast_buffers=False
+```
 
-## P1：避免完整测试 OOM 和指标错误
+生产默认 `freeze_cls_batchnorm_stats: true`，因此默认路径安全。
 
-1. full test 不再 `gather_object` 全部 Python 分数。
-2. 错误样本和 near-threshold 改为 batch 流式写入。
-3. `p>=0.999` 只做计数，不保存所有样本。
-4. 修正视频分组键和视频指标定义。
-5. final full test 参与 best checkpoint 选择。
-6. full test step 跳过重复 quick test。
+但未来若设置：
 
-## P2：优化训练吞吐
+```yaml
+freeze_cls_batchnorm_stats: false
+```
 
-1. 构建真正的视频级 Parquet，避免每 rank `to_pylist()` 百万行。
-2. 数据复制到本地 NVMe。
-3. 增加 tar shard 或 packed uint8 backend。
-4. 减少重复完整模型 checkpoint。
-5. 用 NPU Profiler/Event 代替当前异步 `perf_counter` 分段计时。
-6. quick test 只保存指标和少量错例，不生成完整报告。
+各 rank 的 running mean/variance 会分别更新且不再同步。此时需要：
 
-## P3：提高精度可信度
+* 禁止该组合；
+* 或使用 SyncBatchNorm；
+* 或启用适当的 buffer 同步。
 
-1. 修正 RandomErasing。
-2. 增加自然分布校准集或 logit bias/temperature 校准。
-3. 增加 ECE、Brier Score 和置信度分布。
-4. 检测 train/test 视频和内容泄漏。
-5. 对 cls BatchNorm 冻结策略做消融。
-6. 为 bias 和 BatchNorm 参数设置 `weight_decay=0`，不要对所有 cls 参数统一 AdamW 衰减。
+---
+
+# 五、新 checkpoint 方案的一个完整性问题
+
+trainable-only checkpoint 恢复时使用：
+
+```python
+load_state_dict(..., strict=False)
+```
+
+随后只检查 `unexpected_keys`，没有检查 checkpoint 是否缺少某个预期 `cls` 参数。
+
+如果 checkpoint 文件损坏或旧版本缺少某个 `cls` tensor，该 tensor会继续保留基础 checkpoint 中的值，恢复过程可能静默成功。
+
+建议保存时记录：
+
+```text
+expected_trainable_state_keys
+```
+
+恢复时要求：
+
+```text
+checkpoint keys == 当前期望的可训练参数和相关buffer keys
+```
+
+同时检查 missing 和 unexpected。
+
+---
+
+# 六、建议的执行优先级
+
+## 八卡正式长跑前必须完成
+
+1. 让 evaluator 支持与部署一致的 BF16/FP16 autocast。
+2. 在 910B2 单卡上跑 100 step，并触发一次 quick 和 full test。
+3. 在八卡上跑 100～500 step，再触发一次 full test。
+4. 验证 NPU 上 `bincount`、`scatter_add_`、直方图 AllReduce 和报告合并。
+5. 将最佳模型选择指标改为 macro-game 或组合指标。
+6. 确认 train/test 的两位 video ID 是否全局唯一。
+
+## 百万帧高吞吐训练前完成
+
+1. 用实际数据对比 PNG 和 packed backend。
+2. packed 索引改为整数索引，移除百万项路径字典。
+3. memmap 增加 LRU。
+4. evaluator 消除 batch 内多次 `.item()` 同步。
+5. 使用本地 NVMe，而不是通过约 300 MB/s 的远程随机小文件链路长跑。
+6. 记录各 rank 的 CPU RSS、worker RSS、NPU 利用率和 step P95。
+
+## 精度基线阶段完成
+
+1. 增加 game × label × delta 数据审计。
+2. 使用可配置的最佳模型选择分数。
+3. 比较 FP32 与部署精度下的 `F1@0.99` 差异。
+4. 做增强强度和 cls BatchNorm 策略的消融。
+5. 保留自然分布的 calibration 数据，至少用于验证置信度稳定性。
 
 ---
 
 # 最终判断
 
-这次改动已经把项目从“CUDA 原型骨架”推进到了：
-
-> **具备生产化结构，但尚未通过真实八卡 NPU 评估链路验证的候选版本。**
-
-最值得肯定的是，训练数据的懒采样、分布式评估框架、严格审计、报告模块、CI 和恢复状态都已经补齐。当前真正阻止它进入长跑训练的不是整体设计，而是几个局部但关键的问题：
+当前分支已经解决了上一轮几乎全部明确代码缺陷，尤其是：
 
 ```text
-float64 HCCL
-production配置仍用demo模型
-完整评估中心化汇总
-视频指标定义错误
-uint8 RandomErasing
-重复checkpoint和PNG I/O
+HCCL dtype
+生产模型门禁
+full评估内存
+流式错例
+视频指标
+RandomErasing
+final-best
+checkpoint重复I/O
+视频级索引
+packed backend
 ```
 
-先修复前两项，再进行一次“8 卡、100 step、触发一次 full test”的验证；在这个验证成功前，不建议启动正式的 10 epoch 长跑。
+最新版本已经适合进入**真实 NPU 单卡和八卡 smoke test**，不再需要继续大规模重构后才上机。
 
-[1]: https://www.hiascend.com/document/detail/en/canncommercial/850/API/hcclapiref/hcclcpp_07_0021.html?utm_source=chatgpt.com "HcclAllReduce-Collective Communication-Communication Operators-HCCL API-HCCL API-API-CANN Commercial Edition8.5.0开发文档-昇腾社区"
-[2]: https://docs.pytorch.org/vision/main/_modules/torchvision/transforms/v2/_augment.html "https://docs.pytorch.org/vision/main/_modules/torchvision/transforms/v2/_augment.html"
+现在剩余问题中，最值得优先解决的是：
+
+> **评估精度路径与部署不一致、最佳模型仍按 global F1 选择、packed backend 的百万级 Python 字典，以及缺少真实 HCCL/NPU 验证。**
+
+这四项处理完后，框架才适合进行正式的百万帧八卡长时间训练。

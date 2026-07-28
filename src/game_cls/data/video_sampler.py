@@ -50,6 +50,9 @@ class VideoBalancedPairBatchSampler:
         self.epoch = 0
         self.start_step = 0
         self.last_epoch_delta_counts: Counter[int] = Counter()
+        self.last_epoch_game_label_delta_counts: Counter[
+            tuple[str, int, int]
+        ] = Counter()
         self._support: dict[int, dict[str, dict[int, list[int]]]] = {}
         for video_index, video in enumerate(videos):
             for delta, starts in video.valid_start_positions.items():
@@ -101,6 +104,7 @@ class VideoBalancedPairBatchSampler:
     def __iter__(self) -> Iterator[list[PairRequest]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
         self.last_epoch_delta_counts = Counter()
+        self.last_epoch_game_label_delta_counts = Counter()
         global_batch_size = self.local_batch_size * self.world_size
         deltas = list(self._support)
         delta_weights = [self.delta_probability.get(item, 0.0) for item in deltas]
@@ -130,6 +134,10 @@ class VideoBalancedPairBatchSampler:
                 selected.append(request)
                 used.add(identity)
                 self.last_epoch_delta_counts[request.delta] += 1
+                video = self.videos[request.video_index]
+                self.last_epoch_game_label_delta_counts[
+                    (video.game, video.label, request.delta)
+                ] += 1
             if step < self.start_step:
                 continue
             start = self.rank * self.local_batch_size

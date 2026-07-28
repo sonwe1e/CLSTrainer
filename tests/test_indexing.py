@@ -38,6 +38,17 @@ class IndexBundleTests(unittest.TestCase):
             audit = write_index_bundle(root / "train", root / "test", output)
             self.assertEqual(audit["splits"]["train"]["valid_pairs"]["2"], 1)
             self.assertEqual(
+                audit["splits"]["train"][
+                    "valid_pairs_by_game_label_delta"
+                ][1],
+                {
+                    "game": "game_A",
+                    "label": 0,
+                    "delta": 2,
+                    "count": 1,
+                },
+            )
+            self.assertEqual(
                 pq.read_table(output / "train_frames.parquet").num_rows, 3
             )
             videos = pq.read_table(output / "train_videos.parquet").to_pylist()
@@ -51,6 +62,8 @@ class IndexBundleTests(unittest.TestCase):
             ).to_pylist()
             self.assertEqual(video_entries[0]["frame_ids"], [1, 2, 4])
             self.assertEqual(video_entries[0]["valid_starts_delta2"], [1])
+            self.assertIsNone(video_entries[0]["frame_paths"])
+            self.assertTrue(video_entries[0]["video_directory"])
 
 
 if __name__ == "__main__":

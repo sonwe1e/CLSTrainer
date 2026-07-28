@@ -56,15 +56,15 @@ class ExactTrainingResumeTests(unittest.TestCase):
             run_training(resumed)
 
             full_state = torch.load(
-                root / "full" / "checkpoints" / "model_last.pth",
+                root / "full" / "checkpoints" / "model_last_full.pth",
                 map_location="cpu",
-                weights_only=True,
-            )
+                weights_only=False,
+            )["model"]
             resumed_state = torch.load(
-                root / "resumed" / "checkpoints" / "model_last.pth",
+                root / "resumed" / "checkpoints" / "model_last_full.pth",
                 map_location="cpu",
-                weights_only=True,
-            )
+                weights_only=False,
+            )["model"]
             self.assertEqual(full_state.keys(), resumed_state.keys())
             for key in full_state:
                 self.assertTrue(torch.equal(full_state[key], resumed_state[key]), key)
@@ -72,4 +72,3 @@ class ExactTrainingResumeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

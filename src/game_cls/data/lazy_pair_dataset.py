@@ -36,6 +36,12 @@ def _decode_pair(entry: VideoEntry, request: PairRequest, decoder):
     )
     tensor0 = decoder(path0)
     tensor1 = decoder(path1)
+    def display(reference) -> str:
+        return (
+            reference
+            if isinstance(reference, str)
+            else f"packed://frame/{int(reference)}"
+        )
     return (
         torch.stack((tensor0, tensor1), dim=0),
         {
@@ -45,8 +51,8 @@ def _decode_pair(entry: VideoEntry, request: PairRequest, decoder):
             "frame0_id": frame0_id,
             "frame1_id": frame1_id,
             "delta": request.delta,
-            "image0_path": path0,
-            "image1_path": path1,
+            "image0_path": display(path0),
+            "image1_path": display(path1),
         },
     )
 

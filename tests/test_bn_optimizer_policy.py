@@ -46,6 +46,16 @@ class BatchNormAndOptimizerTests(unittest.TestCase):
         self.assertEqual(len(by_decay[0.01]), 1)
         self.assertEqual(len(by_decay[0.0]), 3)
 
+    def test_ddp_rejects_unsynchronized_cls_batchnorm_statistics(self) -> None:
+        from game_cls.config import load_config
+        from game_cls.engine.trainer import validate_training_config
+
+        config = load_config("configs/cuda_debug.yaml")
+        config.setdefault("distributed", {})["enabled"] = True
+        config["model"]["freeze_cls_batchnorm_stats"] = False
+        with self.assertRaisesRegex(RuntimeError, "SyncBatchNorm"):
+            validate_training_config(config)
+
 
 if __name__ == "__main__":
     unittest.main()

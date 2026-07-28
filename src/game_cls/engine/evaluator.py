@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
 from game_cls.losses.threshold_loss import probability_threshold_to_margin
+from game_cls.engine.device import autocast_context
 from game_cls.metrics.binary_metrics import (
     confusion_from_margins,
     metrics_from_counts,
@@ -65,6 +66,46 @@ def _group_rows(counters: dict, key_names: tuple[str, ...]) -> list[dict]:
         key = key if isinstance(key, tuple) else (key,)
         metrics = metrics_from_counts(*counts).to_dict()
         rows.append({**dict(zip(key_names, key)), **metrics})
+    return rows
+
+
+def _game_label_rows(counters: dict) -> list[dict]:
+    rows = []
+    for (game, label), counts in sorted(counters.items()):
+        metrics = metrics_from_counts(*counts).to_dict()
+        row = {
+            "game": game,
+            "label": label,
+            "sample_count": sum(counts),
+            "tp": metrics["tp"],
+            "fp": metrics["fp"],
+            "fn": metrics["fn"],
+            "tn": metrics["tn"],
+            "f1": None,
+            "roc_auc": None,
+            "pr_auc": None,
+        }
+        if label == 1:
+            row.update(
+                {
+                    "primary_metric": "positive_recall",
+                    "positive_recall": metrics["recall"],
+                    "fn_rate": 1.0 - metrics["recall"],
+                    "negative_specificity": None,
+                    "fp_rate": None,
+                }
+            )
+        else:
+            row.update(
+                {
+                    "primary_metric": "negative_specificity",
+                    "positive_recall": None,
+                    "fn_rate": None,
+                    "negative_specificity": metrics["specificity"],
+                    "fp_rate": 1.0 - metrics["specificity"],
+                }
+            )
+        rows.append(row)
     return rows
 
 
@@ -181,18 +222,24 @@ def _calibration_metrics(
     return ece
 
 
-def _make_reduction_tensors(local_counts, sample_count, cross_entropy_sum, brier_sum, device):
+def _make_reduction_tensors(
+    local_counts, sample_count, cross_entropy_sum, brier_sum, device
+):
     import torch
 
-    counts = torch.tensor(
-        [*local_counts, sample_count],
-        dtype=torch.int64,
-        device=device,
+    counts = torch.cat(
+        (
+            torch.as_tensor(local_counts, dtype=torch.int64, device=device),
+            torch.tensor([sample_count], dtype=torch.int64, device=device),
+        )
     )
-    floating = torch.tensor(
-        [cross_entropy_sum, brier_sum],
-        dtype=torch.float32,
-        device=device,
+    floating = torch.stack(
+        (
+            torch.as_tensor(
+                cross_entropy_sum, dtype=torch.float32, device=device
+            ),
+            torch.as_tensor(brier_sum, dtype=torch.float32, device=device),
+        )
     )
     return counts, floating
 
@@ -212,6 +259,8 @@ def evaluate(
     full_auc_mode: str = "histogram",
     auc_histogram_bins: int = 4096,
     quick_error_limit: int = 200,
+    amp: bool = False,
+    amp_dtype: str = "bfloat16",
 ) -> EvaluationOutput:
     import torch
 
@@ -228,10 +277,10 @@ def evaluate(
     group_video: dict = {}
     group_game_label: dict = {}
     group_video_confidence: dict = {}
-    cross_entropy_sum = 0.0
-    brier_sum = 0.0
+    cross_entropy_sum = torch.zeros((), dtype=torch.float32, device=device)
+    brier_sum = torch.zeros((), dtype=torch.float32, device=device)
     sample_count = 0
-    local_counts = [0, 0, 0, 0]
+    local_counts = torch.zeros(4, dtype=torch.int64, device=device)
     positive_hist = torch.zeros(auc_histogram_bins, dtype=torch.int64, device=device)
     negative_hist = torch.zeros(auc_histogram_bins, dtype=torch.int64, device=device)
     calibration_count = torch.zeros(20, dtype=torch.int64, device=device)
@@ -254,9 +303,17 @@ def evaluate(
             for batch in dataloader:
                 images = batch["images"].to(device, non_blocking=True)
                 if images.dtype == torch.uint8:
-                    images = images.to(torch.float32).div_(255.0)
+                    compute_dtype = (
+                        torch.bfloat16
+                        if amp and amp_dtype == "bfloat16"
+                        else torch.float16
+                        if amp and amp_dtype == "float16"
+                        else torch.float32
+                    )
+                    images = images.to(compute_dtype).div_(255.0)
                 labels = batch["labels"].to(device, non_blocking=True)
-                logits = model(images[:, 0], images[:, 1])
+                with autocast_context(device, amp, amp_dtype):
+                    logits = model(images[:, 0], images[:, 1])
                 if logits.ndim != 2 or logits.shape[1] != 2:
                     raise ValueError(
                         f"Model must return [B,2], got {tuple(logits.shape)}"
@@ -264,18 +321,24 @@ def evaluate(
                 logits_fp32 = logits.float()
                 batch_margins = logits_fp32[:, 1] - logits_fp32[:, 0]
                 probabilities = torch.sigmoid(batch_margins)
-                cross_entropy_sum += torch.nn.functional.cross_entropy(
+                cross_entropy_sum.add_(torch.nn.functional.cross_entropy(
                     logits_fp32, labels, reduction="sum"
-                ).item()
-                brier_sum += torch.square(
+                ))
+                brier_sum.add_(torch.square(
                     probabilities - labels.float()
-                ).sum().item()
+                ).sum())
                 sample_count += len(labels)
                 predictions = batch_margins > cutoff
-                local_counts[0] += int(((predictions) & (labels == 1)).sum().item())
-                local_counts[1] += int(((predictions) & (labels == 0)).sum().item())
-                local_counts[2] += int(((~predictions) & (labels == 1)).sum().item())
-                local_counts[3] += int(((~predictions) & (labels == 0)).sum().item())
+                local_counts.add_(
+                    torch.stack(
+                        (
+                            (predictions & (labels == 1)).sum(),
+                            (predictions & (labels == 0)).sum(),
+                            ((~predictions) & (labels == 1)).sum(),
+                            ((~predictions) & (labels == 0)).sum(),
+                        )
+                    ).to(torch.int64)
+                )
 
                 auc_indices = torch.clamp(
                     (probabilities * auc_histogram_bins).long(),
@@ -312,17 +375,36 @@ def evaluate(
                 ]
                 batch_errors: list[dict] = []
                 batch_near: list[dict] = []
-                for logit, margin_tensor, target_tensor, probability_tensor, meta in zip(
-                    logits_fp32.cpu(),
-                    batch_margins.cpu(),
-                    labels.cpu(),
-                    probabilities.cpu(),
-                    batch_metadata,
+                compact = torch.stack(
+                    (
+                        batch_margins,
+                        probabilities,
+                        labels.to(torch.float32),
+                        predictions.to(torch.float32),
+                    ),
+                    dim=1,
+                ).cpu()
+                report_mask = (
+                    (predictions != labels.bool())
+                    | ((probabilities >= 0.980) & (probabilities <= 0.995))
+                )
+                report_indices = report_mask.nonzero(as_tuple=False).flatten()
+                report_logits = logits_fp32.index_select(
+                    0, report_indices
+                ).cpu()
+                report_logits_by_index = {
+                    int(index): logit
+                    for index, logit in zip(
+                        report_indices.cpu().tolist(), report_logits
+                    )
+                }
+                for index, (values, meta) in enumerate(
+                    zip(compact, batch_metadata)
                 ):
-                    margin = float(margin_tensor)
-                    target = int(target_tensor)
-                    probability = float(probability_tensor)
-                    prediction = int(margin > cutoff)
+                    margin = float(values[0])
+                    probability = float(values[1])
+                    target = int(values[2])
+                    prediction = int(values[3])
                     if exact_scores:
                         margins.append(margin)
                         targets.append(target)
@@ -337,22 +419,26 @@ def evaluate(
                         (game, target, video_id),
                         probability,
                     )
-                    row = {
-                        **meta,
-                        "label": target,
-                        "logit0": float(logit[0]),
-                        "logit1": float(logit[1]),
-                        "margin": margin,
-                        "probability_class1": probability,
-                        "prediction": prediction,
-                        "checkpoint_step": checkpoint_step,
-                    }
-                    if prediction != target:
+                    logit = report_logits_by_index.get(index)
+                    if logit is not None:
+                        row = {
+                            **meta,
+                            "label": target,
+                            "logit0": float(logit[0]),
+                            "logit1": float(logit[1]),
+                            "margin": margin,
+                            "probability_class1": probability,
+                            "prediction": prediction,
+                            "checkpoint_step": checkpoint_step,
+                        }
+                    else:
+                        row = None
+                    if prediction != target and row is not None:
                         batch_errors.append(
                             {**row, "error_type": "FP" if prediction else "FN"}
                         )
                     band = _threshold_band(probability)
-                    if band is not None:
+                    if band is not None and row is not None:
                         batch_near.append({**row, "threshold_band": band})
                 if evaluation_kind == "quick":
                     remaining_errors = max(
@@ -433,7 +519,10 @@ def evaluate(
         video_counters = group_video
         game_label_counters = group_game_label
         video_confidence = group_video_confidence
-        tp, fp, fn, tn = local_counts
+        tp, fp, fn, tn = local_counts.tolist()
+        cross_entropy_sum, brier_sum = torch.stack(
+            (cross_entropy_sum, brier_sum)
+        ).tolist()
 
     if exact_scores:
         ranking = confusion_from_margins(margins, targets, threshold)
@@ -454,7 +543,7 @@ def evaluate(
     )
     by_game = _group_rows(game_counters, ("game",))
     by_video = _video_rows(video_counters, video_confidence)
-    by_game_label = _group_rows(game_label_counters, ("game", "label"))
+    by_game_label = _game_label_rows(game_label_counters)
     calibration_counts = calibration_count.cpu().tolist()
     calibration_probabilities = calibration_probability.cpu().tolist()
     calibration_targets = calibration_target.cpu().tolist()
