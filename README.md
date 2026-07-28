@@ -27,6 +27,10 @@ python -m pytest
 
 Ascend 环境应先按服务器 CANN 版本安装匹配的 PyTorch 和 TorchNPU，再执行基础安装。
 
+正式 NPU 配置位于 `configs/npu_production.yaml`，不再继承 CUDA demo 配置。
+其中的 `model.factory` 和 `model.checkpoint_path` 必须替换为真实模型；未替换、
+checkpoint 不存在或非 `cls` 主干权重未完整加载时，训练会立即终止。
+
 ## 数据索引和严格审计
 
 目录必须满足：
@@ -56,6 +60,11 @@ test `delta=2` pair 不符合要求时，训练会在创建 DataLoader 前终止
 合法起点，sampler 在每个 step 懒生成 pair。测试 pair 使用 rank-local NumPy
 紧凑数组，不补齐、不重复。
 
+索引阶段还会生成 `train_video_entries.parquet` 和
+`test_video_entries.parquet`，训练直接按视频行读取，不再让每个 rank 将百万帧
+转换成 Python dict 和 `FrameRecord`。默认同时计算 SHA-256，严格审计会拒绝
+train/test 共享视频键或相同文件内容。
+
 ## 训练
 
 CPU/CUDA 合成数据 smoke test：
@@ -78,6 +87,18 @@ bash scripts/run_npu_8p.sh
 NPU 运行时会先导入 `torch_npu`、绑定设备，再初始化 HCCL。训练 batch 在 CPU
 侧保持 `uint8`，一次传输到设备后再转换为 FP32/BF16/FP16 并归一化。
 
+如 Profiler 确认 PNG 解码仍是瓶颈，可预解码为固定大小 uint8 分片：
+
+```bash
+python tools/pack_dataset.py \
+  --frame-index indexes/train_frames.parquet \
+  --output-dir /local_nvme/train_packed
+```
+
+分别打包 train/test，然后把生产配置的 `data.backend` 改为 `packed_uint8`，
+并设置 `data.train_packed_index` 与 `data.test_packed_index`。该后端使用内存
+映射读取 CHW uint8，避免训练热路径中的 PNG 解压。数据仍应优先复制到本地 NVMe。
+
 接入真实模型时，将 `model.factory` 设置为 `包名.模块名:函数名`。工厂函数必须
 返回接受 `(image0, image1)` 并输出 `[B,2]` 的 `torch.nn.Module`。
 
@@ -85,9 +106,11 @@ NPU 运行时会先导入 `torch_npu`、绑定设备，再初始化 HCCL。训�
 
 quick test 会从每个 `(game,label,video)` 的 `delta=2` pair 中按时间均匀选取固定
 数量；full test 枚举全部合法 pair。分布式运行时，每个 rank 处理不重复分片，
-混淆矩阵和交叉熵通过 all-reduce 汇总，各 rank 写独立错例分片，由 rank 0 合并。
+混淆矩阵使用 int64、损失使用 float32 all-reduce，兼容 HCCL。full test 默认用
+固定直方图分布式计算 ROC-AUC/PR-AUC，不再把百万 Python 分数集中到 rank 0；
+错例在 batch 内流式写分片，再由 rank 0 流式合并。
 
-报告包含：
+full test 报告包含：
 
 ```text
 metrics.json
@@ -100,6 +123,15 @@ near_threshold.parquet
 errors.html
 ```
 
+quick test 仅写 `metrics.json`、受 `quick_save_error_limit` 全局限制的少量
+FP/FN 与 near-threshold Parquet，不再生成 HTML 和分组 CSV，避免短周期评估
+承担完整报告开销。同一步同时满足 quick/full 周期时只运行 full。
+
+`near_threshold.parquet` 只保存 `0.98 <= p1 <= 0.995` 的样本；更高置信度只记录
+区间计数。指标同时包含 Brier Score、20-bin ECE 和置信度直方图。由于训练采用
+50/50 平衡采样并加入阈值损失，`0.99` 应解释为固定业务分数阈值，而不是天然
+校准后的真实发生概率。
+
 周期性 full test 的角色明确标记为 `observed_dev_test`。训练摘要同时记录 last
 checkpoint 指标、best observed dev-test 指标，以及 quick/full test 的执行次数。
 
@@ -108,3 +140,11 @@ checkpoint 指标、best observed dev-test 指标，以及 quick/full test 的�
 完整 checkpoint 保存 epoch、`step_in_epoch`、global step、sampler 状态、优化器、
 scheduler、scaler、CPU/CUDA/NPU RNG 和各 rank 独立 RNG。训练 pair 自带确定性增强
 seed，因此恢复时可以直接从 epoch 内下一 batch 继续，不重新解码已经消费的 batch。
+
+生产配置的周期性恢复 checkpoint 只保存可训练状态、优化器和基础权重哈希；
+完整 `model_last/model_best` 按较低频率保存。同一步同时触发 best 与 last 时只
+序列化一次，再创建稳定别名，减少冻结主干的重复 I/O。
+
+普通训练日志中的分段时间明确标记为 host enqueue 时间，不表示 NPU 实际算子
+耗时；日志同时报告排除评估/保存的 `train_only_samples/s` 和包含全部停顿的
+`wall_samples/s`。设备级瓶颈必须使用 NPU Event 或 TorchNPU Profiler 验证。

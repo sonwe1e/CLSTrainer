@@ -28,7 +28,18 @@ class StrictAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Strict dataset audit failed"):
             validate_audit(audit)
 
+    def test_rejects_split_leakage_and_missing_hash_audit(self) -> None:
+        audit = valid_audit()
+        audit["leakage"] = {
+            "video_keys_across_splits": [
+                {"game": "game_A", "label": 1, "video_id": "01"}
+            ],
+            "content_hashes_across_splits": [{"sha256": "abc"}],
+            "content_hash_check_enabled": False,
+        }
+        with self.assertRaisesRegex(RuntimeError, "share video keys"):
+            validate_audit(audit, require_content_hash=True)
+
 
 if __name__ == "__main__":
     unittest.main()
-

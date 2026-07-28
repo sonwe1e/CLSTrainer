@@ -78,6 +78,29 @@ def read_video_entries_parquet(
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise RuntimeError("Reading Parquet indexes requires pyarrow") from exc
+    schema_names = set(pq.read_schema(path).names)
+    if "frame_ids" in schema_names:
+        entries = []
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=256):
+            for row in batch.to_pylist():
+                valid = {
+                    delta: np.asarray(
+                        row.get(f"valid_starts_delta{delta}", []),
+                        dtype=np.int32,
+                    )
+                    for delta in deltas
+                }
+                entries.append(
+                    VideoEntry(
+                        game=row["game"],
+                        label=int(row["label"]),
+                        video_id=row["video_id"],
+                        frame_ids=np.asarray(row["frame_ids"], dtype=np.int32),
+                        frame_paths=tuple(row["frame_paths"]),
+                        valid_start_positions=valid,
+                    )
+                )
+        return entries
     columns = [
         "sample_id",
         "split",
@@ -90,11 +113,45 @@ def read_video_entries_parquet(
         "height",
         "channels",
         "file_size",
+        "content_sha256",
     ]
-    table = pq.read_table(path, columns=columns)
+    table = pq.read_table(
+        path, columns=[column for column in columns if column in schema_names]
+    )
     return build_video_entries(
         (FrameRecord(**row) for row in table.to_pylist()),
         deltas=deltas,
+    )
+
+
+def write_video_entries_parquet(
+    entries: Iterable[VideoEntry], path: str | Path
+) -> None:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("Writing video indexes requires pyarrow") from exc
+    rows = []
+    for entry in entries:
+        row = {
+            "game": entry.game,
+            "label": entry.label,
+            "video_id": entry.video_id,
+            "frame_ids": entry.frame_ids.tolist(),
+            "frame_paths": list(entry.frame_paths),
+        }
+        for delta in (1, 2, 3):
+            row[f"valid_starts_delta{delta}"] = entry.valid_start_positions.get(
+                delta, np.empty(0, dtype=np.int32)
+            ).tolist()
+        rows.append(row)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(rows),
+        path,
+        compression="zstd",
     )
 
 

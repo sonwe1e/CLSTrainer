@@ -81,6 +81,53 @@ def _write_parquet(rows: list[dict], path: Path) -> None:
     )
 
 
+class EvaluationShardWriter:
+    """Incrementally writes evaluation rows without retaining the full test set."""
+
+    def __init__(self, output_dir: str | Path, rank: int) -> None:
+        _, _, pq = _arrow()
+        shard_dir = Path(output_dir) / "shards"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        schema = _report_schema()
+        self._error_writer = pq.ParquetWriter(
+            shard_dir / f"errors_rank_{rank:04d}.parquet",
+            schema,
+            compression="zstd",
+        )
+        self._near_writer = pq.ParquetWriter(
+            shard_dir / f"near_threshold_rank_{rank:04d}.parquet",
+            schema,
+            compression="zstd",
+        )
+        self._closed = False
+
+    @staticmethod
+    def _table(rows: list[dict]):
+        pa, _, _ = _arrow()
+        normalized = [
+            {field: row.get(field) for field in ERROR_FIELDS} for row in rows
+        ]
+        return pa.Table.from_pylist(normalized, schema=_report_schema())
+
+    def write(self, errors: list[dict], near_threshold: list[dict]) -> None:
+        if errors:
+            self._error_writer.write_table(self._table(errors))
+        if near_threshold:
+            self._near_writer.write_table(self._table(near_threshold))
+
+    def close(self) -> None:
+        if not self._closed:
+            self._error_writer.close()
+            self._near_writer.close()
+            self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
 def prepare_evaluation_directory(output_dir: str | Path, rank: int) -> None:
     """Remove only stale generated shard files before a repeated evaluation."""
     output_dir = Path(output_dir)
@@ -159,16 +206,19 @@ def _merge_error_shards(
     preview: list[dict] = []
     try:
         for path in sorted(paths):
-            table = pq.read_table(path, schema=schema)
-            for error_type, writer in (("FP", fp_writer), ("FN", fn_writer)):
-                filtered = table.filter(
-                    pc.equal(table["error_type"], pa.scalar(error_type))
-                )
-                if len(filtered):
-                    writer.write_table(filtered)
-                    remaining = html_max_errors - len(preview)
-                    if remaining > 0:
-                        preview.extend(filtered.slice(0, remaining).to_pylist())
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=65536):
+                table = pa.Table.from_batches([batch], schema=schema)
+                for error_type, writer in (("FP", fp_writer), ("FN", fn_writer)):
+                    filtered = table.filter(
+                        pc.equal(table["error_type"], pa.scalar(error_type))
+                    )
+                    if len(filtered):
+                        writer.write_table(filtered)
+                        remaining = html_max_errors - len(preview)
+                        if remaining > 0:
+                            preview.extend(
+                                filtered.slice(0, remaining).to_pylist()
+                            )
     finally:
         fp_writer.close()
         fn_writer.close()
@@ -176,14 +226,15 @@ def _merge_error_shards(
 
 
 def _merge_plain_shards(paths: Iterable[Path], output_path: Path) -> None:
-    _, _, pq = _arrow()
+    pa, _, pq = _arrow()
     schema = _report_schema()
     writer = pq.ParquetWriter(output_path, schema, compression="zstd")
     try:
         for path in sorted(paths):
-            table = pq.read_table(path, schema=schema)
-            if len(table):
-                writer.write_table(table)
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=65536):
+                table = pa.Table.from_batches([batch], schema=schema)
+                if len(table):
+                    writer.write_table(table)
     finally:
         writer.close()
 
@@ -197,6 +248,7 @@ def write_evaluation_report(
     near_threshold: list[dict] | None = None,
     merge_shards: bool = False,
     html_max_errors: int = 200,
+    lightweight: bool = False,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,16 +256,19 @@ def write_evaluation_report(
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    _write_group_csv(
-        output_dir / "metrics_by_game.csv", grouped_metrics.get("by_game", [])
-    )
-    _write_group_csv(
-        output_dir / "metrics_by_video.csv", grouped_metrics.get("by_video", [])
-    )
-    _write_group_csv(
-        output_dir / "metrics_by_game_label.csv",
-        grouped_metrics.get("by_game_label", []),
-    )
+    if not lightweight:
+        _write_group_csv(
+            output_dir / "metrics_by_game.csv",
+            grouped_metrics.get("by_game", []),
+        )
+        _write_group_csv(
+            output_dir / "metrics_by_video.csv",
+            grouped_metrics.get("by_video", []),
+        )
+        _write_group_csv(
+            output_dir / "metrics_by_game_label.csv",
+            grouped_metrics.get("by_game_label", []),
+        )
     if merge_shards:
         preview = _merge_error_shards(
             (output_dir / "shards").glob("errors_rank_*.parquet"),
@@ -239,4 +294,5 @@ def write_evaluation_report(
         _write_parquet(
             near_threshold or [], output_dir / "near_threshold.parquet"
         )
-    _write_html(output_dir / "errors.html", preview)
+    if not lightweight:
+        _write_html(output_dir / "errors.html", preview)

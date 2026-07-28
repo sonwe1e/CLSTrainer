@@ -23,6 +23,7 @@ class FrameRecord:
     height: int
     channels: int
     file_size: int
+    content_sha256: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -139,4 +140,3 @@ def summarize_videos(frames: Iterable[FrameRecord]) -> list[VideoRecord]:
             )
         )
     return records
-

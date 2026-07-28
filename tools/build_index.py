@@ -15,11 +15,20 @@ def main() -> None:
     parser.add_argument("--train-root", required=True)
     parser.add_argument("--test-root", required=True)
     parser.add_argument("--output-dir", default="indexes")
+    parser.add_argument(
+        "--skip-content-hash",
+        action="store_true",
+        help="Skip SHA-256 leakage detection to reduce indexing I/O",
+    )
     args = parser.parse_args()
-    audit = write_index_bundle(args.train_root, args.test_root, args.output_dir)
+    audit = write_index_bundle(
+        args.train_root,
+        args.test_root,
+        args.output_dir,
+        compute_content_hash=not args.skip_content_hash,
+    )
     print(json.dumps(audit, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
     main()
-

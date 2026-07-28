@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict
+import hashlib
 import json
 from pathlib import Path
 from typing import Iterable
@@ -16,6 +17,14 @@ from .records import (
 )
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def scan_split(
     root: str | Path,
     split: str,
@@ -23,6 +32,7 @@ def scan_split(
     expected_width: int = 208,
     expected_height: int = 448,
     expected_channels: int = 3,
+    compute_content_hash: bool = True,
 ) -> tuple[list[FrameRecord], list[dict]]:
     root = Path(root).resolve()
     frames: list[FrameRecord] = []
@@ -86,6 +96,7 @@ def scan_split(
                 height=height,
                 channels=channels,
                 file_size=path.stat().st_size,
+                content_sha256=_sha256(path) if compute_content_hash else "",
             )
         )
     return frames, issues
@@ -153,17 +164,51 @@ def make_audit(
                 for delta in (1, 2, 3)
             },
         }
-    return {"expected": {
-        "width": expected_width,
-        "height": expected_height,
-        "channels": expected_channels,
-    }, "splits": split_reports}
+    train_frames = frames_by_split.get("train", [])
+    test_frames = frames_by_split.get("test", [])
+    train_videos = {
+        (frame.game, frame.label, frame.video_id) for frame in train_frames
+    }
+    test_videos = {
+        (frame.game, frame.label, frame.video_id) for frame in test_frames
+    }
+    train_hashes = {
+        frame.content_sha256: frame.path
+        for frame in train_frames
+        if frame.content_sha256
+    }
+    duplicate_hashes = [
+        {
+            "sha256": frame.content_sha256,
+            "train_path": train_hashes[frame.content_sha256],
+            "test_path": frame.path,
+        }
+        for frame in test_frames
+        if frame.content_sha256 in train_hashes
+    ]
+    return {
+        "expected": {
+            "width": expected_width,
+            "height": expected_height,
+            "channels": expected_channels,
+        },
+        "splits": split_reports,
+        "leakage": {
+            "video_keys_across_splits": [
+                {"game": game, "label": label, "video_id": video_id}
+                for game, label, video_id in sorted(train_videos & test_videos)
+            ],
+            "content_hashes_across_splits": duplicate_hashes,
+            "content_hash_check_enabled": bool(train_hashes),
+        },
+    }
 
 
 def validate_audit(
     audit: dict,
     *,
     require_test_delta: int = 2,
+    require_content_hash: bool = False,
 ) -> None:
     problems: list[str] = []
     for split in ("train", "test"):
@@ -186,18 +231,40 @@ def validate_audit(
     test_report = audit.get("splits", {}).get("test", {})
     if int(test_report.get("valid_pairs", {}).get(str(require_test_delta), 0)) <= 0:
         problems.append(f"test has no legal delta={require_test_delta} pairs")
+    leakage = audit.get("leakage", {})
+    if require_content_hash and not leakage.get("content_hash_check_enabled", False):
+        problems.append("content-hash leakage check was not performed")
+    if leakage.get("video_keys_across_splits"):
+        problems.append(
+            "train/test share video keys: "
+            f"{leakage['video_keys_across_splits'][:20]}"
+        )
+    if leakage.get("content_hashes_across_splits"):
+        problems.append(
+            "train/test contain identical file hashes: "
+            f"{len(leakage['content_hashes_across_splits'])}"
+        )
     if problems:
         raise RuntimeError("Strict dataset audit failed: " + "; ".join(problems))
 
 
-def validate_audit_file(path: str | Path, *, require_test_delta: int = 2) -> dict:
+def validate_audit_file(
+    path: str | Path,
+    *,
+    require_test_delta: int = 2,
+    require_content_hash: bool = False,
+) -> dict:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(
             f"Strict audit is enabled but audit report is missing: {path}"
         )
     audit = json.loads(path.read_text(encoding="utf-8"))
-    validate_audit(audit, require_test_delta=require_test_delta)
+    validate_audit(
+        audit,
+        require_test_delta=require_test_delta,
+        require_content_hash=require_content_hash,
+    )
     return audit
 
 
@@ -206,16 +273,28 @@ def write_index_bundle(
     test_root: str | Path,
     output_dir: str | Path,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
+    compute_content_hash: bool = True,
 ) -> dict:
     output_dir = Path(output_dir)
     frames_by_split: dict[str, list[FrameRecord]] = {}
     issues_by_split: dict[str, list[dict]] = {}
     for split, root in (("train", train_root), ("test", test_root)):
-        frames, issues = scan_split(root, split, filename_pattern)
+        frames, issues = scan_split(
+            root,
+            split,
+            filename_pattern,
+            compute_content_hash=compute_content_hash,
+        )
         frames_by_split[split] = frames
         issues_by_split[split] = issues
         write_parquet(frames, output_dir / f"{split}_frames.parquet")
         write_parquet(summarize_videos(frames), output_dir / f"{split}_videos.parquet")
+        from .video_index import build_video_entries, write_video_entries_parquet
+
+        write_video_entries_parquet(
+            build_video_entries(frames),
+            output_dir / f"{split}_video_entries.parquet",
+        )
     audit = make_audit(frames_by_split, issues_by_split)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "audit.json").write_text(

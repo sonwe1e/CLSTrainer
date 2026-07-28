@@ -87,6 +87,26 @@ class PairAugmentTests(unittest.TestCase):
             self.assertEqual(output.dtype, torch.uint8)
             self.assertTrue(torch.equal(output[0], output[1]))
 
+    def test_uint8_random_erasing_uses_full_rgb_range(self) -> None:
+        from game_cls.data.augment import ConsistentPairAugment
+
+        transform = ConsistentPairAugment(
+            {
+                "random_erasing": {
+                    "enabled": True,
+                    "probability": 1.0,
+                    "scale": [0.25, 0.25],
+                    "ratio": [1.0, 1.0],
+                    "value": "random",
+                }
+            }
+        )
+        frame = torch.zeros(3, 32, 32, dtype=torch.uint8)
+        output = transform(torch.stack([frame, frame]))
+        self.assertTrue(torch.equal(output[0], output[1]))
+        self.assertGreater(int(output.max()), 32)
+        self.assertGreater(torch.unique(output).numel(), 16)
+
 
 if __name__ == "__main__":
     unittest.main()

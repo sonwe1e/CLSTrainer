@@ -1,19 +1,25 @@
 experiment:
-  name: dual_frame_game_cls_debug
+  name: dual_frame_game_cls_npu
   seed: 20260728
-  output_dir: runs/dual_frame_game_cls_debug
+  output_dir: runs/dual_frame_game_cls_npu
 
 device:
-  accelerator: auto
-  amp: false
-  amp_dtype: float16
+  accelerator: npu
+  amp: true
+  amp_dtype: bfloat16
 
 data:
-  synthetic: true
+  synthetic: false
   strict_audit: true
+  require_content_hash_audit: true
   audit_path: indexes/audit.json
+  train_video_index: indexes/train_video_entries.parquet
+  test_video_index: indexes/test_video_entries.parquet
   train_index: indexes/train_frames.parquet
   test_index: indexes/test_frames.parquet
+  backend: png
+  train_packed_index: null
+  test_packed_index: null
   width: 208
   height: 448
 
@@ -47,15 +53,17 @@ augmentation:
     probability: 0.10
     scale: [0.005, 0.03]
     ratio: [0.3, 3.3]
-    value: random
+    value: 0
 
 model:
-  factory: game_cls.model.builder:build_demo_model
+  factory: your_package.your_module:build_model
   checkpoint_path: null
   trainable_name_contains: cls
   num_classes: 2
   freeze_backbone_batchnorm_stats: true
   freeze_cls_batchnorm_stats: true
+  require_pretrained_backbone: true
+  minimum_non_cls_coverage: 0.99
 
 loss:
   cross_entropy_weight: 1.0
@@ -73,35 +81,39 @@ optimizer:
 
 scheduler:
   name: cosine
-  warmup_steps: 10
+  warmup_steps: 500
   min_learning_rate: 0.00001
 
 train:
-  epochs: 1
-  steps_per_epoch: 100
-  max_steps: 100
+  epochs: 10
+  steps_per_epoch: 1000
+  max_steps: null
   stop_after_steps: null
   resume_path: null
-  verify_frozen_parameters: true
-  local_batch_size: 4
+  verify_frozen_parameters: false
+  local_batch_size: 64
   gradient_clip_norm: 5.0
-  log_every_steps: 10
+  log_every_steps: 50
 
 dataloader:
-  num_workers: 0
-  persistent_workers: false
-  prefetch_factor: 2
-  pin_memory: false
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
 
 evaluation:
   threshold: 0.99
-  quick_test_every_steps: 50
-  quick_test_pairs_per_video: 16
-  full_test_every_steps: 100
+  quick_test_every_steps: 1000
+  quick_test_pairs_per_video: 128
+  full_test_every_steps: 5000
   full_test_at_end: true
-  save_all_errors: true
+  full_auc_mode: histogram
+  auc_histogram_bins: 4096
+  quick_save_error_limit: 200
   html_max_errors_per_group: 200
 
 checkpoint:
-  save_last_every_steps: 50
+  save_last_every_steps: 1000
   save_best_test_f1: true
+  periodic_state_mode: trainable_only
+  full_model_every_steps: 5000

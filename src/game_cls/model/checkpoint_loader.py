@@ -12,6 +12,39 @@ class LoadReport:
     shape_mismatch: tuple[str, ...]
 
 
+def validate_production_load(
+    model,
+    report: LoadReport,
+    *,
+    trainable_name_contains: str = "cls",
+    minimum_non_cls_coverage: float = 0.99,
+) -> float:
+    state_keys = set(model.state_dict())
+    non_cls_keys = {
+        key for key in state_keys if trainable_name_contains not in key
+    }
+    loaded_non_cls = {
+        key for key in report.loaded if trainable_name_contains not in key
+    }
+    missing_non_cls = {
+        key for key in report.missing if trainable_name_contains not in key
+    }
+    mismatch_non_cls = {
+        key for key in report.shape_mismatch if trainable_name_contains not in key
+    }
+    coverage = (
+        len(loaded_non_cls) / len(non_cls_keys) if non_cls_keys else 1.0
+    )
+    if missing_non_cls or mismatch_non_cls or coverage < minimum_non_cls_coverage:
+        raise RuntimeError(
+            "Production checkpoint did not fully load the frozen backbone: "
+            f"coverage={coverage:.2%}, "
+            f"missing_non_cls={sorted(missing_non_cls)}, "
+            f"shape_mismatch_non_cls={sorted(mismatch_non_cls)}"
+        )
+    return coverage
+
+
 def extract_state_dict(checkpoint) -> dict:
     if isinstance(checkpoint, dict) and isinstance(checkpoint.get("model"), dict):
         state = checkpoint["model"]
@@ -44,4 +77,3 @@ def load_model_checkpoint(model, path: str | Path) -> LoadReport:
         unexpected=tuple(sorted(key for key in incoming if key not in current)),
         shape_mismatch=tuple(sorted(shape_mismatch)),
     )
-

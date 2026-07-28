@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import random
+import hashlib
+from functools import lru_cache
+import shutil
 
 
 def unwrap_model(model):
@@ -19,6 +22,35 @@ def _atomic_torch_save(payload, path: Path) -> None:
     with temporary.open("r+b") as stream:
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def clone_checkpoint_pair(
+    output_dir: str | Path, source_tag: str, target_tag: str
+) -> None:
+    """Create best aliases from an already serialized checkpoint pair."""
+    output_dir = Path(output_dir)
+    for prefix in ("model", "checkpoint"):
+        source = output_dir / f"{prefix}_{source_tag}.pth"
+        if not source.is_file():
+            continue
+        target = output_dir / f"{prefix}_{target_tag}.pth"
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+
+
+@lru_cache(maxsize=8)
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def capture_random_state() -> dict:
@@ -75,13 +107,43 @@ def save_checkpoint_pair(
     sampler_state: dict | None = None,
     rank_random_states: list[dict] | None = None,
     evaluation_state: dict | None = None,
+    state_mode: str = "full",
+    write_model_only: bool = True,
 ) -> None:
     output_dir = Path(output_dir)
-    state_dict = unwrap_model(model).state_dict()
-    _atomic_torch_save(state_dict, output_dir / f"model_{tag}.pth")
+    unwrapped = unwrap_model(model)
+    full_state_dict = unwrapped.state_dict()
+    if state_mode == "trainable_only":
+        trainable_names = {
+            name for name, parameter in unwrapped.named_parameters()
+            if parameter.requires_grad
+        }
+        checkpoint_state_dict = {
+            key: value
+            for key, value in full_state_dict.items()
+            if key in trainable_names
+            or any(key.startswith(name.rsplit(".", 1)[0] + ".") for name in trainable_names)
+        }
+    elif state_mode == "full":
+        checkpoint_state_dict = full_state_dict
+    else:
+        raise ValueError(f"Unsupported checkpoint state mode: {state_mode}")
+    if write_model_only:
+        _atomic_torch_save(full_state_dict, output_dir / f"model_{tag}.pth")
+    base_checkpoint = config.get("model", {}).get("checkpoint_path")
+    base_hash = (
+        _file_sha256(str(Path(base_checkpoint).resolve()))
+        if state_mode == "trainable_only"
+        and base_checkpoint
+        and Path(base_checkpoint).is_file()
+        else None
+    )
     _atomic_torch_save(
         {
-            "model": state_dict,
+            "model": checkpoint_state_dict,
+            "model_state_mode": state_mode,
+            "base_checkpoint": base_checkpoint,
+            "base_checkpoint_sha256": base_hash,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler else None,
             "scaler": scaler.state_dict() if scaler else None,
@@ -108,12 +170,36 @@ def save_checkpoint_pair(
 
 
 def restore_training_checkpoint(
-    path: str | Path, model, optimizer=None, scheduler=None, scaler=None
+    path: str | Path,
+    model,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    expected_base_checkpoint: str | Path | None = None,
 ) -> dict:
     import torch
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    unwrap_model(model).load_state_dict(checkpoint["model"])
+    state_mode = checkpoint.get("model_state_mode", "full")
+    if state_mode == "trainable_only":
+        stored_hash = checkpoint.get("base_checkpoint_sha256")
+        if stored_hash and expected_base_checkpoint:
+            actual_hash = _file_sha256(
+                str(Path(expected_base_checkpoint).resolve())
+            )
+            if actual_hash != stored_hash:
+                raise RuntimeError(
+                    "Resume base checkpoint hash does not match the checkpoint state."
+                )
+        result = unwrap_model(model).load_state_dict(
+            checkpoint["model"], strict=False
+        )
+        if result.unexpected_keys:
+            raise RuntimeError(
+                f"Unexpected trainable checkpoint keys: {result.unexpected_keys}"
+            )
+    else:
+        unwrap_model(model).load_state_dict(checkpoint["model"])
     if optimizer is not None and checkpoint.get("optimizer"):
         optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler"):

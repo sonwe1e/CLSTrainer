@@ -43,8 +43,15 @@ class IndexBundleTests(unittest.TestCase):
             videos = pq.read_table(output / "train_videos.parquet").to_pylist()
             self.assertEqual(videos[0]["valid_pair_count_delta2"], 1)
             self.assertTrue((output / "audit.json").is_file())
+            self.assertTrue(
+                (output / "train_video_entries.parquet").is_file()
+            )
+            video_entries = pq.read_table(
+                output / "train_video_entries.parquet"
+            ).to_pylist()
+            self.assertEqual(video_entries[0]["frame_ids"], [1, 2, 4])
+            self.assertEqual(video_entries[0]["valid_starts_delta2"], [1])
 
 
 if __name__ == "__main__":
     unittest.main()
-

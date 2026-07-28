@@ -37,7 +37,12 @@ def configure_trainable_parameters(
 
 
 def set_frozen_backbone_train_mode(
-    model, name_contains: str = "cls", freeze_batchnorm_stats: bool = True
+    model,
+    name_contains: str = "cls",
+    freeze_batchnorm_stats: bool | None = None,
+    *,
+    freeze_backbone_batchnorm_stats: bool = True,
+    freeze_cls_batchnorm_stats: bool = True,
 ) -> None:
     try:
         from torch import nn
@@ -48,9 +53,17 @@ def set_frozen_backbone_train_mode(
     for module_name, module in model.named_modules():
         if name_contains in module_name:
             module.train()
-    if freeze_batchnorm_stats:
-        for module in model.modules():
-            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+    if freeze_batchnorm_stats is not None:
+        freeze_backbone_batchnorm_stats = freeze_batchnorm_stats
+        freeze_cls_batchnorm_stats = freeze_batchnorm_stats
+    for module_name, module in model.named_modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            is_cls = name_contains in module_name
+            if (
+                is_cls and freeze_cls_batchnorm_stats
+            ) or (
+                not is_cls and freeze_backbone_batchnorm_stats
+            ):
                 module.eval()
 
 

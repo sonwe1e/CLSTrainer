@@ -16,22 +16,26 @@ class PairRequest:
     augmentation_seed: int = 0
 
 
-def _decode_pair(entry: VideoEntry, request: PairRequest):
+def _decode_image_png(path: str):
     try:
-        import torch
         from PIL import Image
         from torchvision.transforms.v2 import functional as F
     except ImportError as exc:
         raise RuntimeError(
             "Decoding pairs requires torch, torchvision and Pillow"
         ) from exc
+    with Image.open(path) as image:
+        return F.to_image(image.convert("RGB"))
+
+
+def _decode_pair(entry: VideoEntry, request: PairRequest, decoder):
+    import torch
+
     frame0_id, frame1_id, path0, path1 = entry.pair_paths(
         request.delta, request.start_position
     )
-    with Image.open(path0) as image0:
-        tensor0 = F.to_image(image0.convert("RGB"))
-    with Image.open(path1) as image1:
-        tensor1 = F.to_image(image1.convert("RGB"))
+    tensor0 = decoder(path0)
+    tensor1 = decoder(path1)
     return (
         torch.stack((tensor0, tensor1), dim=0),
         {
@@ -54,9 +58,11 @@ class LazyTrainingPairDataset:
         self,
         videos: Sequence[VideoEntry],
         transform: Callable[[Any], Any] | None = None,
+        decoder: Callable[[str], Any] | None = None,
     ) -> None:
         self.videos = videos
         self.transform = transform
+        self.decoder = decoder or _decode_image_png
 
     def __len__(self) -> int:
         return sum(
@@ -68,7 +74,9 @@ class LazyTrainingPairDataset:
     def __getitem__(self, request: PairRequest) -> dict[str, Any]:
         import torch
 
-        images, meta = _decode_pair(self.videos[request.video_index], request)
+        images, meta = _decode_pair(
+            self.videos[request.video_index], request, self.decoder
+        )
         if self.transform is not None:
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(request.augmentation_seed)
@@ -85,11 +93,13 @@ class EvalPairDataset:
         video_indices: np.ndarray,
         deltas: np.ndarray,
         start_positions: np.ndarray,
+        decoder: Callable[[str], Any] | None = None,
     ) -> None:
         self.videos = videos
         self.video_indices = video_indices.astype(np.int32, copy=False)
         self.deltas = deltas.astype(np.int8, copy=False)
         self.start_positions = start_positions.astype(np.int32, copy=False)
+        self.decoder = decoder or _decode_image_png
 
     def __len__(self) -> int:
         return len(self.video_indices)
@@ -100,7 +110,9 @@ class EvalPairDataset:
             delta=int(self.deltas[index]),
             start_position=int(self.start_positions[index]),
         )
-        images, meta = _decode_pair(self.videos[request.video_index], request)
+        images, meta = _decode_pair(
+            self.videos[request.video_index], request, self.decoder
+        )
         return {"images": images, "label": meta["label"], "meta": meta}
 
     @property
@@ -119,6 +131,7 @@ def build_eval_dataset(
     rank: int = 0,
     world_size: int = 1,
     max_pairs_per_video: int | None = None,
+    decoder: Callable[[str], Any] | None = None,
 ) -> EvalPairDataset:
     video_indices: list[int] = []
     deltas: list[int] = []
@@ -142,4 +155,5 @@ def build_eval_dataset(
         np.asarray(video_indices, dtype=np.int32),
         np.asarray(deltas, dtype=np.int8),
         np.asarray(start_positions, dtype=np.int32),
+        decoder=decoder,
     )
