@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -8,20 +9,21 @@ import time
 from typing import Any
 
 from game_cls.data.collate import pair_collate
-from game_cls.data.pair_dataset import PairDataset, enumerate_pairs
-from game_cls.data.pair_sampler import BalancedDistributedPairBatchSampler
 from game_cls.engine.checkpoint import (
+    capture_random_state,
+    restore_random_state,
     restore_training_checkpoint,
     save_checkpoint_pair,
     unwrap_model,
 )
-from game_cls.engine.device import autocast_context, initialize_device
+from game_cls.engine.device import autocast_context
 from game_cls.engine.distributed import (
     cleanup_distributed,
     distributed_barrier,
-    distributed_context,
+    initialize_runtime,
+    is_distributed,
 )
-from game_cls.engine.evaluator import evaluate
+from game_cls.engine.evaluator import EvaluationOutput, evaluate
 from game_cls.losses.threshold_loss import combined_loss
 from game_cls.model.builder import build_model
 from game_cls.model.checkpoint_loader import load_model_checkpoint
@@ -31,7 +33,11 @@ from game_cls.model.freeze_policy import (
     set_frozen_backbone_train_mode,
     snapshot_frozen_parameters,
 )
-from game_cls.reports.error_writer import write_evaluation_report
+from game_cls.reports.error_writer import (
+    prepare_evaluation_directory,
+    write_evaluation_report,
+    write_evaluation_shard,
+)
 
 
 class SyntheticPairDataset:
@@ -67,8 +73,19 @@ class SyntheticPairDataset:
                 "frame0_id": index,
                 "frame1_id": index + 2,
                 "delta": 2,
+                "image0_path": "",
+                "image1_path": "",
             },
         }
+
+
+@dataclass
+class LoaderBundle:
+    train: Any
+    quick_test: Any
+    full_test: Any
+    sampler: Any
+    data_summary: dict
 
 
 def _seed_everything(seed: int) -> None:
@@ -82,67 +99,116 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _make_dataloaders(config: dict, rank: int, world_size: int):
-    import torch
-    from torch.utils.data import DataLoader
-
-    data_cfg = config["data"]
-    train_cfg = config["train"]
-    loader_cfg = config["dataloader"]
-    batch_size = int(train_cfg["local_batch_size"])
-    workers = int(loader_cfg.get("num_workers", 0))
+def _loader_common(config: dict) -> dict:
+    workers = int(config["dataloader"].get("num_workers", 0))
     common = {
         "num_workers": workers,
-        "pin_memory": loader_cfg.get("pin_memory", False),
+        "pin_memory": config["dataloader"].get("pin_memory", False),
         "collate_fn": pair_collate,
     }
     if workers > 0:
-        common["persistent_workers"] = loader_cfg.get("persistent_workers", True)
-        common["prefetch_factor"] = loader_cfg.get("prefetch_factor", 2)
+        common["persistent_workers"] = config["dataloader"].get(
+            "persistent_workers", True
+        )
+        common["prefetch_factor"] = config["dataloader"].get("prefetch_factor", 2)
+    return common
+
+
+def _make_dataloaders(
+    config: dict, rank: int, world_size: int
+) -> LoaderBundle:
+    from torch.utils.data import DataLoader, Subset
+
+    from game_cls.data.video_sampler import DeterministicIndexBatchSampler
+
+    data_cfg = config["data"]
+    train_cfg = config["train"]
+    batch_size = int(train_cfg["local_batch_size"])
+    steps_per_epoch = int(train_cfg["steps_per_epoch"])
+    common = _loader_common(config)
 
     if data_cfg.get("synthetic", False):
-        train_length = max(
-            batch_size * int(train_cfg["steps_per_epoch"]) * world_size, 128
-        )
+        train_length = max(batch_size * steps_per_epoch * world_size, 128)
         train_dataset = SyntheticPairDataset(
-            train_length, data_cfg["height"], data_cfg["width"], config["experiment"]["seed"]
+            train_length,
+            data_cfg["height"],
+            data_cfg["width"],
+            config["experiment"]["seed"],
         )
         test_dataset = SyntheticPairDataset(
-            64, data_cfg["height"], data_cfg["width"], config["experiment"]["seed"] + 99
+            64,
+            data_cfg["height"],
+            data_cfg["width"],
+            config["experiment"]["seed"] + 99,
         )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True,
-            **common,
+        sampler = DeterministicIndexBatchSampler(
+            train_length,
+            batch_size,
+            steps_per_epoch,
+            rank=rank,
+            world_size=world_size,
+            seed=config["experiment"]["seed"],
         )
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, **common)
-        return train_loader, test_loader, None
+        full_indices = list(range(rank, len(test_dataset), world_size))
+        quick_global = min(
+            len(test_dataset),
+            int(config["evaluation"].get("quick_test_pairs_per_video", 16)) * 2,
+        )
+        quick_indices = list(range(rank, quick_global, world_size))
+        return LoaderBundle(
+            train=DataLoader(train_dataset, batch_sampler=sampler, **common),
+            quick_test=DataLoader(
+                Subset(test_dataset, quick_indices), batch_size=batch_size, **common
+            ),
+            full_test=DataLoader(
+                Subset(test_dataset, full_indices), batch_size=batch_size, **common
+            ),
+            sampler=sampler,
+            data_summary={
+                "storage": "synthetic",
+                "train_samples": train_length,
+                "quick_test_samples_global": quick_global,
+                "full_test_samples_global": len(test_dataset),
+            },
+        )
 
     from game_cls.data.augment import ConsistentPairAugment
-    from game_cls.data.indexing import read_frame_parquet
+    from game_cls.data.indexing import validate_audit_file
+    from game_cls.data.lazy_pair_dataset import (
+        LazyTrainingPairDataset,
+        build_eval_dataset,
+    )
+    from game_cls.data.video_index import (
+        read_video_entries_parquet,
+        video_index_memory_bytes,
+    )
+    from game_cls.data.video_sampler import VideoBalancedPairBatchSampler
 
-    train_frames = read_frame_parquet(data_cfg["train_index"])
-    test_frames = read_frame_parquet(data_cfg["test_index"])
+    if data_cfg.get("strict_audit", True):
+        audit_path = data_cfg.get("audit_path")
+        if not audit_path:
+            audit_path = str(Path(data_cfg["train_index"]).parent / "audit.json")
+        validate_audit_file(
+            audit_path, require_test_delta=int(config["pair"]["test_delta"])
+        )
     delta_probability = {
         int(key): float(value)
         for key, value in config["pair"]["train_delta_probability"].items()
     }
-    train_pairs = enumerate_pairs(train_frames, list(delta_probability))
-    test_pairs = enumerate_pairs(test_frames, [int(config["pair"]["test_delta"])])
-    if not train_pairs or not test_pairs:
-        raise RuntimeError("Train and test indexes must both contain legal pairs")
+    train_videos = read_video_entries_parquet(
+        data_cfg["train_index"], delta_probability.keys()
+    )
+    test_delta = int(config["pair"]["test_delta"])
+    test_videos = read_video_entries_parquet(data_cfg["test_index"], (test_delta,))
     transform = None
     if config.get("augmentation", {}).get("enabled", True):
         transform = ConsistentPairAugment(config["augmentation"])
-    train_dataset = PairDataset(train_pairs, transform=transform)
-    test_dataset = PairDataset(test_pairs)
+    train_dataset = LazyTrainingPairDataset(train_videos, transform=transform)
     sampler_cfg = config["sampler"]
-    sampler = BalancedDistributedPairBatchSampler(
-        train_pairs,
-        local_batch_size=batch_size,
-        steps_per_epoch=int(train_cfg["steps_per_epoch"]),
+    sampler = VideoBalancedPairBatchSampler(
+        train_videos,
+        batch_size,
+        steps_per_epoch,
         rank=rank,
         world_size=world_size,
         seed=config["experiment"]["seed"],
@@ -156,9 +222,53 @@ def _make_dataloaders(config: dict, rank: int, world_size: int):
             "deduplicate_within_global_batch", True
         ),
     )
-    train_loader = DataLoader(train_dataset, batch_sampler=sampler, **common)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, **common)
-    return train_loader, test_loader, sampler
+    quick_dataset = build_eval_dataset(
+        test_videos,
+        test_delta,
+        rank=rank,
+        world_size=world_size,
+        max_pairs_per_video=int(
+            config["evaluation"].get("quick_test_pairs_per_video", 128)
+        ),
+    )
+    full_dataset = build_eval_dataset(
+        test_videos,
+        test_delta,
+        rank=rank,
+        world_size=world_size,
+    )
+    global_quick = _distributed_sum_int(len(quick_dataset))
+    global_full = _distributed_sum_int(len(full_dataset))
+    if global_quick <= 0 or global_full <= 0:
+        raise RuntimeError("Test index does not contain legal delta=2 pairs")
+    return LoaderBundle(
+        train=DataLoader(train_dataset, batch_sampler=sampler, **common),
+        quick_test=DataLoader(quick_dataset, batch_size=batch_size, **common),
+        full_test=DataLoader(full_dataset, batch_size=batch_size, **common),
+        sampler=sampler,
+        data_summary={
+            "storage": "video_index_lazy_pairs",
+            "train_videos": len(train_videos),
+            "test_videos": len(test_videos),
+            "video_index_bytes_per_rank": (
+                video_index_memory_bytes(train_videos)
+                + video_index_memory_bytes(test_videos)
+            ),
+            "quick_test_samples_global": global_quick,
+            "full_test_samples_global": global_full,
+            "full_test_index_bytes_this_rank": full_dataset.index_nbytes,
+        },
+    )
+
+
+def _distributed_sum_int(value: int) -> int:
+    if not is_distributed():
+        return value
+    import torch.distributed as dist
+
+    values = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(values, value)
+    return sum(int(item) for item in values)
 
 
 def _build_scheduler(optimizer, config: dict, total_steps: int):
@@ -179,14 +289,137 @@ def _build_scheduler(optimizer, config: dict, total_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
+def _broadcast_object(value, rank: int):
+    if not is_distributed():
+        return value
+    import torch.distributed as dist
+
+    payload = [value if rank == 0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
+def _gather_random_states(rank: int, world_size: int) -> list[dict] | None:
+    local = capture_random_state()
+    if not is_distributed():
+        return [local]
+    import torch.distributed as dist
+
+    gathered = [None for _ in range(world_size)] if rank == 0 else None
+    dist.gather_object(local, gathered, dst=0)
+    return gathered
+
+
+def _normalized_position(
+    epoch: int, step_in_epoch: int, steps_per_epoch: int
+) -> tuple[int, int]:
+    if step_in_epoch >= steps_per_epoch:
+        return epoch + 1, 0
+    return epoch, step_in_epoch
+
+
+def _save_all_ranks(
+    *,
+    output_dir: Path,
+    tag: str,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    step_in_epoch: int,
+    global_step: int,
+    best_metrics: dict,
+    config: dict,
+    sampler,
+    evaluation_state: dict,
+    rank: int,
+    world_size: int,
+) -> None:
+    states = _gather_random_states(rank, world_size)
+    save_epoch, save_step = _normalized_position(
+        epoch, step_in_epoch, int(config["train"]["steps_per_epoch"])
+    )
+    if rank == 0:
+        sampler_state = sampler.state_dict(save_step)
+        sampler_state["epoch"] = save_epoch
+        save_checkpoint_pair(
+            output_dir / "checkpoints",
+            tag,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            save_epoch,
+            global_step,
+            best_metrics,
+            config,
+            step_in_epoch=save_step,
+            sampler_state=sampler_state,
+            rank_random_states=states,
+            evaluation_state=evaluation_state,
+        )
+
+
+def _run_evaluation(
+    *,
+    kind: str,
+    model,
+    dataloader,
+    device,
+    config: dict,
+    output_dir: Path,
+    global_step: int,
+    rank: int,
+    world_size: int,
+) -> EvaluationOutput:
+    report_dir = output_dir / "reports" / f"{kind}_step_{global_step:08d}"
+    prepare_evaluation_directory(report_dir, rank)
+    distributed_barrier()
+    result = evaluate(
+        unwrap_model(model),
+        dataloader,
+        device,
+        config["evaluation"].get("threshold", 0.99),
+        checkpoint_step=global_step,
+        distributed=is_distributed(),
+        rank=rank,
+        world_size=world_size,
+    )
+    write_evaluation_shard(
+        report_dir, rank, result.errors, result.near_threshold
+    )
+    distributed_barrier()
+    if rank == 0:
+        metrics = dict(result.metrics or {})
+        metrics.update(
+            {
+                "evaluation_kind": kind,
+                "evaluation_role": "observed_dev_test",
+                "checkpoint_step": global_step,
+            }
+        )
+        write_evaluation_report(
+            report_dir,
+            metrics,
+            result.grouped_metrics,
+            merge_shards=True,
+            html_max_errors=int(
+                config["evaluation"].get("html_max_errors_per_group", 200)
+            ),
+        )
+        result.metrics = metrics
+    distributed_barrier()
+    return result
+
+
 def run_training(config: dict[str, Any]) -> dict:
     import torch
 
-    rank, world_size, local_rank = distributed_context(config.get("distributed", {}))
+    rank, world_size, local_rank, device = initialize_runtime(config)
     try:
         seed = int(config["experiment"]["seed"])
-        _seed_everything(seed)
-        device = initialize_device(config["device"]["accelerator"], local_rank)
+        _seed_everything(seed + rank)
         output_dir = Path(config["experiment"]["output_dir"])
         if rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -222,11 +455,7 @@ def run_training(config: dict[str, Any]) -> dict:
                 broadcast_buffers=False,
                 gradient_as_bucket_view=True,
             )
-        frozen_snapshot = (
-            snapshot_frozen_parameters(model)
-            if config["train"].get("verify_frozen_parameters", False)
-            else None
-        )
+        frozen_snapshot = None
         if rank == 0:
             print("Trainable parameters:")
             for name in summary.trainable_names:
@@ -236,7 +465,9 @@ def run_training(config: dict[str, Any]) -> dict:
                 f"Ratio={summary.trainable_ratio:.4%}"
             )
 
-        train_loader, test_loader, sampler = _make_dataloaders(config, rank, world_size)
+        loaders = _make_dataloaders(config, rank, world_size)
+        if rank == 0:
+            print("Data pipeline:", json.dumps(loaders.data_summary, ensure_ascii=False))
         train_cfg = config["train"]
         total_steps = int(
             train_cfg.get("max_steps")
@@ -253,47 +484,94 @@ def run_training(config: dict[str, Any]) -> dict:
             device.type, enabled=use_amp and config["device"]["amp_dtype"] == "float16"
         )
         global_step = 0
-        best_f1 = -1.0
-        best_metrics: dict = {}
         epoch = 0
+        step_in_epoch = 0
+        best_metrics: dict = {}
+        evaluation_state = {
+            "quick_test_count": 0,
+            "full_test_count": 0,
+            "last_full_metrics": {},
+            "best_observed_dev_test_metrics": {},
+            "train_delta_history": [],
+        }
         resume_path = train_cfg.get("resume_path")
         if resume_path:
             checkpoint = restore_training_checkpoint(
                 resume_path, model, optimizer, scheduler, scaler
             )
             global_step = int(checkpoint.get("global_step", 0))
-            epoch = int(checkpoint.get("sampler_epoch", checkpoint.get("epoch", 0)))
+            sampler_state = checkpoint.get("sampler_state", {})
+            epoch = int(
+                sampler_state.get(
+                    "epoch", checkpoint.get("sampler_epoch", checkpoint.get("epoch", 0))
+                )
+            )
+            step_in_epoch = int(
+                sampler_state.get(
+                    "step_in_epoch", checkpoint.get("step_in_epoch", 0)
+                )
+            )
             best_metrics = dict(checkpoint.get("best_metrics", {}))
-            best_f1 = float(best_metrics.get("f1", -1.0))
-            random_state = checkpoint.get("random_state", {})
-            if random_state.get("python") is not None:
-                random.setstate(random_state["python"])
-            if random_state.get("numpy") is not None:
-                import numpy as np
-
-                np.random.set_state(random_state["numpy"])
-            if random_state.get("torch") is not None:
-                torch.set_rng_state(random_state["torch"])
+            evaluation_state.update(checkpoint.get("evaluation_state", {}))
+            rank_states = checkpoint.get("rank_random_states")
+            if rank_states and rank < len(rank_states):
+                restore_random_state(rank_states[rank])
+            else:
+                restore_random_state(checkpoint.get("random_state", {}))
             if rank == 0:
-                print(f"Resumed from {resume_path} at step={global_step}, epoch={epoch}")
+                print(
+                    f"Resumed from {resume_path} at step={global_step}, "
+                    f"epoch={epoch}, step_in_epoch={step_in_epoch}"
+                )
         if global_step >= total_steps:
             raise ValueError(
                 f"Resume step {global_step} is not below target max step {total_steps}"
             )
+        if config["train"].get("verify_frozen_parameters", False):
+            frozen_snapshot = snapshot_frozen_parameters(model)
+        stop_after_steps = train_cfg.get("stop_after_steps")
+        run_until_step = (
+            min(total_steps, int(stop_after_steps))
+            if stop_after_steps is not None
+            else total_steps
+        )
+        if global_step >= run_until_step:
+            raise ValueError(
+                f"Current step {global_step} is not below this run's stop step "
+                f"{run_until_step}"
+            )
+
         started = time.perf_counter()
-        while global_step < total_steps:
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+        last_batch_finished = started
+        timing = {"data_wait": 0.0, "h2d": 0.0, "forward": 0.0, "backward": 0.0, "optimizer": 0.0}
+        timing_steps = 0
+        while global_step < run_until_step:
+            loaders.sampler.set_epoch(epoch, start_step=step_in_epoch)
             set_frozen_backbone_train_mode(
                 model,
                 config["model"].get("trainable_name_contains", "cls"),
                 config["model"].get("freeze_batchnorm_stats", True),
             )
-            for batch in train_loader:
+            yielded = False
+            for batch in loaders.train:
+                yielded = True
+                batch_ready = time.perf_counter()
+                timing["data_wait"] += batch_ready - last_batch_finished
+                transfer_started = time.perf_counter()
                 images = batch["images"].to(device, non_blocking=True)
-                images = images.float().div_(255.0) if images.dtype == torch.uint8 else images
+                if images.dtype == torch.uint8:
+                    compute_dtype = (
+                        torch.bfloat16
+                        if use_amp and config["device"]["amp_dtype"] == "bfloat16"
+                        else torch.float16
+                        if use_amp and config["device"]["amp_dtype"] == "float16"
+                        else torch.float32
+                    )
+                    images = images.to(compute_dtype).div_(255.0)
                 labels = batch["labels"].to(device, non_blocking=True)
+                timing["h2d"] += time.perf_counter() - transfer_started
                 optimizer.zero_grad(set_to_none=True)
+                forward_started = time.perf_counter()
                 with autocast_context(
                     device, use_amp, config["device"].get("amp_dtype", "float16")
                 ):
@@ -305,104 +583,224 @@ def run_training(config: dict[str, Any]) -> dict:
                     loss, components = combined_loss(
                         logits, labels, config["loss"], global_step, total_steps
                     )
+                timing["forward"] += time.perf_counter() - forward_started
+                backward_started = time.perf_counter()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     train_cfg.get("gradient_clip_norm", 5.0),
                 )
+                timing["backward"] += time.perf_counter() - backward_started
+                optimizer_started = time.perf_counter()
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
+                timing["optimizer"] += time.perf_counter() - optimizer_started
                 global_step += 1
+                step_in_epoch += 1
+                timing_steps += 1
 
-                if rank == 0 and global_step % train_cfg["log_every_steps"] == 0:
+                log_every = int(train_cfg["log_every_steps"])
+                if rank == 0 and global_step % log_every == 0:
                     elapsed = time.perf_counter() - started
                     samples = global_step * train_cfg["local_batch_size"] * world_size
+                    averages = {
+                        key: value / max(1, timing_steps)
+                        for key, value in timing.items()
+                    }
                     print(
                         f"step={global_step}/{total_steps} loss={loss.detach().item():.6f} "
                         f"ce={components['cross_entropy'].item():.6f} "
                         f"threshold_weight={components['threshold_weight']:.4f} "
-                        f"samples/s={samples / elapsed:.2f}",
+                        f"samples/s={samples / elapsed:.2f} timing={averages}",
                         flush=True,
                     )
-                eval_every = config["evaluation"].get("quick_test_every_steps", 0)
-                if eval_every and global_step % eval_every == 0:
-                    distributed_barrier()
-                    if rank == 0:
-                        metrics, errors = evaluate(
-                            unwrap_model(model),
-                            test_loader,
-                            device,
-                            config["evaluation"].get("threshold", 0.99),
-                        )
-                        report_dir = output_dir / "reports" / f"test_step_{global_step:08d}"
-                        write_evaluation_report(report_dir, metrics, errors)
-                        if metrics["f1"] > best_f1:
-                            best_f1, best_metrics = metrics["f1"], metrics
-                            if config["checkpoint"].get("save_best_test_f1", True):
-                                save_checkpoint_pair(
-                                    output_dir / "checkpoints",
-                                    "best_f1_tau099",
-                                    model,
-                                    optimizer,
-                                    scheduler,
-                                    scaler,
-                                    epoch,
-                                    global_step,
-                                    best_metrics,
-                                    config,
-                                )
-                        set_frozen_backbone_train_mode(
-                            model,
-                            config["model"].get("trainable_name_contains", "cls"),
-                            config["model"].get("freeze_batchnorm_stats", True),
-                        )
-                    distributed_barrier()
-                save_every = config["checkpoint"].get("save_last_every_steps", 0)
-                if rank == 0 and save_every and global_step % save_every == 0:
-                    save_checkpoint_pair(
-                        output_dir / "checkpoints",
-                        "last",
-                        model,
-                        optimizer,
-                        scheduler,
-                        scaler,
-                        epoch,
-                        global_step,
-                        best_metrics,
-                        config,
-                    )
-                if global_step >= total_steps:
-                    break
-            epoch += 1
+                    timing = {key: 0.0 for key in timing}
+                    timing_steps = 0
 
+                quick_every = int(
+                    config["evaluation"].get("quick_test_every_steps", 0)
+                )
+                if quick_every and global_step % quick_every == 0:
+                    result = _run_evaluation(
+                        kind="quick",
+                        model=model,
+                        dataloader=loaders.quick_test,
+                        device=device,
+                        config=config,
+                        output_dir=output_dir,
+                        global_step=global_step,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                    evaluation_state["quick_test_count"] += 1
+                    set_frozen_backbone_train_mode(
+                        model,
+                        config["model"].get("trainable_name_contains", "cls"),
+                        config["model"].get("freeze_batchnorm_stats", True),
+                    )
+
+                full_every = int(
+                    config["evaluation"].get("full_test_every_steps", 0)
+                )
+                if full_every and global_step % full_every == 0:
+                    result = _run_evaluation(
+                        kind="full",
+                        model=model,
+                        dataloader=loaders.full_test,
+                        device=device,
+                        config=config,
+                        output_dir=output_dir,
+                        global_step=global_step,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                    evaluation_state["full_test_count"] += 1
+                    metrics = _broadcast_object(result.metrics, rank)
+                    evaluation_state["last_full_metrics"] = metrics
+                    is_best = metrics.get("f1", -1.0) > best_metrics.get("f1", -1.0)
+                    if is_best:
+                        best_metrics = metrics
+                        evaluation_state["best_observed_dev_test_metrics"] = metrics
+                        if config["checkpoint"].get("save_best_test_f1", True):
+                            _save_all_ranks(
+                                output_dir=output_dir,
+                                tag="best_observed_dev_test_f1_tau099",
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                scaler=scaler,
+                                epoch=epoch,
+                                step_in_epoch=step_in_epoch,
+                                global_step=global_step,
+                                best_metrics=best_metrics,
+                                config=config,
+                                sampler=loaders.sampler,
+                                evaluation_state=evaluation_state,
+                                rank=rank,
+                                world_size=world_size,
+                            )
+                    set_frozen_backbone_train_mode(
+                        model,
+                        config["model"].get("trainable_name_contains", "cls"),
+                        config["model"].get("freeze_batchnorm_stats", True),
+                    )
+
+                save_every = int(
+                    config["checkpoint"].get("save_last_every_steps", 0)
+                )
+                if save_every and global_step % save_every == 0:
+                    _save_all_ranks(
+                        output_dir=output_dir,
+                        tag="last",
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch,
+                        global_step=global_step,
+                        best_metrics=best_metrics,
+                        config=config,
+                        sampler=loaders.sampler,
+                        evaluation_state=evaluation_state,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                last_batch_finished = time.perf_counter()
+                if global_step >= run_until_step:
+                    break
+            if not yielded and step_in_epoch < int(train_cfg["steps_per_epoch"]):
+                raise RuntimeError("Training sampler yielded no batches")
+            if step_in_epoch >= int(train_cfg["steps_per_epoch"]):
+                delta_counts = getattr(
+                    loaders.sampler, "last_epoch_delta_counts", None
+                )
+                if delta_counts:
+                    total_sampled = sum(delta_counts.values())
+                    distribution = {
+                        str(delta): count / total_sampled
+                        for delta, count in sorted(delta_counts.items())
+                    }
+                    evaluation_state["train_delta_history"].append(
+                        {
+                            "epoch": epoch,
+                            "counts": dict(delta_counts),
+                            "distribution": distribution,
+                        }
+                    )
+                    if rank == 0:
+                        print(
+                            "Observed train delta distribution:",
+                            json.dumps(distribution, ensure_ascii=False),
+                        )
+                epoch += 1
+                step_in_epoch = 0
+
+        if config["evaluation"].get("full_test_at_end", True):
+            already_full = (
+                evaluation_state["last_full_metrics"].get("checkpoint_step")
+                == global_step
+            )
+            if not already_full:
+                result = _run_evaluation(
+                    kind="full_final",
+                    model=model,
+                    dataloader=loaders.full_test,
+                    device=device,
+                    config=config,
+                    output_dir=output_dir,
+                    global_step=global_step,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                evaluation_state["full_test_count"] += 1
+                evaluation_state["last_full_metrics"] = _broadcast_object(
+                    result.metrics, rank
+                )
+        _save_all_ranks(
+            output_dir=output_dir,
+            tag="last",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            step_in_epoch=step_in_epoch,
+            global_step=global_step,
+            best_metrics=best_metrics,
+            config=config,
+            sampler=loaders.sampler,
+            evaluation_state=evaluation_state,
+            rank=rank,
+            world_size=world_size,
+        )
         distributed_barrier()
         if rank == 0:
-            if config["evaluation"].get("full_test_at_end", True):
-                metrics, errors = evaluate(
-                    unwrap_model(model),
-                    test_loader,
-                    device,
-                    config["evaluation"].get("threshold", 0.99),
-                )
-                write_evaluation_report(output_dir / "reports" / "test_final", metrics, errors)
-            save_checkpoint_pair(
-                output_dir / "checkpoints",
-                "last",
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                epoch,
-                global_step,
-                best_metrics,
-                config,
-            )
             if frozen_snapshot is not None:
                 assert_frozen_parameters_unchanged(frozen_snapshot, model)
                 print("Verified: every frozen parameter remained bitwise unchanged.")
+            summary_payload = {
+                "global_step": global_step,
+                "last_checkpoint_metrics": evaluation_state["last_full_metrics"],
+                "best_observed_dev_test_metrics": best_metrics,
+                "test_evaluation_counts": {
+                    "quick": evaluation_state["quick_test_count"],
+                    "full": evaluation_state["full_test_count"],
+                },
+                "data_pipeline": loaders.data_summary,
+            }
+            (output_dir / "training_summary.json").write_text(
+                json.dumps(summary_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         distributed_barrier()
-        return {"global_step": global_step, "best_metrics": best_metrics}
+        return {
+            "global_step": global_step,
+            "last_metrics": evaluation_state["last_full_metrics"],
+            "best_metrics": best_metrics,
+            "evaluation_state": evaluation_state,
+        }
     finally:
         cleanup_distributed()

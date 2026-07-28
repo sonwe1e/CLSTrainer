@@ -84,9 +84,9 @@ class PairAugmentTests(unittest.TestCase):
         pair = torch.stack([frame, frame])
         for _ in range(10):
             output = transform(pair)
+            self.assertEqual(output.dtype, torch.uint8)
             self.assertTrue(torch.equal(output[0], output[1]))
 
 
 if __name__ == "__main__":
     unittest.main()
-

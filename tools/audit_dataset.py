@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from game_cls.data.indexing import validate_audit
 
 
 def main() -> None:
@@ -19,19 +24,16 @@ def main() -> None:
     destination.write_text(
         json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    problems = 0
     for split, report in audit["splits"].items():
-        problems += report["unexpected_dimension_count"]
-        problems += len(report["parse_or_file_issues"])
         print(
             f"{split}: frames={report['frame_count']} videos={report['video_count']} "
             f"unexpected_dimensions={report['unexpected_dimension_count']} "
             f"issues={len(report['parse_or_file_issues'])}"
         )
-    if args.strict and problems:
-        raise SystemExit(f"Dataset audit failed with {problems} problem(s)")
+    if args.strict:
+        validate_audit(audit)
+        print("Strict dataset audit passed.")
 
 
 if __name__ == "__main__":
     main()
-

@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Sequence
+
+import numpy as np
+
+from .video_index import VideoEntry
+
+
+@dataclass(frozen=True)
+class PairRequest:
+    video_index: int
+    delta: int
+    start_position: int
+    augmentation_seed: int = 0
+
+
+def _decode_pair(entry: VideoEntry, request: PairRequest):
+    try:
+        import torch
+        from PIL import Image
+        from torchvision.transforms.v2 import functional as F
+    except ImportError as exc:
+        raise RuntimeError(
+            "Decoding pairs requires torch, torchvision and Pillow"
+        ) from exc
+    frame0_id, frame1_id, path0, path1 = entry.pair_paths(
+        request.delta, request.start_position
+    )
+    with Image.open(path0) as image0:
+        tensor0 = F.to_image(image0.convert("RGB"))
+    with Image.open(path1) as image1:
+        tensor1 = F.to_image(image1.convert("RGB"))
+    return (
+        torch.stack((tensor0, tensor1), dim=0),
+        {
+            "game": entry.game,
+            "label": entry.label,
+            "video_id": entry.video_id,
+            "frame0_id": frame0_id,
+            "frame1_id": frame1_id,
+            "delta": request.delta,
+            "image0_path": path0,
+            "image1_path": path1,
+        },
+    )
+
+
+class LazyTrainingPairDataset:
+    """Dataset addressed by compact PairRequest objects emitted by the sampler."""
+
+    def __init__(
+        self,
+        videos: Sequence[VideoEntry],
+        transform: Callable[[Any], Any] | None = None,
+    ) -> None:
+        self.videos = videos
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return sum(
+            len(starts)
+            for video in self.videos
+            for starts in video.valid_start_positions.values()
+        )
+
+    def __getitem__(self, request: PairRequest) -> dict[str, Any]:
+        import torch
+
+        images, meta = _decode_pair(self.videos[request.video_index], request)
+        if self.transform is not None:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(request.augmentation_seed)
+                images = self.transform(images)
+        return {"images": images, "label": meta["label"], "meta": meta}
+
+
+class EvalPairDataset:
+    """Compact, rank-local evaluation pair index backed by NumPy arrays."""
+
+    def __init__(
+        self,
+        videos: Sequence[VideoEntry],
+        video_indices: np.ndarray,
+        deltas: np.ndarray,
+        start_positions: np.ndarray,
+    ) -> None:
+        self.videos = videos
+        self.video_indices = video_indices.astype(np.int32, copy=False)
+        self.deltas = deltas.astype(np.int8, copy=False)
+        self.start_positions = start_positions.astype(np.int32, copy=False)
+
+    def __len__(self) -> int:
+        return len(self.video_indices)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        request = PairRequest(
+            video_index=int(self.video_indices[index]),
+            delta=int(self.deltas[index]),
+            start_position=int(self.start_positions[index]),
+        )
+        images, meta = _decode_pair(self.videos[request.video_index], request)
+        return {"images": images, "label": meta["label"], "meta": meta}
+
+    @property
+    def index_nbytes(self) -> int:
+        return (
+            self.video_indices.nbytes
+            + self.deltas.nbytes
+            + self.start_positions.nbytes
+        )
+
+
+def build_eval_dataset(
+    videos: Sequence[VideoEntry],
+    delta: int,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+    max_pairs_per_video: int | None = None,
+) -> EvalPairDataset:
+    video_indices: list[int] = []
+    deltas: list[int] = []
+    start_positions: list[int] = []
+    global_pair_index = 0
+    for video_index, video in enumerate(videos):
+        starts = video.valid_start_positions.get(delta, np.empty(0, dtype=np.int32))
+        if max_pairs_per_video is not None and len(starts) > max_pairs_per_video:
+            selected = np.linspace(
+                0, len(starts) - 1, num=max_pairs_per_video, dtype=np.int64
+            )
+            starts = starts[selected]
+        for start in starts:
+            if global_pair_index % world_size == rank:
+                video_indices.append(video_index)
+                deltas.append(delta)
+                start_positions.append(int(start))
+            global_pair_index += 1
+    return EvalPairDataset(
+        videos,
+        np.asarray(video_indices, dtype=np.int32),
+        np.asarray(deltas, dtype=np.int8),
+        np.asarray(start_positions, dtype=np.int32),
+    )

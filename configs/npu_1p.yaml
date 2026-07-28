@@ -1,11 +1,13 @@
 base: cuda_debug.yaml
 device:
   accelerator: npu
-  amp: false
+  amp: true
   amp_dtype: bfloat16
 data:
   synthetic: false
 train:
+  epochs: 10
+  steps_per_epoch: 1000
   local_batch_size: 64
   max_steps: null
   verify_frozen_parameters: false
@@ -16,3 +18,10 @@ dataloader:
   persistent_workers: true
   prefetch_factor: 4
   pin_memory: true
+evaluation:
+  quick_test_every_steps: 1000
+  quick_test_pairs_per_video: 128
+  full_test_every_steps: 5000
+  full_test_at_end: true
+checkpoint:
+  save_last_every_steps: 1000

@@ -10,6 +10,8 @@ device:
 
 data:
   synthetic: true
+  strict_audit: true
+  audit_path: indexes/audit.json
   train_index: indexes/train_frames.parquet
   test_index: indexes/test_frames.parquet
   width: 208
@@ -77,6 +79,7 @@ train:
   epochs: 1
   steps_per_epoch: 100
   max_steps: 100
+  stop_after_steps: null
   resume_path: null
   verify_frozen_parameters: true
   local_batch_size: 4
@@ -95,6 +98,8 @@ evaluation:
   quick_test_pairs_per_video: 16
   full_test_every_steps: 100
   full_test_at_end: true
+  save_all_errors: true
+  html_max_errors_per_group: 200
 
 checkpoint:
   save_last_every_steps: 50

@@ -1,0 +1,24 @@
+name: CPU checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest
+      - run: >-
+          python tools/train.py --config configs/cuda_debug.yaml
+          train.max_steps=2
+          evaluation.quick_test_every_steps=1
+          evaluation.full_test_every_steps=2
+          checkpoint.save_last_every_steps=1
+          experiment.output_dir=runs/ci_smoke

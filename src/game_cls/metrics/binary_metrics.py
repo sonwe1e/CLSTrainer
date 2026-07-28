@@ -111,6 +111,34 @@ def confusion_from_margins(
     )
 
 
+def metrics_from_counts(
+    tp: int,
+    fp: int,
+    fn: int,
+    tn: int,
+    *,
+    roc_auc: float = 0.0,
+    pr_auc: float = 0.0,
+) -> BinaryMetrics:
+    precision = _divide(tp, tp + fp)
+    recall = _divide(tp, tp + fn)
+    specificity = _divide(tn, tn + fp)
+    return BinaryMetrics(
+        tp=tp,
+        fp=fp,
+        fn=fn,
+        tn=tn,
+        precision=precision,
+        recall=recall,
+        f1=_divide(2 * precision * recall, precision + recall),
+        accuracy=_divide(tp + tn, tp + fp + fn + tn),
+        specificity=specificity,
+        balanced_accuracy=(recall + specificity) / 2,
+        roc_auc=roc_auc,
+        pr_auc=pr_auc,
+    )
+
+
 def probability_from_margin(margin: float) -> float:
     if margin >= 0:
         z = math.exp(-margin)

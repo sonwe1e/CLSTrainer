@@ -21,6 +21,45 @@ def _atomic_torch_save(payload, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def capture_random_state() -> dict:
+    import numpy as np
+    import torch
+
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    npu = getattr(torch, "npu", None)
+    if npu is not None and callable(getattr(npu, "is_available", None)):
+        if npu.is_available() and hasattr(npu, "get_rng_state_all"):
+            state["npu"] = npu.get_rng_state_all()
+    return state
+
+
+def restore_random_state(state: dict) -> None:
+    import numpy as np
+    import torch
+
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("numpy") is not None:
+        np.random.set_state(state["numpy"])
+    if state.get("torch") is not None:
+        torch.set_rng_state(state["torch"])
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+    npu = getattr(torch, "npu", None)
+    if (
+        state.get("npu") is not None
+        and npu is not None
+        and hasattr(npu, "set_rng_state_all")
+    ):
+        npu.set_rng_state_all(state["npu"])
+
+
 def save_checkpoint_pair(
     output_dir: str | Path,
     tag: str,
@@ -32,10 +71,11 @@ def save_checkpoint_pair(
     global_step: int,
     best_metrics: dict,
     config: dict,
+    step_in_epoch: int = 0,
+    sampler_state: dict | None = None,
+    rank_random_states: list[dict] | None = None,
+    evaluation_state: dict | None = None,
 ) -> None:
-    import numpy as np
-    import torch
-
     output_dir = Path(output_dir)
     state_dict = unwrap_model(model).state_dict()
     _atomic_torch_save(state_dict, output_dir / f"model_{tag}.pth")
@@ -46,14 +86,21 @@ def save_checkpoint_pair(
             "scheduler": scheduler.state_dict() if scheduler else None,
             "scaler": scaler.state_dict() if scaler else None,
             "epoch": epoch,
+            "step_in_epoch": step_in_epoch,
             "global_step": global_step,
             "sampler_epoch": epoch,
-            "best_metrics": best_metrics,
-            "random_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
+            "sampler_state": sampler_state or {
+                "epoch": epoch,
+                "step_in_epoch": step_in_epoch,
             },
+            "best_metrics": best_metrics,
+            "random_state": (
+                rank_random_states[0]
+                if rank_random_states
+                else capture_random_state()
+            ),
+            "rank_random_states": rank_random_states,
+            "evaluation_state": evaluation_state or {},
             "config": config,
         },
         output_dir / f"checkpoint_{tag}.pth",

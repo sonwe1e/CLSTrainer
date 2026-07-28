@@ -12,12 +12,11 @@ dependencies = [
   "Pillow>=10.0",
   "PyYAML>=6.0",
   "pyarrow>=15.0",
-  "torch>=2.2",
-  "torchvision>=0.17",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+cuda = ["torch>=2.2", "torchvision>=0.17"]
+dev = ["pytest>=8.0", "torch>=2.2", "torchvision>=0.17"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -25,4 +24,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-

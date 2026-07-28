@@ -1,1603 +1,643 @@
-# 双帧多游戏二分类训练框架技术方案 v1.0
+# 总体评价
 
-## 核心结论
+这版仓库的**技术方向正确，模块边界也比较清晰**，尤其是双帧合法配对、分层采样、`cls` 冻结、固定 `0.99` 阈值损失和双 checkpoint 的设计，已经形成了不错的 CUDA 训练框架骨架。
 
-现有需求已经澄清，可以直接进入实现。框架采用以下固定定义：
+但当前 `main` 分支还不能视为“可直接在 8 卡 A3 上训练”的版本。我的评估是：
 
-* 开发环境：单卡 CUDA。
-* 正式训练：单机 8 卡 Ascend 910B2，HCCL + DDP。
-* 输入：两张 RGB 图像，按“宽 × 高”解释为 `208 × 448`，因此张量形状为 `[B, 3, 448, 208]`。
-* 部署输入：固定 `delta=2`，即第 1 帧和第 3 帧。
-* 训练增强：`delta=2` 占多数，`delta=1/3` 作为时间跨度增强，初始比例设为 `15%/70%/15%`。
-* 模型输出：`[B, 2]`。
-* 训练参数：名称包含小写 `cls` 的参数可训练，其他参数全部冻结。
-* 判定规则：第二通道 Softmax 概率严格大于 `0.99` 判为类别 1，否则判为类别 0。
-* 数据平衡：游戏、类别、视频三级分层采样。
-* 评估：训练期间周期性执行 test，保存固定 `0.99` 阈值指标和错分类样本。
-* 模型保存：每个 checkpoint 同时保存纯模型参数文件和完整训练状态文件。
+| 维度                |         评价 |
+| ----------------- | ---------: |
+| 总体架构设计            | **7.5/10** |
+| CUDA 最小闭环完整度      |   **5/10** |
+| 百万图片规模适应性         |   **3/10** |
+| 8 卡 Ascend A3 就绪度 |   **2/10** |
+| 指标与实验可信度          |   **4/10** |
 
-你提到的 `random find`，本方案按常见的 `RandomAffine` 理解。Torchvision 原生提供 `RandomAffine`、`ColorJitter` 和 `RandomErasing`，并支持带有额外前导维度的图像或视频张量，因此可以对两帧应用一致的随机参数。([PyTorch Docs][1])
+最先需要解决的不是继续调整损失函数，而是几个会阻断运行、放大内存或使测试结果不可信的问题。
 
 ---
 
-# 一、项目目录和模块边界
+# 一、目前实现得比较好的部分
 
-建议从一开始就把设备差异和业务逻辑分开：
+## 1. 双帧配对逻辑是正确的
 
-```text
-game_cls/
-├── configs/
-│   ├── cuda_debug.yaml
-│   ├── npu_1p.yaml
-│   └── npu_8p.yaml
-├── tools/
-│   ├── build_index.py
-│   ├── audit_dataset.py
-│   ├── pack_dataset.py
-│   ├── train.py
-│   ├── test.py
-│   └── profile_train.py
-├── src/
-│   ├── data/
-│   │   ├── records.py
-│   │   ├── pair_dataset.py
-│   │   ├── pair_sampler.py
-│   │   ├── augment.py
-│   │   ├── png_backend.py
-│   │   ├── packed_backend.py
-│   │   └── collate.py
-│   ├── model/
-│   │   ├── builder.py
-│   │   ├── checkpoint_loader.py
-│   │   ├── freeze_policy.py
-│   │   └── model_wrapper.py
-│   ├── losses/
-│   │   └── threshold_loss.py
-│   ├── engine/
-│   │   ├── device.py
-│   │   ├── distributed.py
-│   │   ├── trainer.py
-│   │   └── evaluator.py
-│   ├── metrics/
-│   │   ├── binary_metrics.py
-│   │   └── grouped_metrics.py
-│   └── reports/
-│       ├── error_writer.py
-│       └── html_report.py
-├── scripts/
-│   ├── run_cuda_debug.sh
-│   ├── run_npu_1p.sh
-│   └── run_npu_8p.sh
-└── tests/
-    ├── test_filename_parser.py
-    ├── test_pair_sampler.py
-    ├── test_freeze_policy.py
-    ├── test_threshold_loss.py
-    └── test_checkpoint_resume.py
-```
+代码按照 `game + label + video_id` 分组，再检查 `frame_id + delta` 是否真实存在，因此不会跨视频、跨类别配对，也不会假设帧号一定连续。这个实现符合你的数据定义。
 
-CUDA 和 NPU 的区别只应存在于：
+训练和测试的 delta 设计也已落地：
 
-```text
-src/engine/device.py
-src/engine/distributed.py
-AMP上下文
-Profiler初始化
-启动脚本
-```
+* 训练：`1/2/3 = 0.15/0.70/0.15`
+* 测试：固定 `delta=2`
 
-数据、损失、指标和模型冻结逻辑完全复用。
+配置与原始需求一致。
 
----
+## 2. 双帧一致增强处理正确
 
-# 二、数据索引方案
+两帧先堆叠为 `[2,C,H,W]`，再统一经过 `RandomAffine`、`ColorJitter` 和 `RandomErasing`。这种实现可以避免两帧被施加不同的几何变化，整体思路正确。
 
-## 2.1 原始目录约定
+尤其是把空间增强应用于整个双帧张量，而不是分别调用两次随机变换，这是必要的。
 
-```text
-train/
-├── game_A/
-│   ├── 0/
-│   │   ├── 0100001.png
-│   │   ├── 0100002.png
-│   │   └── 0100003.png
-│   └── 1/
-├── game_B/
-│   ├── 0/
-│   └── 1/
-└── ...
+## 3. `cls` 冻结逻辑基本符合需求
 
-test/
-├── game_A/
-│   ├── 0/
-│   └── 1/
-└── ...
-```
-
-文件名解析规则：
-
-```regex
-^(?P<video_id>\d{2})(?P<frame_id>\d{5})\.png$
-```
-
-例如：
-
-```text
-0100001.png
-│ │
-│ └── frame_id = 00001
-└──── video_id = 01
-```
-
-## 2.2 建立帧索引
-
-`build_index.py` 扫描一次目录，输出：
-
-```text
-indexes/
-├── train_frames.parquet
-├── train_videos.parquet
-├── test_frames.parquet
-├── test_videos.parquet
-└── audit.json
-```
-
-每帧至少记录：
-
-```text
-sample_id
-split
-game
-label
-video_id
-frame_id
-path
-width
-height
-channels
-file_size
-```
-
-每个视频记录：
-
-```text
-game
-label
-video_id
-frame_count
-min_frame_id
-max_frame_id
-valid_pair_count_delta1
-valid_pair_count_delta2
-valid_pair_count_delta3
-```
-
-必须根据“目标帧是否真实存在”判断是否合法，不能默认帧号连续。
-
-例如视频中存在：
-
-```text
-00001
-00002
-00004
-```
-
-则：
-
-```text
-00001 → 00003，delta=2：非法
-00002 → 00004，delta=2：合法
-```
-
-建议在索引阶段直接建立：
+代码使用大小写敏感的：
 
 ```python
-frame_id_to_path: dict[int, str]
-valid_starts: dict[int, list[int]]  # key为delta
+parameter.requires_grad = name_contains in name
 ```
 
----
+默认只让名称包含小写 `cls` 的参数参与训练，并在没有匹配参数时立即报错。
 
-# 三、训练样本生成
+模型模式处理也比较稳妥：
 
-一个训练样本定义为：
+* 整体先 `eval()`
+* 名称包含 `cls` 的模块切换回 `train()`
+* 所有 BatchNorm 统计量保持冻结
 
-```text
-PairSample(
-    game,
-    label,
-    video_id,
-    frame0_id,
-    frame1_id,
-    delta,
-    image0_path,
-    image1_path
-)
-```
+这可以避免冻结主干的 BatchNorm running statistics 继续变化。
 
-## 3.1 delta 分布
+## 4. 固定 0.99 阈值损失的数学实现正确
 
-部署固定使用 `delta=2`，训练初始采用：
-
-```yaml
-pair:
-  train_delta_prob:
-    1: 0.15
-    2: 0.70
-    3: 0.15
-  test_delta: 2
-```
-
-这意味着训练的大多数样本与部署一致，同时通过 `delta=1/3` 增加对时间变化速度的鲁棒性。
-
-测试集只枚举：
-
-```text
-frame_t + frame_t+2
-```
-
-不把 `delta=1/3` 混入核心测试指标。可以额外生成鲁棒性报告，但不参与主指标。
-
-## 3.2 三级平衡采样
-
-每次采样按以下顺序执行：
-
-```text
-选择游戏
-→ 选择类别
-→ 选择视频
-→ 选择delta
-→ 选择合法起始帧
-```
-
-推荐默认配置：
-
-```yaml
-sampler:
-  game_alpha: 0.25
-  class_probability:
-    0: 0.5
-    1: 0.5
-  uniform_video: true
-  deduplicate_within_batch: true
-```
-
-游戏概率为：
+代码正确地将概率阈值转换为：
 
 [
-P(g)\propto N_g^{0.25}
+\log \frac{0.99}{1-0.99}=\log 99
 ]
 
-这里的 `N_g` 建议使用游戏的视频数量，而不是帧数量。
+并围绕这个 logit margin 构造正负样本辅助损失。
 
-这样可以避免：
+同时保留交叉熵，并让阈值损失经过 warmup 和线性增权，而不是从第一个 step 就施加强约束，这个设计合理。
 
-* 帧多的游戏统治训练；
-* 长视频统治短视频；
-* 类别数量不均衡导致模型倾向多数类别；
-* 极小游戏被完全均匀采样时发生过度重复。
+评估使用严格的 `margin > cutoff`，也与你定义的“第二通道概率大于 0.99”一致。
 
-## 3.3 分布式采样方案
+## 5. 双 checkpoint 结构已经实现
 
-不要直接使用普通 `DistributedSampler` 完成全部逻辑，因为它只能对已有索引切片，不能自然表达游戏—类别—视频的三级均衡。
-
-实现一个：
+代码同时保存：
 
 ```text
-BalancedDistributedPairBatchSampler
+model_<tag>.pth
+checkpoint_<tag>.pth
 ```
 
-每个训练 step：
+其中完整 checkpoint 包含模型、优化器、scheduler、scaler、epoch、global step、随机状态和配置，并使用临时文件加原子替换。
 
-1. 根据固定随机种子生成完整 global batch。
-2. global batch 大小为：
-
-```text
-local_batch_size × world_size
-```
-
-3. 所有 rank 使用相同确定性算法生成同一 global batch。
-4. 每个 rank 只取得自己的切片。
-5. 不需要每 step 广播样本索引。
-
-例如八卡、每卡 64：
-
-```text
-global batch = 512
-
-rank0: [0:64]
-rank1: [64:128]
-...
-rank7: [448:512]
-```
-
-PyTorch DDP 只负责同步模型梯度，不会自动切分输入，因此必须由 sampler 或 dataset 负责每个进程的数据划分。([PyTorch Docs][2])
+这与需求方向一致。
 
 ---
 
-# 四、双帧一致的数据增强
+# 二、P0：必须立即修复的阻断问题
 
-## 4.1 基本原则
+## 1. 当前训练入口很可能无法启动
 
-两帧来自同一个视频，其空间坐标系和光照环境是关联的。因此：
-
-* 几何变换必须对两帧使用完全相同的参数。
-* 颜色变换第一版也使用相同参数。
-* 不能分别随机旋转两张图。
-* 不能让一张水平翻转、另一张不翻转。
-* 不能让两帧采用不同的随机裁剪位置。
-
-将输入先堆叠为：
-
-```text
-pair: [2, 3, 448, 208]
-```
-
-然后把它当作两帧视频执行增强。
-
-Torchvision v2 的 `RandomAffine` 和 `ColorJitter` 支持具有任意前导维度的图像输入，`ColorJitter` 也明确支持图像或视频。([PyTorch Docs][1])
-
-## 4.2 推荐初始增强配置
-
-```yaml
-augmentation:
-  enabled: true
-
-  random_affine:
-    enabled: true
-    probability: 0.50
-    degrees: 2.0
-    translate: [0.02, 0.02]
-    scale: [0.98, 1.02]
-    shear: [-1.0, 1.0]
-
-  color_jitter:
-    enabled: true
-    probability: 0.80
-    brightness: 0.15
-    contrast: 0.15
-    saturation: 0.10
-    hue: 0.02
-
-  random_erasing:
-    enabled: true
-    probability: 0.10
-    scale: [0.005, 0.03]
-    ratio: [0.3, 3.3]
-    value: random
-
-  horizontal_flip:
-    enabled: false
-
-  vertical_flip:
-    enabled: false
-```
-
-`RandomErasing` 会随机擦除矩形区域，适合模拟小范围遮挡，但第一版概率和面积都应保持较小。([PyTorch Docs][3])
-
-## 4.3 为什么默认不打开水平翻转
-
-游戏画面可能包含：
-
-* 固定方向的 UI；
-* 文字；
-* 小地图；
-* 左右方向具有业务语义的动作；
-* 方向性场景元素。
-
-所以水平翻转不能默认开启。只有确认左右翻转不改变类别含义后，再设置：
-
-```yaml
-horizontal_flip:
-  enabled: true
-  probability: 0.20
-```
-
-## 4.4 暂时不使用的增强
-
-第一阶段不使用：
-
-```text
-MixUp
-CutMix
-Label Smoothing
-大幅RandomResizedCrop
-大角度旋转
-强Perspective
-垂直翻转
-```
-
-原因是你的部署目标要求类别 1 概率稳定超过 `0.99`。软标签和过强的形变可能让模型刻意降低置信度，或者破坏两帧之间的真实运动关系。
-
----
-
-# 五、模型加载、冻结和训练模式
-
-## 5.1 参数冻结规则
-
-按照你的原始目标，本方案解释为：
-
-> 名称包含小写 `cls` 的参数解冻并训练，其他参数全部冻结。
-
-实现：
+`trainer.py` 中明确存在：
 
 ```python
-def configure_trainable_parameters(model):
-    trainable_names = []
-
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad = "cls" in name
-
-        if parameter.requires_grad:
-            trainable_names.append(name)
-
-    if not trainable_names:
-        raise RuntimeError(
-            "No trainable parameter contains lowercase 'cls'."
-        )
-
-    return trainable_names
+from game_cls.reports.error_writer import write_evaluation_report
 ```
 
-启动日志必须输出：
+但我分别检查了：
 
 ```text
-Trainable parameters:
-  xxx.cls.conv1.weight
-  xxx.cls.conv1.bias
-  xxx.cls.fc.weight
-  xxx.cls.fc.bias
-
-Trainable parameter count: ...
-Frozen parameter count: ...
-Trainable ratio: ...
+main
+962ea3a5cba4f9b4ded56ad80a17132ef62ebe67
 ```
 
-优化器只接收：
-
-```python
-trainable_parameters = [
-    parameter
-    for parameter in model.parameters()
-    if parameter.requires_grad
-]
-```
-
-## 5.2 冻结主干的运行模式
-
-训练开始时：
-
-```python
-model.eval()
-```
-
-然后只将包含 `cls` 参数的模块切换为训练模式。
-
-需要特别处理 BatchNorm：
-
-* 冻结主干中的 BatchNorm 必须保持 `eval`。
-* `cls` 中若存在 BatchNorm，第一版建议同样冻结运行均值和方差。
-* BatchNorm 的 `weight`、`bias` 可以训练，但 running mean/variance 不更新。
-* `cls` 中的卷积、激活、Dropout 和 Linear 正常训练。
-
-这是为了避免八卡上各 rank 的 BatchNorm 统计不一致。
-
-## 5.3 拆分 backbone 和 cls
-
-最好把模型包装成：
-
-```python
-class TrainModelWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.backbone = ...
-        self.cls = ...
-
-    def forward(self, image0, image1):
-        with torch.no_grad():
-            features = self.backbone(image0, image1)
-
-        logits = self.cls(features)
-        return logits
-```
-
-`torch.no_grad()` 只包裹冻结主干，不能包裹 `cls`。
-
-如果原模型无法直接拆开，第一版可以只依靠 `requires_grad=False`，但性能优化阶段应尽量明确划分 backbone 和 `cls`。
-
----
-
-# 六、权重加载方案
-
-兼容以下两类 PyTorch checkpoint：
-
-```python
-checkpoint = torch.load(path, map_location="cpu")
-
-if isinstance(checkpoint, dict) and "model" in checkpoint:
-    state_dict = checkpoint["model"]
-elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-    state_dict = checkpoint["state_dict"]
-else:
-    state_dict = checkpoint
-```
-
-清理 DDP 前缀：
-
-```python
-state_dict = {
-    key.removeprefix("module."): value
-    for key, value in state_dict.items()
-}
-```
-
-加载时输出：
+在这两个 ref 下，GitHub 都对以下文件返回了 `404 Not Found`：
 
 ```text
-成功加载参数
-缺失参数
-多余参数
-形状不匹配参数
-cls参数加载结果
+src/game_cls/reports/error_writer.py
+src/game_cls/reports/__init__.py
 ```
 
-如果最后分类层原来不是两通道：
-
-```text
-跳过原分类层参数
-重新初始化输出维度为2的分类层
-```
-
-如果已经是两通道，则直接加载。
-
----
-
-# 七、固定 0.99 阈值优化
-
-## 7.1 部署判定的等价形式
-
-输出为：
-
-```text
-logits[:, 0]
-logits[:, 1]
-```
-
-定义：
-
-[
-d=z_1-z_0
-]
-
-则第二通道 Softmax 概率为：
-
-[
-p_1=\operatorname{sigmoid}(d)
-]
-
-部署规则：
-
-[
-p_1>0.99
-]
-
-等价于：
-
-[
-d>\log(99)\approx4.59511985
-]
-
-测试和部署建议使用 FP32 margin：
-
-```python
-margin = logits[:, 1].float() - logits[:, 0].float()
-
-prediction = margin > 4.59511985
-```
-
-需要展示置信度时再计算：
-
-```python
-probability = torch.softmax(logits.float(), dim=1)[:, 1]
-```
-
-## 7.2 训练损失
-
-第一部分使用普通交叉熵：
-
-```python
-ce_loss = F.cross_entropy(logits.float(), target)
-```
-
-第二部分加入固定阈值辅助损失。
-
-```python
-def threshold_margin_loss(
-    logits,
-    target,
-    threshold_margin=4.59511985,
-    safety_margin=0.20,
-    temperature=0.50,
-):
-    margin = logits[:, 1].float() - logits[:, 0].float()
-    target = target.float()
-
-    positive_loss = temperature * F.softplus(
-        (
-            threshold_margin
-            + safety_margin
-            - margin
-        ) / temperature
-    )
-
-    negative_loss = temperature * F.softplus(
-        (
-            margin
-            - threshold_margin
-            + safety_margin
-        ) / temperature
-    )
-
-    return torch.where(
-        target > 0.5,
-        positive_loss,
-        negative_loss,
-    ).mean()
-```
-
-总损失：
-
-```python
-loss = ce_loss + lambda_threshold * threshold_loss
-```
-
-建议初始值：
-
-```yaml
-loss:
-  threshold: 0.99
-  safety_margin: 0.20
-  temperature: 0.50
-  threshold_loss_weight: 0.20
-```
-
-## 7.3 损失权重调度
-
-不要从第一个 step 就施加强阈值约束。
-
-推荐：
-
-```text
-前10%训练step：
-lambda_threshold = 0
-
-接下来20%训练step：
-lambda_threshold从0线性增加到0.2
-
-剩余70%：
-lambda_threshold = 0.2
-```
-
-这样先学会区分类别，再推动类别 1 样本越过高置信度边界。
-
-## 7.4 类别平衡方式
-
-第一版只使用分层采样，不同时增加较大的 `class_weight`。
-
-否则会形成：
-
-```text
-类别均衡采样
-+
-类别加权交叉熵
-+
-阈值辅助损失
-```
-
-三重补偿，可能导致类别 1 置信度过高、假阳性增加。
-
----
-
-# 八、测试系统
-
-按照你的要求，本版只建立：
-
-```text
-train
-test
-```
-
-不单独建立 validation。
-
-但要明确：如果根据周期性 test 的结果选择最佳 epoch，那么该 test 在统计意义上已经参与了模型开发。因此框架应同时报告：
-
-```text
-last checkpoint结果
-best observed test F1 checkpoint结果
-```
-
-并且：
-
-* 不在 test 上搜索阈值，阈值始终固定为 `0.99`。
-* 不根据 test 自动修改采样比例。
-* 默认不根据 test 自动提前终止训练。
-* test 主要用于观察和保存中间结果。
-
-## 8.1 快速测试
-
-每隔固定 step 执行确定性子集测试：
-
-```yaml
-evaluation:
-  quick_test_every_steps: 1000
-  quick_test_pairs_per_video: 128
-```
-
-从每个 `(game, label, video)` 的全部 `delta=2` pair 中，按时间均匀抽取最多 128 个。
-
-这样小型游戏和短视频不会在快速测试中消失。
-
-## 8.2 完整测试
-
-```yaml
-evaluation:
-  full_test_every_steps: 5000
-  full_test_at_end: true
-```
-
-完整测试枚举 test 中所有合法 `delta=2` pair。
-
-## 8.3 固定阈值指标
-
-全局保存：
-
-```text
-TP
-FP
-FN
-TN
-Precision@0.99
-Recall@0.99
-F1@0.99
-Accuracy
-Specificity
-Balanced Accuracy
-PR-AUC
-ROC-AUC
-Cross Entropy
-```
-
-同时按以下维度分组：
-
-```text
-每个游戏
-每个类别
-每个视频
-游戏 × 类别
-```
-
-核心聚合指标：
-
-```text
-global_f1_tau099
-macro_game_f1_tau099
-worst_game_f1_tau099
-macro_video_f1_tau099
-```
-
-建议监控重点不是只有 global F1，而是：
-
-```text
-global F1
-+
-macro game F1
-+
-worst game F1
-```
-
-## 8.4 错分类样本
-
-所有 FP 和 FN 记录：
-
-```text
-game
-label
-video_id
-frame0_id
-frame1_id
-delta
-image0_path
-image1_path
-logit0
-logit1
-margin
-probability_class1
-prediction
-error_type
-checkpoint_step
-```
-
-输出目录：
-
-```text
-reports/test_step_00005000/
-├── metrics.json
-├── metrics_by_game.csv
-├── metrics_by_video.csv
-├── false_positive.parquet
-├── false_negative.parquet
-├── near_threshold.parquet
-└── errors.html
-```
-
-HTML 中两张图片并排展示：
-
-```text
-image0 | image1
-真实标签
-预测标签
-类别1概率
-margin
-game/video/frame信息
-```
-
-阈值附近样本额外分组：
-
-```text
-0.980 ≤ p1 < 0.990
-0.990 < p1 < 0.995
-0.995 ≤ p1 < 0.999
-p1 ≥ 0.999
-```
-
----
-
-# 九、checkpoint 保存设计
-
-每个需要保存的 checkpoint 标签都产生两个文件。
-
-例如 `last`：
-
-```text
-checkpoints/
-├── model_last.pth
-└── checkpoint_last.pth
-```
-
-例如固定阈值 F1 最佳：
-
-```text
-checkpoints/
-├── model_best_f1_tau099.pth
-└── checkpoint_best_f1_tau099.pth
-```
-
-## 9.1 纯模型参数
-
-```python
-torch.save(
-    unwrap_model(model).state_dict(),
-    "model_last.pth",
-)
-```
-
-只包含模型参数，可直接部署或重新加载。
-
-## 9.2 完整训练状态
-
-```python
-torch.save(
-    {
-        "model": unwrap_model(model).state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict() if scaler else None,
-        "epoch": epoch,
-        "global_step": global_step,
-        "best_metrics": best_metrics,
-        "sampler_epoch": sampler_epoch,
-        "random_state": {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
-        },
-        "config": resolved_config,
-    },
-    "checkpoint_last.pth",
-)
-```
-
-八卡环境下只有 rank 0 写公共 checkpoint，并使用：
-
-```text
-先写临时文件
-→ fsync
-→ 原子rename
-```
-
-避免进程中断留下半个 checkpoint。
-
----
-
-# 十、训练配置初始版本
-
-```yaml
-experiment:
-  name: dual_frame_game_cls
-  seed: 20260728
-  output_dir: runs/dual_frame_game_cls
-
-device:
-  accelerator: cuda
-  amp: true
-  amp_dtype: float16
-  compile: false
-
-data:
-  train_root: /data/train
-  test_root: /data/test
-  width: 208
-  height: 448
-  channels: 3
-  normalization: zero_one
-  filename_pattern: '^(?P<video_id>\d{2})(?P<frame_id>\d{5})\.png$'
-
-pair:
-  train_delta_probability:
-    1: 0.15
-    2: 0.70
-    3: 0.15
-  test_delta: 2
-
-sampler:
-  game_alpha: 0.25
-  class0_probability: 0.50
-  class1_probability: 0.50
-  uniform_video: true
-  deduplicate_within_global_batch: true
-
-augmentation:
-  random_affine:
-    enabled: true
-    probability: 0.50
-    degrees: 2.0
-    translate: [0.02, 0.02]
-    scale: [0.98, 1.02]
-    shear: [-1.0, 1.0]
-
-  color_jitter:
-    enabled: true
-    probability: 0.80
-    brightness: 0.15
-    contrast: 0.15
-    saturation: 0.10
-    hue: 0.02
-
-  random_erasing:
-    enabled: true
-    probability: 0.10
-    scale: [0.005, 0.03]
-    ratio: [0.3, 3.3]
-    value: random
-
-  horizontal_flip:
-    enabled: false
-
-model:
-  checkpoint_path: /models/base_model.pth
-  trainable_name_contains: cls
-  num_classes: 2
-  freeze_batchnorm_stats: true
-
-loss:
-  cross_entropy_weight: 1.0
-  threshold: 0.99
-  threshold_loss_weight: 0.20
-  threshold_safety_margin: 0.20
-  threshold_temperature: 0.50
-  threshold_warmup_ratio: 0.10
-  threshold_ramp_ratio: 0.20
-
-optimizer:
-  name: AdamW
-  learning_rate: 0.001
-  weight_decay: 0.0001
-
-scheduler:
-  name: cosine
-  warmup_steps: 500
-  min_learning_rate: 0.00001
-
-train:
-  epochs: 10
-  steps_per_epoch: 1000
-  local_batch_size: 64
-  gradient_clip_norm: 5.0
-  log_every_steps: 50
-
-dataloader:
-  num_workers: 4
-  persistent_workers: true
-  prefetch_factor: 4
-  pin_memory: true
-  drop_last: true
-
-evaluation:
-  threshold: 0.99
-  quick_test_every_steps: 1000
-  quick_test_pairs_per_video: 128
-  full_test_every_steps: 5000
-  full_test_at_end: true
-  save_all_errors: true
-  html_max_errors_per_group: 200
-
-checkpoint:
-  save_last_every_steps: 1000
-  save_best_test_f1: true
-  save_model_only: true
-  save_full_state: true
-```
-
-这里的 epoch 不是强制遍历全部帧，而是固定 `steps_per_epoch`。这样数据量继续增加时，训练时长仍然可控。
-
----
-
-# 十一、CUDA 单卡开发路线
-
-## 阶段 1：数据正确性
-
-执行：
+因此执行：
 
 ```bash
-python tools/build_index.py \
-  --train-root /data/train \
-  --test-root /data/test \
-  --output-dir indexes
-
-python tools/audit_dataset.py \
-  --index-dir indexes \
-  --output-dir reports/data_audit
+python tools/train.py ...
 ```
 
-验收条件：
+时，`tools/train.py` 导入 `game_cls.engine.trainer` 后，大概率直接出现：
 
 ```text
-全部图片尺寸为448×208
-全部图片为3通道
-全部文件名可解析
-没有跨视频pair
-没有跨类别pair
-随机可视化100组delta=1/2/3 pair正确
-test仅生成delta=2 pair
+ModuleNotFoundError: No module named 'game_cls.reports'
 ```
 
-## 阶段 2：模型冻结正确性
+训练入口确实会立即导入 trainer。
 
-先跑 100 step：
+### 修复要求
 
-```bash
-python tools/train.py \
-  --config configs/cuda_debug.yaml \
-  train.max_steps=100
-```
-
-验收：
+至少补齐：
 
 ```text
-所有包含cls的参数requires_grad=True
-其他参数requires_grad=False
-cls参数有非零梯度
-非cls参数没有梯度
-训练100步后非cls参数逐元素完全不变
-loss能够下降
-输出形状为[B,2]
+src/game_cls/reports/__init__.py
+src/game_cls/reports/error_writer.py
 ```
 
-## 阶段 3：采样分布正确性
+并增加一个真正导入训练主链路的测试：
 
-运行一个不训练的 sampler 检查：
-
-```text
-采样100万次
-统计game比例
-统计每游戏类别比例
-统计视频比例
-统计delta比例
+```python
+def test_training_entrypoint_imports():
+    from game_cls.engine.trainer import run_training
+    assert callable(run_training)
 ```
 
-期望：
+目前测试主要覆盖独立组件，没有覆盖 `run_training()` 的完整导入和执行，因此这个遗漏没有被测试发现。
 
-```text
-delta1 ≈ 15%
-delta2 ≈ 70%
-delta3 ≈ 15%
-
-每游戏内部：
-label0 ≈ 50%
-label1 ≈ 50%
-```
-
-## 阶段 4：损失正确性
-
-构造人工 logit：
-
-```text
-正样本margin很小：threshold loss大
-正样本margin>4.8：threshold loss小
-负样本margin接近4.6：threshold loss大
-负样本margin<0：threshold loss小
-```
-
-验证损失无 NaN、梯度有限。
-
-## 阶段 5：完整 CUDA 闭环
-
-运行：
-
-```bash
-bash scripts/run_cuda_debug.sh
-```
-
-必须得到：
-
-```text
-训练日志
-quick test
-full test
-错误样本报告
-model_last.pth
-checkpoint_last.pth
-断点恢复成功
-```
+仓库也没有任何 GitHub Actions workflow 运行记录。
 
 ---
 
-# 十二、迁移到 Ascend 单卡
+## 2. 八卡 HCCL 初始化顺序存在高风险
 
-设备抽象：
+当前主流程先执行：
 
 ```python
-def initialize_device(accelerator, local_rank):
-    if accelerator == "cuda":
-        torch.cuda.set_device(local_rank)
-        return torch.device(f"cuda:{local_rank}")
+rank, world_size, local_rank = distributed_context(...)
+```
+
+然后才执行：
+
+```python
+device = initialize_device(...)
+```
+
+但是 `distributed_context()` 内已经调用：
+
+```python
+dist.init_process_group(backend="hccl")
+```
+
+而 `torch_npu` 是在之后的 `initialize_device()` 中才导入。
+
+这意味着 HCCL 初始化发生时，`torch_npu` 可能还没有完成后端注册，可能出现：
+
+```text
+Unknown c10d backend type HCCL
+```
+
+或者分布式初始化异常。
+
+Ascend 当前官方 DDP 示例会在初始化 HCCL 前先导入 `torch_npu`；官方完整示例也明确在模块顶部导入该扩展。([hiascend.com][1])
+
+### 推荐结构
+
+不要把设备初始化和分布式初始化拆成现在的顺序，改成统一运行时初始化：
+
+```python
+def initialize_runtime(config):
+    import os
+    import torch
+    import torch.distributed as dist
+
+    distributed = config.get("distributed", {}).get("enabled", False)
+    accelerator = config["device"]["accelerator"]
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     if accelerator == "npu":
         import torch_npu
         torch.npu.set_device(local_rank)
-        return torch.device(f"npu:{local_rank}")
+        device = torch.device(f"npu:{local_rank}")
+    elif accelerator == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
 
-    raise ValueError(accelerator)
-```
+    if distributed:
+        dist.init_process_group(
+            backend=config["distributed"]["backend"],
+            init_method="env://",
+        )
 
-先检查实际环境：
-
-```bash
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-python - <<'PY'
-import sys
-import torch
-import torch_npu
-
-print("Python:", sys.version)
-print("PyTorch:", torch.__version__)
-print("TorchNPU:", torch_npu.__version__)
-print("NPU available:", torch.npu.is_available())
-print("NPU count:", torch.npu.device_count())
-PY
-
-npu-smi info
-```
-
-当前 TorchNPU 官方仓库给出的安装示例包含 CANN 9.0.0、PyTorch 2.10.0 和 TorchNPU 2.10.0.post2；官方发布信息也列出了 PyTorch 2.10 和 Python 3.13 支持。实际训练前仍要把服务器的精确版本写入实验日志。([GitHub][4])
-
-单卡启动：
-
-```bash
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-python tools/train.py \
-  --config configs/npu_1p.yaml
-```
-
-验收顺序：
-
-```text
-固定输入FP32前向正常
-单batch反向正常
-cls参数更新
-checkpoint可保存
-checkpoint可恢复
-100步无NaN
-测试指标可生成
-```
-
-随后再打开 BF16 或 FP16 AMP。PyTorch AMP 会让适合低精度的卷积、线性等运算使用 FP16/BF16，同时保留部分需要 FP32 数值范围的运算；本方案仍强制把阈值 margin 和指标计算转换到 FP32。([PyTorch Docs][5])
-
----
-
-# 十三、八卡训练方案
-
-Ascend 侧使用：
-
-```text
-一个进程绑定一张NPU
-8个训练进程
-HCCL后端
-DistributedDataParallel
-```
-
-Ascend 官方迁移文档推荐使用 DDP，并通过 `backend="hccl"` 初始化进程组；单机多卡也支持使用 `torchrun` 拉起。([Hiascend][6])
-
-初始化：
-
-```python
-dist.init_process_group(
-    backend="hccl",
-    init_method="env://",
-)
-
-local_rank = int(os.environ["LOCAL_RANK"])
-torch.npu.set_device(local_rank)
-```
-
-包装模型：
-
-```python
-model = DDP(
-    model,
-    device_ids=[local_rank],
-    find_unused_parameters=False,
-    broadcast_buffers=False,
-    gradient_as_bucket_view=True,
-)
-```
-
-`broadcast_buffers=False` 的前提是所有 BatchNorm running stats 已被冻结。否则不能直接关闭。
-
-启动脚本：
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-torchrun \
-  --standalone \
-  --nnodes=1 \
-  --nproc_per_node=8 \
-  tools/train.py \
-  --config configs/npu_8p.yaml
-```
-
-八卡验收：
-
-```text
-8个rank全部启动
-每个rank绑定不同NPU
-每个rank的local batch不同
-所有rank step数量一致
-没有重复写checkpoint
-测试样本不重复、不补齐
-指标all_reduce正确
-单卡和八卡loss趋势一致
+    return rank, world_size, local_rank, device
 ```
 
 ---
 
-# 十四、当前每秒 200 samples 的性能路线
+# 三、P1：会明显影响训练正确性和性能的问题
 
-## 14.1 首先判断数据瓶颈
+## 1. “快速测试”实际上每次都执行完整测试
 
-一张未压缩 RGB 图像大小为：
-
-```text
-208 × 448 × 3 = 279,552 bytes
-```
-
-一个双帧样本约为：
-
-```text
-559,104 bytes
-≈ 0.533 MiB
-```
-
-一百万张原始 RGB 图像约为：
-
-```text
-260 GiB
-```
-
-如果训练数据通过你提到的约 `300 MB/s` 链路读取，则不考虑任何开销时，未压缩双帧样本的理论上限约为：
-
-```text
-536 samples/s
-```
-
-当前 `200 samples/s` 对应约 `106.6 MiB/s` 的原始像素吞吐。由于实际还存在 PNG 解码、小文件打开、随机访问、数据增强和 CPU 到 NPU 传输，因此“远程存储 + PNG”很可能是锯齿利用率的重要来源，但需要 Profiler 进一步确认。
-
-## 14.2 数据存储优化分三步
-
-### 第一步：复制到本机 NVMe
-
-正式性能测试不要直接跨服务器随机读取百万小文件。
-
-优先：
-
-```text
-远程数据
-→ 一次性复制到A3服务器本地NVMe
-→ 本地建立索引
-→ 本地训练
-```
-
-### 第二步：PNG 分片
-
-如果本地仍受到小文件 metadata 开销影响，将 PNG 打包为大分片：
-
-```text
-shard_000.tar
-shard_001.tar
-...
-```
-
-保留 PNG 压缩，减少随机打开大量小文件的成本。
-
-### 第三步：预解码 uint8 分片
-
-如果 Profiler 显示 CPU PNG 解码仍是瓶颈，转换为固定大小原始数据：
-
-```text
-packed/
-├── shard_000.bin
-├── shard_001.bin
-├── ...
-└── index.parquet
-```
-
-每张图固定存储：
-
-```text
-uint8 [3, 448, 208]
-```
-
-运行时直接按 offset 读取，不再执行 PNG 解码。
-
-代价是每百万张图片约需要 `260 GiB` 本地空间。
-
-## 14.3 DataLoader 参数扫描
-
-PyTorch DataLoader 原生支持 `num_workers`、`prefetch_factor` 和 `persistent_workers` 等配置。([PyTorch Docs][7])
-
-不要直接固定一个参数，执行短时间网格测试：
-
-```text
-num_workers_per_rank = 2 / 4 / 8
-prefetch_factor = 2 / 4
-pin_memory = true / false
-```
-
-八卡时总 worker 数为：
-
-```text
-8 × num_workers_per_rank
-```
-
-因此 worker 太多也可能造成 CPU 争用。
-
-初始值：
+配置中定义了：
 
 ```yaml
-dataloader:
-  num_workers: 4
-  prefetch_factor: 4
-  persistent_workers: true
-  pin_memory: true
+quick_test_every_steps: 50
+quick_test_pairs_per_video: 16
+full_test_every_steps: 100
 ```
 
-## 14.4 一次传输完整双帧 batch
-
-CPU DataLoader 返回：
-
-```text
-images: uint8 [B, 2, 3, 448, 208]
-labels: int64 [B]
-```
-
-一次传到设备：
+但训练代码只读取：
 
 ```python
-images = images.to(device, non_blocking=True)
-images = images.to(compute_dtype).div_(255.0)
-
-image0 = images[:, 0]
-image1 = images[:, 1]
+quick_test_every_steps
 ```
 
-不要分别对 `image0`、`image1` 执行多次零散 H2D。
+然后直接对完整的 `test_loader` 调用 `evaluate()`。
 
-## 14.5 batch size 扫描
-
-在单卡 NPU 和八卡 NPU 上分别测试：
+当前以下配置实际上没有被使用：
 
 ```text
-local_batch = 32
-local_batch = 64
-local_batch = 128
-local_batch = 256
+quick_test_pairs_per_video
+full_test_every_steps
 ```
 
-每组固定运行 500～1000 step，记录：
+在百万帧数据下，这会造成：
 
 ```text
-平均samples/s
-P50/P95 step时间
-data wait时间
-forward时间
-backward时间
-optimizer时间
-NPU峰值显存
+到达 quick_test 间隔
+→ rank 0 完整遍历 test
+→ 其他 7 个 rank 全部在 barrier 等待
+→ 完整生成错误记录
+→ 可能再保存 checkpoint
 ```
 
-选择吞吐最高且稳定的 batch，而不是只选择显存刚好不溢出的 batch。
+这很容易制造你之前提到的 NPU 利用率锯齿。
 
-## 14.6 减少同步
+### 应拆成两个 DataLoader
 
-热路径中禁止每一步执行：
+```text
+quick_test_loader
+    每个 game-label-video 均匀抽取固定数量 delta=2 pair
+
+full_test_loader
+    枚举全部合法 delta=2 pair
+```
+
+训练逻辑分别使用：
 
 ```python
-loss.item()
-tensor.cpu()
-torch.npu.synchronize()
-保存checkpoint
-写CSV
-```
+if step % quick_test_every_steps == 0:
+    evaluate(quick_test_loader)
 
-建议每 50 step 统一记录一次日志。
+if step % full_test_every_steps == 0:
+    evaluate(full_test_loader)
+```
 
 ---
 
-# 十五、Profiler 执行方式
+## 2. 八卡评估没有并行
 
-Ascend PyTorch Profiler 支持设置 `skip_first`、`warmup` 和 `active` step；官方文档建议通过短采集窗口避免全程 Profiling。([Hiascend][8])
+当前只有 rank 0 执行测试，其他 rank 在 barrier 中等待。
 
-建议：
+这虽然不会重复计算指标，但在 8 卡环境中效率很低。正确方案应为：
+
+```text
+每个 rank 处理 test 的不重复分片
+→ 本地累计 TP/FP/FN/TN 和 CE
+→ all_reduce 数值指标
+→ 每个 rank 单独写错误样本分片
+→ rank 0 合并报告
+```
+
+特别要避免使用会补齐重复样本的普通 `DistributedSampler`；测试 sampler 应不补齐、不重复。
+
+---
+
+## 3. 当前 test 已经被当作 validation 使用
+
+代码在周期性 test 后比较：
 
 ```python
-schedule = torch_npu.profiler.schedule(
-    skip_first=10,
-    wait=0,
-    warmup=1,
-    active=5,
-    repeat=1,
+if metrics["f1"] > best_f1:
+    save best_f1 checkpoint
+```
+
+因此这个 test 实际上参与了：
+
+* checkpoint 选择；
+* 模型版本选择；
+* 训练过程判断。
+
+这在统计上已经是 validation/dev set，而不是独立 final test。
+
+如果你坚持只保留 train 和 test，也可以继续这样做，但最终报告必须准确描述为：
+
+```text
+best observed dev-test F1
+```
+
+不能把反复查看并选择过的最高值当作完全独立的最终泛化指标。至少应同时报告：
+
+```text
+last checkpoint F1
+best checkpoint F1
+模型选择过程中总共评估 test 的次数
+```
+
+---
+
+## 4. 百万级数据下会生成数百万 Python 对象
+
+当前实现会：
+
+```python
+train_frames = read_frame_parquet(...)
+train_pairs = enumerate_pairs(train_frames, [1, 2, 3])
+```
+
+`enumerate_pairs()` 会针对三个 delta 分别构造完整 `PairSample` 列表。
+
+随后：
+
+* `PairDataset` 再复制一次 pair 列表；
+
+* sampler 再复制一次 pair 列表；
+
+* sampler 再为所有 pair 建立多层索引和 Python 整数列表。
+
+对于约 100 万帧：
+
+```text
+约 300 万个 train pair
+× 8 个独立训练进程
+```
+
+每个 rank 都读取完整 Parquet、创建完整 pair 对象和完整 test pair。启动时间、CPU 内存和 Python GC 压力都会很高，可能直接导致内存不足。
+
+### 应改成视频级懒采样
+
+训练阶段不要物化全部 pair，只保留紧凑的视频索引：
+
+```python
+VideoEntry(
+    game_id,
+    label,
+    video_id,
+    frame_ids: np.ndarray,
+    frame_paths: np.ndarray,
+    valid_starts_delta1: np.ndarray,
+    valid_starts_delta2: np.ndarray,
+    valid_starts_delta3: np.ndarray,
 )
 ```
 
-第一轮不要打开 `with_stack=True`。官方案例指出调用栈采集会显著增加 Profiling 膨胀。([Hiascend][9])
-
-Profiler 需要回答四个问题：
+sampler 直接返回：
 
 ```text
-1. DataLoader是否出现明显空洞？
-2. CPU增强和PNG解码占用多少时间？
-3. H2D是否与NPU计算重叠？
-4. forward、backward、HCCL分别占多少时间？
+video_index
+delta
+start_position
 ```
 
-根据结果决策：
+Dataset 再解析出两张图片路径。
 
-```text
-DataLoader空洞高
-→ 本地缓存、加worker、打包数据、预解码
-
-forward占比高
-→ 增大batch、AMP、后续测试图模式
-
-HCCL占比高
-→ 检查是否误同步了冻结参数或buffer
-
-测试/保存占比高
-→ 降低完整测试和checkpoint频率
-```
-
-TorchNPU 当前官方仓库也提供图模式能力，但应在 eager 模式精度和数据流水线稳定后再开启。([GitHub][4])
+这样内存规模从“所有 pair 数量”降为“所有 frame 数量 + 视频索引”。
 
 ---
 
-# 十六、最终执行顺序
+## 5. 需求中的分游戏、分视频指标尚未实现
 
-## 第一阶段：CUDA 正确性
+当前 `BinaryMetrics` 只提供一组全局指标。
 
-```text
-1. 建立索引
-2. 数据审计
-3. 双帧配对
-4. 一致数据增强
-5. 模型加载
-6. cls冻结策略
-7. 普通CE训练
-8. 0.99固定阈值测试
-9. checkpoint保存与恢复
-```
-
-## 第二阶段：算法增强
+`evaluate()` 也只调用一次全局 `confusion_from_margins()`，没有计算：
 
 ```text
-1. 三级平衡采样
-2. delta=15/70/15
-3. 阈值辅助损失
-4. 每游戏指标
-5. 每视频指标
-6. 错分类HTML
+每游戏 F1
+macro_game_f1
+worst_game_f1
+每视频 F1
+macro_video_f1
 ```
 
-## 第三阶段：NPU 单卡
+这会导致大游戏继续主导最终指标，无法验证“每个游戏都具有较好识别效果”的核心需求。
+
+此外，目前错误记录缺少：
 
 ```text
-1. FP32前向
-2. 单步反向
-3. 100步训练
-4. AMP
-5. 测试和checkpoint
+logit0
+logit1
+阈值附近样本
+按游戏汇总
+按视频汇总
+HTML双帧展示
 ```
 
-## 第四阶段：八卡 DDP
-
-```text
-1. HCCL初始化
-2. 分布式pair sampler
-3. 八卡训练
-4. 分布式测试
-5. rank0 checkpoint
-```
-
-## 第五阶段：性能优化
-
-严格按以下顺序：
-
-```text
-本地化数据
-→ 调DataLoader
-→ 调batch size
-→ AMP
-→ 减少同步
-→ PNG分片
-→ 预解码uint8
-→ Profiler复测
-→ 最后再测试图模式
-```
+并且错误报告模块本身还没有提交。
 
 ---
 
-## 最终验收标准
+## 6. 完整 checkpoint 不能精确续训
 
-框架完成时应满足：
+虽然 checkpoint 保存了 optimizer、scheduler、scaler 和 CPU RNG，但只保存了：
 
 ```text
-输入固定为两张[B,3,448,208]
-部署和主测试固定delta=2
-训练delta比例可配置且统计正确
-只有名称包含cls的参数发生变化
-每个游戏和类别都被均衡采样
-0.99阈值比较与部署严格一致
-周期性test可复现
-所有FP/FN可定位到两张原图
-模型参数和完整训练状态分别保存
-CUDA、NPU单卡、NPU八卡使用同一套业务代码
-八卡训练不存在持续的DataLoader空洞
-Profiler能够明确解释剩余性能瓶颈
+epoch
+global_step
+sampler_epoch
 ```
 
-实际实施从 `build_index.py → pair_dataset.py → freeze_policy.py → CUDA 100 step smoke test` 开始；在这四项通过前，不应先迁移八卡或打开图编译。
+没有保存：
 
-[1]: https://docs.pytorch.org/vision/main/generated/torchvision.transforms.v2.RandomAffine.html "https://docs.pytorch.org/vision/main/generated/torchvision.transforms.v2.RandomAffine.html"
-[2]: https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html "https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html"
-[3]: https://docs.pytorch.org/vision/main/generated/torchvision.transforms.RandomErasing.html "https://docs.pytorch.org/vision/main/generated/torchvision.transforms.RandomErasing.html"
-[4]: https://github.com/Ascend/pytorch/blob/master/README.md "https://github.com/Ascend/pytorch/blob/master/README.md"
-[5]: https://docs.pytorch.org/docs/stable/amp.html "https://docs.pytorch.org/docs/stable/amp.html"
-[6]: https://www.hiascend.com/document/detail/zh/canncommercial/700/modeldevpt/ptmigr/AImpug_000202.html "https://www.hiascend.com/document/detail/zh/canncommercial/700/modeldevpt/ptmigr/AImpug_000202.html"
-[7]: https://docs.pytorch.org/docs/stable/data.html "https://docs.pytorch.org/docs/stable/data.html"
-[8]: https://www.hiascend.com/document/detail/en/mindstudio/700/TITools/Profiling/atlasprofiling_16_0033.html "https://www.hiascend.com/document/detail/en/mindstudio/700/TITools/Profiling/atlasprofiling_16_0033.html"
-[9]: https://www.hiascend.com/document/caselibrary/detail/profilingcase_007 "https://www.hiascend.com/document/caselibrary/detail/profilingcase_007"
+```text
+当前 epoch 内已经消费的 batch 数量
+CUDA RNG
+NPU RNG
+各 rank 独立 RNG
+DataLoader worker RNG
+```
+
+恢复后代码重新设置 sampler epoch，然后从该 epoch 的第一个 batch 开始迭代。
+
+例如在 epoch 3 的第 400 step 保存，恢复时会重新消费 epoch 3 的前 400 个 batch。因此它是“可以继续训练”，但不是“精确恢复全部训练状态”。
+
+建议保存：
+
+```text
+epoch
+step_in_epoch
+global_step
+sampler state
+torch CPU RNG
+CUDA/NPU RNG
+每个 rank 的 RNG state
+```
+
+恢复时跳过已经消费的 batch，或者让 sampler 接受 `start_step`。
+
+---
+
+# 四、P2：需要在性能阶段优化的问题
+
+## 1. 游戏视频数量统计存在一个小错误
+
+当前游戏权重使用：
+
+```python
+{
+    video
+    for by_video in self.groups[game].values()
+    for video in by_video
+}
+```
+
+如果类别 0 和类别 1 中都存在 `video_id="01"`，它们会被当成同一个视频，只计数一次。
+
+应改成：
+
+```python
+{
+    (label, video)
+    for label, by_video in self.groups[game].items()
+    for video in by_video
+}
+```
+
+否则游戏采样权重并不是真正的 game-label-video 数量。
+
+## 2. 实际 delta 分布不一定是 15/70/15
+
+当前流程是：
+
+```text
+先选视频
+→ 再在该视频可用的 delta 中抽样
+```
+
+如果部分视频缺少合法的 `delta=2` pair，最终全局 delta 分布会偏离 70%。
+
+更严格的实现应先选择 delta，再从支持该 delta 的视频中选择视频，或者至少每个 epoch 输出实际 delta 分布。
+
+## 3. 数据增强后以 FP32 传输到 NPU
+
+增强链中明确执行：
+
+```python
+v2.ToDtype(dtype=torch.float32, scale=True)
+```
+
+因此训练 batch 从 DataLoader 输出时已经是 FP32；训练循环发现不是 uint8 后会直接传输。
+
+相对于 uint8，H2D 数据量放大四倍。对于 `[B,2,3,448,208]` 的输入，这会显著增加内存带宽、共享内存和 pin memory 压力。
+
+后续高性能实现应考虑：
+
+```text
+CPU执行PNG解码和必要空间增强
+→ 尽量保持uint8
+→ 一次H2D
+→ NPU上转换BF16/FP16并除以255
+→ 适合设备执行的增强放在设备端
+```
+
+## 4. 数据审计只报告，不阻止错误数据进入训练
+
+索引代码会统计不符合 `208×448×3` 的样本，但仍把这些帧写入 Parquet。
+
+训练主流程也不会读取 `audit.json` 或检查尺寸。遇到异常图片时，可能直到 DataLoader collate 才因张量尺寸不同而报错。
+
+建议正式训练默认：
+
+```yaml
+data:
+  strict_audit: true
+```
+
+出现以下任一问题就拒绝启动：
+
+```text
+尺寸错误
+通道错误
+损坏PNG
+非法文件名
+某游戏缺少一个类别
+test中没有合法delta=2 pair
+```
+
+## 5. Python 包依赖可能破坏 Ascend 环境
+
+`pyproject.toml` 把：
+
+```text
+torch>=2.2
+torchvision>=0.17
+```
+
+设为普通安装依赖。
+
+在 910B2 环境执行：
+
+```bash
+pip install -e .
+```
+
+可能让 pip 尝试安装或替换普通 PyTorch wheel，从而破坏已经匹配好的 `torch + torch_npu + CANN` 环境。
+
+更安全的是：
+
+```toml
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10.0",
+  "PyYAML>=6.0",
+  "pyarrow>=15.0",
+]
+
+[project.optional-dependencies]
+cuda = ["torch", "torchvision"]
+dev = ["pytest>=8.0"]
+```
+
+Ascend 环境安装时使用预先匹配好的 PyTorch/TorchNPU，不由该项目自动修改。
+
+---
+
+# 五、建议的修改顺序
+
+## 第一批：让仓库真正可运行
+
+1. 补齐 `reports` 包和 `write_evaluation_report()`。
+2. 增加 `run_training()` 导入及 2-step smoke test。
+3. 调整 NPU/HCCL 初始化，确保先导入 `torch_npu`。
+4. 添加 CPU GitHub Actions，至少执行：
+
+   ```bash
+   python -m pip install -e .[dev]
+   python -m pytest
+   python tools/train.py --config configs/cuda_debug.yaml train.max_steps=2
+   ```
+
+## 第二批：修复评估契约
+
+1. 真正实现 quick test 子集。
+2. 真正实现 `full_test_every_steps`。
+3. 增加按游戏和按视频指标。
+4. 增加 near-threshold、FP、FN 和 HTML 报告。
+5. 八卡分布式评估，不让 7 张卡等待 rank 0。
+
+## 第三批：解决百万数据规模问题
+
+1. 删除完整 `train_pairs` 物化。
+2. 改为视频级紧凑索引和懒采样。
+3. test pair 使用 NumPy/Arrow 紧凑数组。
+4. 每个 rank 不重复创建数百万 Python 对象。
+5. 再加入本地 NVMe、PNG shard 或 packed uint8 backend。
+
+## 第四批：完善训练状态和 A3 性能
+
+1. 支持精确的 `step_in_epoch` 恢复。
+2. 保存 CUDA/NPU 和各 rank RNG。
+3. 启用 BF16 AMP 并验证算子兼容性。
+4. 增加 DataLoader、H2D、forward、backward、HCCL 分段计时。
+5. 最后再考虑 `torch.compile` 或图模式。
+
+---
+
+# 最终判断
+
+这版不是一个“思路错误、需要推倒重写”的方案。相反，它已经具备了一个良好的训练框架核心：
+
+```text
+合法双帧配对
++ 多层均衡采样
++ 一致增强
++ cls冻结
++ 0.99阈值目标
++ 双checkpoint
+```
+
+但当前更准确的定位是：
+
+> **结构合理的 CUDA 原型代码，而不是已经完成的百万数据、8 卡 Ascend 生产训练框架。**
+
+最关键的下一步是先修复缺失的报告模块和 HCCL 初始化，再重构评估与 pair 索引。否则直接放到 8 卡服务器上，最可能遇到的不是模型精度问题，而是导入失败、HCCL 初始化失败、启动内存过大，以及周期性完整测试导致的严重锯齿停顿。
+
+[1]: https://www.hiascend.com/document/detail/zh/Pytorch/710/ptmoddevg/trainingmigrguide/PT_LMTMOG_0022.html "https://www.hiascend.com/document/detail/zh/Pytorch/710/ptmoddevg/trainingmigrguide/PT_LMTMOG_0022.html"

@@ -56,31 +56,57 @@ class BalancedDistributedPairBatchSampler:
         return self.steps_per_epoch
 
     def _sample_one(self, rng: random.Random) -> int:
-        games = list(self.groups)
+        available_deltas = sorted(
+            {
+                delta
+                for by_label in self.groups.values()
+                for by_video in by_label.values()
+                for by_delta in by_video.values()
+                for delta in by_delta
+            }
+        )
+        delta = _weighted_choice(
+            rng,
+            available_deltas,
+            [self.delta_probability.get(item, 0.0) for item in available_deltas],
+        )
+        games = [
+            game
+            for game, by_label in self.groups.items()
+            if any(
+                delta in by_delta
+                for by_video in by_label.values()
+                for by_delta in by_video.values()
+            )
+        ]
         game_weights = []
         for game in games:
             video_count = len(
                 {
-                    video
-                    for by_video in self.groups[game].values()
-                    for video in by_video
+                    (label, video)
+                    for label, by_video in self.groups[game].items()
+                    for video, by_delta in by_video.items()
+                    if delta in by_delta
                 }
             )
             game_weights.append(max(1, video_count) ** self.game_alpha)
         game = _weighted_choice(rng, games, game_weights)
 
-        labels = list(self.groups[game])
+        labels = [
+            label
+            for label, by_video in self.groups[game].items()
+            if any(delta in by_delta for by_delta in by_video.values())
+        ]
         label = _weighted_choice(
             rng, labels, [self.class_probability.get(label, 0.0) for label in labels]
         )
-        videos = list(self.groups[game][label])
+        videos = [
+            video
+            for video, by_delta in self.groups[game][label].items()
+            if delta in by_delta
+        ]
         video = rng.choice(videos)
-        available = self.groups[game][label][video]
-        deltas = list(available)
-        delta = _weighted_choice(
-            rng, deltas, [self.delta_probability.get(delta, 0.0) for delta in deltas]
-        )
-        return rng.choice(available[delta])
+        return rng.choice(self.groups[game][label][video][delta])
 
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
@@ -107,8 +133,11 @@ def expected_game_probabilities(
     grouped = group_pair_indices(pairs)
     weights = {}
     for game, by_label in grouped.items():
-        videos = {video for by_video in by_label.values() for video in by_video}
+        videos = {
+            (label, video)
+            for label, by_video in by_label.items()
+            for video in by_video
+        }
         weights[game] = len(videos) ** game_alpha
     denominator = sum(weights.values())
     return {game: weight / denominator for game, weight in weights.items()}
-

@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from collections import Counter
+import random
+from typing import Iterator, Sequence
+
+from .lazy_pair_dataset import PairRequest
+from .video_index import VideoEntry
+
+
+def _choice(rng: random.Random, values: Sequence, weights: Sequence[float]):
+    if not values:
+        raise RuntimeError("Cannot sample from an empty population")
+    if not any(weight > 0 for weight in weights):
+        return rng.choice(list(values))
+    return rng.choices(values, weights=weights, k=1)[0]
+
+
+class VideoBalancedPairBatchSampler:
+    """Delta-first, deterministic sampler without materializing PairSample objects."""
+
+    def __init__(
+        self,
+        videos: Sequence[VideoEntry],
+        local_batch_size: int,
+        steps_per_epoch: int,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+        game_alpha: float = 0.25,
+        class_probability: dict[int, float] | None = None,
+        delta_probability: dict[int, float] | None = None,
+        deduplicate_within_global_batch: bool = True,
+    ) -> None:
+        if local_batch_size <= 0 or steps_per_epoch <= 0:
+            raise ValueError("batch size and steps_per_epoch must be positive")
+        if not 0 <= rank < world_size:
+            raise ValueError("rank must be in [0, world_size)")
+        self.videos = videos
+        self.local_batch_size = local_batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.game_alpha = game_alpha
+        self.class_probability = class_probability or {0: 0.5, 1: 0.5}
+        self.delta_probability = delta_probability or {1: 0.15, 2: 0.70, 3: 0.15}
+        self.deduplicate = deduplicate_within_global_batch
+        self.epoch = 0
+        self.start_step = 0
+        self.last_epoch_delta_counts: Counter[int] = Counter()
+        self._support: dict[int, dict[str, dict[int, list[int]]]] = {}
+        for video_index, video in enumerate(videos):
+            for delta, starts in video.valid_start_positions.items():
+                if len(starts):
+                    self._support.setdefault(delta, {}).setdefault(
+                        video.game, {}
+                    ).setdefault(video.label, []).append(video_index)
+        if not self._support:
+            raise ValueError("No legal training pairs are available")
+
+    def set_epoch(self, epoch: int, start_step: int = 0) -> None:
+        self.epoch = epoch
+        self.start_step = start_step
+
+    def state_dict(self, step_in_epoch: int) -> dict:
+        return {
+            "epoch": self.epoch,
+            "step_in_epoch": step_in_epoch,
+            "seed": self.seed,
+        }
+
+    def __len__(self) -> int:
+        return max(0, self.steps_per_epoch - self.start_step)
+
+    def _sample_for_delta(self, rng: random.Random, delta: int) -> PairRequest:
+        games = list(self._support[delta])
+        game_weights = []
+        for game in games:
+            count = sum(
+                len(video_indices)
+                for video_indices in self._support[delta][game].values()
+            )
+            game_weights.append(max(1, count) ** self.game_alpha)
+        game = _choice(rng, games, game_weights)
+        labels = list(self._support[delta][game])
+        label = _choice(
+            rng, labels, [self.class_probability.get(item, 0.0) for item in labels]
+        )
+        video_index = rng.choice(self._support[delta][game][label])
+        valid_starts = self.videos[video_index].valid_start_positions[delta]
+        start_position = int(rng.choice(valid_starts))
+        return PairRequest(
+            video_index=video_index,
+            delta=delta,
+            start_position=start_position,
+            augmentation_seed=rng.getrandbits(63),
+        )
+
+    def __iter__(self) -> Iterator[list[PairRequest]]:
+        rng = random.Random(self.seed + self.epoch * 1_000_003)
+        self.last_epoch_delta_counts = Counter()
+        global_batch_size = self.local_batch_size * self.world_size
+        deltas = list(self._support)
+        delta_weights = [self.delta_probability.get(item, 0.0) for item in deltas]
+        for step in range(self.steps_per_epoch):
+            selected: list[PairRequest] = []
+            used: set[tuple[int, int, int]] = set()
+            attempts = 0
+            max_attempts = max(100, global_batch_size * 20)
+            while len(selected) < global_batch_size:
+                delta = _choice(rng, deltas, delta_weights)
+                request = self._sample_for_delta(rng, delta)
+                identity = (
+                    request.video_index,
+                    request.delta,
+                    request.start_position,
+                )
+                attempts += 1
+                if self.deduplicate and identity in used and attempts < max_attempts:
+                    while identity in used and attempts < max_attempts:
+                        request = self._sample_for_delta(rng, delta)
+                        identity = (
+                            request.video_index,
+                            request.delta,
+                            request.start_position,
+                        )
+                        attempts += 1
+                selected.append(request)
+                used.add(identity)
+                self.last_epoch_delta_counts[request.delta] += 1
+            if step < self.start_step:
+                continue
+            start = self.rank * self.local_batch_size
+            yield selected[start : start + self.local_batch_size]
+
+
+class DeterministicIndexBatchSampler:
+    """Exact-resume sampler used by the synthetic smoke dataset."""
+
+    def __init__(
+        self,
+        dataset_size: int,
+        local_batch_size: int,
+        steps_per_epoch: int,
+        *,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+    ) -> None:
+        self.dataset_size = dataset_size
+        self.local_batch_size = local_batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self.epoch = 0
+        self.start_step = 0
+
+    def set_epoch(self, epoch: int, start_step: int = 0) -> None:
+        self.epoch = epoch
+        self.start_step = start_step
+
+    def state_dict(self, step_in_epoch: int) -> dict:
+        return {"epoch": self.epoch, "step_in_epoch": step_in_epoch, "seed": self.seed}
+
+    def __len__(self) -> int:
+        return max(0, self.steps_per_epoch - self.start_step)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch * 1_000_003)
+        global_batch_size = self.local_batch_size * self.world_size
+        for step in range(self.steps_per_epoch):
+            batch = [rng.randrange(self.dataset_size) for _ in range(global_batch_size)]
+            if step < self.start_step:
+                continue
+            start = self.rank * self.local_batch_size
+            yield batch[start : start + self.local_batch_size]

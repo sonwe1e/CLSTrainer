@@ -8,7 +8,6 @@ class ConsistentPairAugment:
 
     def __init__(self, config: dict[str, Any]) -> None:
         try:
-            import torch
             from torchvision.transforms import v2
         except ImportError as exc:
             raise RuntimeError("Augmentation requires torchvision") from exc
@@ -44,7 +43,6 @@ class ConsistentPairAugment:
                     p=color.get("probability", 0.8),
                 )
             )
-        transforms.append(v2.ToDtype(dtype=torch.float32, scale=True))
         erasing = config.get("random_erasing", {})
         if erasing.get("enabled", False):
             value = erasing.get("value", "random")

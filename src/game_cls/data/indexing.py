@@ -20,6 +20,9 @@ def scan_split(
     root: str | Path,
     split: str,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
+    expected_width: int = 208,
+    expected_height: int = 448,
+    expected_channels: int = 3,
 ) -> tuple[list[FrameRecord], list[dict]]:
     root = Path(root).resolve()
     frames: list[FrameRecord] = []
@@ -27,19 +30,48 @@ def scan_split(
     if not root.is_dir():
         raise FileNotFoundError(f"{split} root does not exist: {root}")
 
-    for path in sorted(root.glob("*/*/*.png")):
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
         relative = path.relative_to(root)
         if len(relative.parts) != 3:
+            issues.append(
+                {
+                    "path": str(path),
+                    "kind": "invalid_layout",
+                    "error": "expected <game>/<0|1>/<frame>.png",
+                }
+            )
             continue
         game, label_text, _ = relative.parts
         if label_text not in {"0", "1"}:
-            issues.append({"path": str(path), "error": "label directory must be 0 or 1"})
+            issues.append({
+                "path": str(path),
+                "kind": "invalid_label",
+                "error": "label directory must be 0 or 1",
+            })
             continue
         try:
             video_id, frame_id = parse_filename(path.name, filename_pattern)
             width, height, channels = read_png_metadata(path)
         except (OSError, ValueError) as exc:
-            issues.append({"path": str(path), "error": str(exc)})
+            issues.append(
+                {"path": str(path), "kind": "invalid_file", "error": str(exc)}
+            )
+            continue
+        if (width, height, channels) != (
+            expected_width,
+            expected_height,
+            expected_channels,
+        ):
+            issues.append(
+                {
+                    "path": str(path),
+                    "kind": "unexpected_dimensions",
+                    "error": (
+                        f"expected {expected_width}x{expected_height}x"
+                        f"{expected_channels}, got {width}x{height}x{channels}"
+                    ),
+                }
+            )
             continue
         frames.append(
             FrameRecord(
@@ -105,11 +137,15 @@ def make_audit(
                 for (w, h, c), count in sorted(dimensions.items())
             ],
             "unexpected_dimension_count": sum(
-                (f.width, f.height, f.channels)
-                != (expected_width, expected_height, expected_channels)
-                for f in frames
+                issue.get("kind") == "unexpected_dimensions"
+                for issue in issues_by_split.get(split, [])
             ),
             "parse_or_file_issues": issues_by_split.get(split, []),
+            "games_missing_labels": {
+                game: sorted({0, 1} - {frame.label for frame in frames if frame.game == game})
+                for game in sorted({frame.game for frame in frames})
+                if {frame.label for frame in frames if frame.game == game} != {0, 1}
+            },
             "valid_pairs": {
                 str(delta): sum(
                     getattr(video, f"valid_pair_count_delta{delta}") for video in videos
@@ -122,6 +158,47 @@ def make_audit(
         "height": expected_height,
         "channels": expected_channels,
     }, "splits": split_reports}
+
+
+def validate_audit(
+    audit: dict,
+    *,
+    require_test_delta: int = 2,
+) -> None:
+    problems: list[str] = []
+    for split in ("train", "test"):
+        report = audit.get("splits", {}).get(split)
+        if report is None:
+            problems.append(f"missing {split} audit")
+            continue
+        if report.get("unexpected_dimension_count", 0):
+            problems.append(
+                f"{split} has {report['unexpected_dimension_count']} invalid dimensions"
+            )
+        if report.get("parse_or_file_issues"):
+            problems.append(
+                f"{split} has {len(report['parse_or_file_issues'])} invalid files"
+            )
+        if report.get("games_missing_labels"):
+            problems.append(f"{split} games missing labels: {report['games_missing_labels']}")
+        if report.get("frame_count", 0) == 0:
+            problems.append(f"{split} has no valid frames")
+    test_report = audit.get("splits", {}).get("test", {})
+    if int(test_report.get("valid_pairs", {}).get(str(require_test_delta), 0)) <= 0:
+        problems.append(f"test has no legal delta={require_test_delta} pairs")
+    if problems:
+        raise RuntimeError("Strict dataset audit failed: " + "; ".join(problems))
+
+
+def validate_audit_file(path: str | Path, *, require_test_delta: int = 2) -> dict:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Strict audit is enabled but audit report is missing: {path}"
+        )
+    audit = json.loads(path.read_text(encoding="utf-8"))
+    validate_audit(audit, require_test_delta=require_test_delta)
+    return audit
 
 
 def write_index_bundle(
@@ -145,4 +222,3 @@ def write_index_bundle(
         json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return audit
-
