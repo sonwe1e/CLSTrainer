@@ -1,0 +1,18 @@
+base: cuda_debug.yaml
+device:
+  accelerator: npu
+  amp: false
+  amp_dtype: bfloat16
+data:
+  synthetic: false
+train:
+  local_batch_size: 64
+  max_steps: null
+  verify_frozen_parameters: false
+optimizer:
+  learning_rate: 0.001
+dataloader:
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true

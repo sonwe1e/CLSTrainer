@@ -1,0 +1,7 @@
+base: npu_1p.yaml
+distributed:
+  enabled: true
+  backend: hccl
+train:
+  local_batch_size: 64
+

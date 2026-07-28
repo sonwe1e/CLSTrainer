@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Validate an index audit report")
+    parser.add_argument("--index-dir", default="indexes")
+    parser.add_argument("--output-dir", default="reports/data_audit")
+    parser.add_argument("--strict", action="store_true")
+    args = parser.parse_args()
+    source = Path(args.index_dir) / "audit.json"
+    audit = json.loads(source.read_text(encoding="utf-8"))
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    destination = output / "audit.json"
+    destination.write_text(
+        json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    problems = 0
+    for split, report in audit["splits"].items():
+        problems += report["unexpected_dimension_count"]
+        problems += len(report["parse_or_file_issues"])
+        print(
+            f"{split}: frames={report['frame_count']} videos={report['video_count']} "
+            f"unexpected_dimensions={report['unexpected_dimension_count']} "
+            f"issues={len(report['parse_or_file_issues'])}"
+        )
+    if args.strict and problems:
+        raise SystemExit(f"Dataset audit failed with {problems} problem(s)")
+
+
+if __name__ == "__main__":
+    main()
+
