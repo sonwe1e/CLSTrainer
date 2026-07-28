@@ -3,6 +3,10 @@
 双帧、多游戏二分类训练框架。输入为两张 `[B,3,448,208]` RGB 图像，模型输出
 `[B,2]`，部署判定固定为第二通道 Softmax 概率严格大于 `0.99`。
 
+希望先了解项目全貌时，可直接在浏览器打开自包含的中文教程
+[`tutorial.html`](tutorial.html)。教程按“项目目的 → 技术架构 → 数据准备 →
+训练评估 → NPU 验收”的顺序提供完整操作路径。
+
 ## 安装
 
 项目的基础安装不会安装或替换 PyTorch，避免破坏已经与 CANN 匹配的
@@ -69,6 +73,17 @@ train/test 中字节完全相同的图片。两位 `video_id` 默认按 split �
 跨 split 重名只作为信息记录；只有确认它在整个项目中全局唯一后，才应启用
 `require_unique_video_keys_across_splits` 强制检查。
 
+SHA-256 会完整读取每张图片，是一次性但明显的 I/O 成本。百万帧数据推荐按以下
+顺序准备，避免在远程小文件链路上反复扫描：
+
+```text
+复制 train/test 到本地 NVMe
+→ 建索引并计算 SHA-256
+→ 生成 packed 数据
+→ 执行审计
+→ 开始 smoke/正式训练
+```
+
 ## 训练
 
 CPU/CUDA 合成数据 smoke test：
@@ -107,6 +122,10 @@ NPU 运行时会先导入 `torch_npu`、绑定设备，再初始化 HCCL。训�
 python tools/pack_dataset.py \
   --frame-index indexes/train_frames.parquet \
   --output-dir /local_nvme/train_packed
+
+python tools/pack_dataset.py \
+  --frame-index indexes/test_frames.parquet \
+  --output-dir /local_nvme/test_packed
 ```
 
 分别打包 train/test，然后把生产配置的 `data.backend` 改为 `packed_uint8`，
@@ -116,8 +135,24 @@ python tools/pack_dataset.py \
 仅维护最多 `packed_max_open_shards` 个 LRU memmap。该后端避免训练热路径中的
 PNG 解压，数据仍应优先复制到本地 NVMe。
 
+普通生产配置默认保留 `backend: png`，便于直接接入原始数据；高吞吐训练应显式
+使用 `configs/npu_production_packed.yaml`。正式选择后端前，应保持模型、batch、
+worker 和训练步数完全一致，分别运行 500～1000 step，对比：
+
+- `wall_samples/s` 和 host data wait；
+- CPU 使用率及主进程/worker RSS；
+- NPU 利用率和 step P95；
+- page cache 稳定后而非冷启动阶段的吞吐。
+
+默认每 shard 4096 张图，约 1.07 GiB。随机均衡采样下建议实测
+`images_per_shard=512/1024/2048/4096` 与
+`packed_max_open_shards=8/16/32` 的组合；memmap 只建立映射，不等于一次读取
+整个 shard，但 shard 大小和 LRU 数量会影响 page cache 命中率。
+
 接入真实模型时，将 `model.factory` 设置为 `包名.模块名:函数名`。工厂函数必须
 返回接受 `(image0, image1)` 并输出 `[B,2]` 的 `torch.nn.Module`。
+只训练 `cls` 时，所有非 `cls` 参数和 buffer 必须 100% 从基础 checkpoint 加载；
+该严格规则固定生效，不提供容易产生误解的关闭开关。
 
 ## 评估契约
 
@@ -128,6 +163,10 @@ quick test 会从每个 `(game,label,video)` 的 `delta=2` pair 中按时间均�
 错例在 batch 内流式写分片，再由 rank 0 流式合并。评估前向按
 `evaluation.amp/amp_dtype` 使用与部署一致的 BF16/FP16；CE、Brier 和混淆矩阵
 在设备上累计，结束时再统一归约，避免每个 batch 多次 `.item()` 同步。
+真实视频评估使用连续的 game、game-label 和 video 整数 ID，通过 NumPy
+`bincount` 按 batch 聚合分组混淆矩阵；Python 逐样本处理仅用于 FP/FN 和临界
+样本。Parquet writer 默认累计 `parquet_row_group_size=4096` 条记录再写 row
+group，避免每个 batch 产生一次小写入。
 
 full test 报告包含：
 
@@ -140,11 +179,16 @@ false_positive.parquet
 false_negative.parquet
 near_threshold.parquet
 errors.html
+previews/*.png
 ```
 
 quick test 仅写 `metrics.json`、受 `quick_save_error_limit` 全局限制的少量
 FP/FN 与 near-threshold Parquet，不再生成 HTML 和分组 CSV，避免短周期评估
 承担完整报告开销。同一步同时满足 quick/full 周期时只运行 full。
+
+PNG 后端的 HTML 直接引用原图；packed 后端只为 HTML 上限内的错例解码并导出
+`previews/*.png`，浏览器不会再尝试加载无效的 `packed://` 地址。完整 FP/FN
+Parquet 仍保存紧凑的 packed frame index，不会为全部错例重复导出图片。
 
 `near_threshold.parquet` 只保存 `0.98 <= p1 <= 0.995` 的样本；更高置信度只记录
 区间计数。指标同时包含 Brier Score、20-bin ECE 和置信度直方图。由于训练采用
@@ -158,6 +202,12 @@ checkpoint 指标、best observed dev-test 指标，以及 quick/full test 的�
 灾难性退化。单类 `by_game_label` 行不再展示无意义的 F1/AUC：正类报告 recall
 和 FN rate，负类报告 specificity 和 FP rate。
 
+生产模板将 `minimum_worst_game_f1` 留为 `null`，因为没有可靠基线时不应猜测
+门限。首轮稳定基线完成后，应根据各游戏结果设为非零值（例如基线明确支持时再
+设为 `0.75`）。周期 full test 参与选模，因此其角色是 observed dev-test；对外
+报告无偏结果时，还需要一个从未参与选模的独立 final test。若分数需要跨游戏和
+版本解释为概率，还应在自然分布 calibration 集上拟合 temperature 和 bias。
+
 ## 精确恢复
 
 完整 checkpoint 保存 epoch、`step_in_epoch`、global step、sampler 状态、优化器、
@@ -165,10 +215,21 @@ scheduler、scaler、CPU/CUDA/NPU RNG 和各 rank 独立 RNG。训练 pair 自�
 seed，因此恢复时可以直接从 epoch 内下一 batch 继续，不重新解码已经消费的 batch。
 
 生产配置的周期性恢复 checkpoint 只保存可训练状态、优化器和基础权重哈希；
-同时记录并严格核对预期 trainable state keys。完整快照按较低频率保存为
-`model_<tag>_full.pth`，文件内明确记录 `global_step` 和 artifact role；周期恢复
-文件保持为 `checkpoint_last.pth`。同一步同时触发 best 与 last 时只序列化一次，
-再创建稳定别名，减少冻结主干的重复 I/O。
+同时记录并严格核对预期 trainable state keys。产物契约为：
+
+```text
+model_<tag>.pth                 纯 state_dict，可直接 load_state_dict
+model_<tag>.metadata.json       global_step、epoch、artifact role
+checkpoint_<tag>.pth            完整训练与恢复状态
+```
+
+周期恢复文件为 `checkpoint_last.pth`。完整纯权重按较低频率保存；同一步同时触发
+best 与 last 时只序列化一次，再创建稳定别名，减少冻结主干的重复 I/O。部署端可
+继续直接执行：
+
+```python
+model.load_state_dict(torch.load("model_last.pth", map_location="cpu"))
+```
 
 普通训练日志中的分段时间明确标记为 host enqueue 时间，不表示 NPU 实际算子
 耗时；日志同时报告排除评估/保存的 `train_only_samples/s` 和包含全部停顿的

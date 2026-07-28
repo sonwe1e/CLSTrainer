@@ -261,8 +261,11 @@ def evaluate(
     quick_error_limit: int = 200,
     amp: bool = False,
     amp_dtype: str = "bfloat16",
+    parquet_row_group_size: int = 4096,
+    group_catalogs: dict | None = None,
 ) -> EvaluationOutput:
     import torch
+    import numpy as np
 
     from game_cls.reports.error_writer import EvaluationShardWriter
 
@@ -277,6 +280,29 @@ def evaluate(
     group_video: dict = {}
     group_game_label: dict = {}
     group_video_confidence: dict = {}
+    vectorized_groups = bool(group_catalogs)
+    if vectorized_groups:
+        game_counts_array = np.zeros(
+            (len(group_catalogs["game"]), 4), dtype=np.int64
+        )
+        game_label_counts_array = np.zeros(
+            (len(group_catalogs["game_label"]), 4), dtype=np.int64
+        )
+        video_counts_array = np.zeros(
+            (len(group_catalogs["video"]), 4), dtype=np.int64
+        )
+        video_probability_count = np.zeros(
+            len(group_catalogs["video"]), dtype=np.int64
+        )
+        video_probability_sum = np.zeros(
+            len(group_catalogs["video"]), dtype=np.float64
+        )
+        video_probability_min = np.full(
+            len(group_catalogs["video"]), np.inf, dtype=np.float64
+        )
+        video_probability_max = np.full(
+            len(group_catalogs["video"]), -np.inf, dtype=np.float64
+        )
     cross_entropy_sum = torch.zeros((), dtype=torch.float32, device=device)
     brier_sum = torch.zeros((), dtype=torch.float32, device=device)
     sample_count = 0
@@ -292,7 +318,15 @@ def evaluate(
         dtype=torch.float32,
         device=device,
     )
-    writer = EvaluationShardWriter(report_dir, rank) if report_dir is not None else None
+    writer = (
+        EvaluationShardWriter(
+            report_dir,
+            rank,
+            row_group_size=parquet_row_group_size,
+        )
+        if report_dir is not None
+        else None
+    )
     quick_local_limit = (
         (quick_error_limit + max(1, world_size) - 1) // max(1, world_size)
         if quick_error_limit > 0
@@ -369,10 +403,12 @@ def evaluate(
                     confidence_indices, minlength=5
                 )
 
-                batch_metadata = [
-                    _metadata_dict(item)
-                    for item in batch.get("meta", [{}] * len(labels))
-                ]
+                raw_metadata = batch.get("meta", [{}] * len(labels))
+                batch_metadata = (
+                    raw_metadata
+                    if vectorized_groups
+                    else [_metadata_dict(item) for item in raw_metadata]
+                )
                 batch_errors: list[dict] = []
                 batch_near: list[dict] = []
                 compact = torch.stack(
@@ -384,6 +420,120 @@ def evaluate(
                     ),
                     dim=1,
                 ).cpu()
+                compact_numpy = compact.numpy()
+                targets_numpy = compact_numpy[:, 2].astype(
+                    np.int64, copy=False
+                )
+                predictions_numpy = compact_numpy[:, 3].astype(
+                    np.int64, copy=False
+                )
+                if exact_scores:
+                    margins.extend(compact_numpy[:, 0].tolist())
+                    targets.extend(targets_numpy.tolist())
+                if vectorized_groups:
+                    required_group_fields = (
+                        "game_id",
+                        "game_label_id",
+                        "video_group_id",
+                    )
+                    missing_group_fields = [
+                        key
+                        for key in required_group_fields
+                        if key not in batch
+                    ]
+                    if missing_group_fields:
+                        raise KeyError(
+                            "Vectorized evaluation is missing group IDs: "
+                            f"{missing_group_fields}"
+                        )
+                    outcomes = np.empty(len(targets_numpy), dtype=np.int64)
+                    outcomes[
+                        (predictions_numpy == 1) & (targets_numpy == 1)
+                    ] = 0
+                    outcomes[
+                        (predictions_numpy == 1) & (targets_numpy == 0)
+                    ] = 1
+                    outcomes[
+                        (predictions_numpy == 0) & (targets_numpy == 1)
+                    ] = 2
+                    outcomes[
+                        (predictions_numpy == 0) & (targets_numpy == 0)
+                    ] = 3
+
+                    def accumulate_counts(destination, ids) -> None:
+                        ids = ids.numpy().astype(np.int64, copy=False)
+                        flattened = np.bincount(
+                            ids * 4 + outcomes,
+                            minlength=destination.size,
+                        )
+                        if flattened.size != destination.size:
+                            raise IndexError(
+                                "Evaluation group ID exceeds its catalog"
+                            )
+                        destination += flattened.reshape(
+                            destination.shape
+                        )
+
+                    accumulate_counts(
+                        game_counts_array, batch["game_id"]
+                    )
+                    accumulate_counts(
+                        game_label_counts_array,
+                        batch["game_label_id"],
+                    )
+                    accumulate_counts(
+                        video_counts_array, batch["video_group_id"]
+                    )
+                    video_ids = (
+                        batch["video_group_id"]
+                        .numpy()
+                        .astype(np.int64, copy=False)
+                    )
+                    probability_values = compact_numpy[:, 1].astype(
+                        np.float64, copy=False
+                    )
+                    np.add.at(video_probability_count, video_ids, 1)
+                    np.add.at(
+                        video_probability_sum,
+                        video_ids,
+                        probability_values,
+                    )
+                    np.minimum.at(
+                        video_probability_min,
+                        video_ids,
+                        probability_values,
+                    )
+                    np.maximum.at(
+                        video_probability_max,
+                        video_ids,
+                        probability_values,
+                    )
+                else:
+                    for values, meta in zip(
+                        compact_numpy, batch_metadata
+                    ):
+                        margin = float(values[0])
+                        probability = float(values[1])
+                        target = int(values[2])
+                        counts = _counter(margin, target, cutoff)
+                        game = str(meta.get("game", "unknown"))
+                        video_id = str(
+                            meta.get("video_id", "unknown")
+                        )
+                        _add_counter(group_game, game, counts)
+                        _add_counter(
+                            group_video,
+                            (game, target, video_id),
+                            counts,
+                        )
+                        _add_counter(
+                            group_game_label, (game, target), counts
+                        )
+                        _add_confidence(
+                            group_video_confidence,
+                            (game, target, video_id),
+                            probability,
+                        )
                 report_mask = (
                     (predictions != labels.bool())
                     | ((probabilities >= 0.980) & (probabilities <= 0.995))
@@ -392,53 +542,31 @@ def evaluate(
                 report_logits = logits_fp32.index_select(
                     0, report_indices
                 ).cpu()
-                report_logits_by_index = {
-                    int(index): logit
-                    for index, logit in zip(
-                        report_indices.cpu().tolist(), report_logits
-                    )
-                }
-                for index, (values, meta) in enumerate(
-                    zip(compact, batch_metadata)
+                for index, logit in zip(
+                    report_indices.cpu().tolist(), report_logits
                 ):
+                    values = compact_numpy[index]
+                    meta = _metadata_dict(batch_metadata[index])
                     margin = float(values[0])
                     probability = float(values[1])
                     target = int(values[2])
                     prediction = int(values[3])
-                    if exact_scores:
-                        margins.append(margin)
-                        targets.append(target)
-                    counts = _counter(margin, target, cutoff)
-                    game = str(meta.get("game", "unknown"))
-                    video_id = str(meta.get("video_id", "unknown"))
-                    _add_counter(group_game, game, counts)
-                    _add_counter(group_video, (game, target, video_id), counts)
-                    _add_counter(group_game_label, (game, target), counts)
-                    _add_confidence(
-                        group_video_confidence,
-                        (game, target, video_id),
-                        probability,
-                    )
-                    logit = report_logits_by_index.get(index)
-                    if logit is not None:
-                        row = {
-                            **meta,
-                            "label": target,
-                            "logit0": float(logit[0]),
-                            "logit1": float(logit[1]),
-                            "margin": margin,
-                            "probability_class1": probability,
-                            "prediction": prediction,
-                            "checkpoint_step": checkpoint_step,
-                        }
-                    else:
-                        row = None
-                    if prediction != target and row is not None:
+                    row = {
+                        **meta,
+                        "label": target,
+                        "logit0": float(logit[0]),
+                        "logit1": float(logit[1]),
+                        "margin": margin,
+                        "probability_class1": probability,
+                        "prediction": prediction,
+                        "checkpoint_step": checkpoint_step,
+                    }
+                    if prediction != target:
                         batch_errors.append(
                             {**row, "error_type": "FP" if prediction else "FN"}
                         )
                     band = _threshold_band(probability)
-                    if band is not None and row is not None:
+                    if band is not None:
                         batch_near.append({**row, "threshold_band": band})
                 if evaluation_kind == "quick":
                     remaining_errors = max(
@@ -457,6 +585,40 @@ def evaluate(
     finally:
         if writer is not None:
             writer.close()
+
+    if vectorized_groups:
+        group_game = {
+            key: values.tolist()
+            for key, values in zip(
+                group_catalogs["game"], game_counts_array
+            )
+            if values.sum()
+        }
+        group_game_label = {
+            tuple(key): values.tolist()
+            for key, values in zip(
+                group_catalogs["game_label"],
+                game_label_counts_array,
+            )
+            if values.sum()
+        }
+        group_video = {
+            tuple(key): values.tolist()
+            for key, values in zip(
+                group_catalogs["video"], video_counts_array
+            )
+            if values.sum()
+        }
+        group_video_confidence = {
+            tuple(key): {
+                "count": int(video_probability_count[index]),
+                "sum": float(video_probability_sum[index]),
+                "min": float(video_probability_min[index]),
+                "max": float(video_probability_max[index]),
+            }
+            for index, key in enumerate(group_catalogs["video"])
+            if video_probability_count[index]
+        }
 
     if distributed:
         import torch.distributed as dist

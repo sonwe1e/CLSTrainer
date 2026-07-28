@@ -1,0 +1,1258 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="CLSTrainer 项目目的、技术架构与完整使用教程">
+  <title>CLSTrainer · 双帧分类训练教程</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07110f;
+      --surface: #0d1a17;
+      --surface-2: #12231f;
+      --surface-3: #172c27;
+      --line: rgba(166, 219, 199, .16);
+      --line-strong: rgba(166, 219, 199, .32);
+      --text: #edf8f3;
+      --muted: #9db9ae;
+      --accent: #55e6aa;
+      --accent-2: #83bfff;
+      --warm: #ffcb76;
+      --danger: #ff8e8e;
+      --code: #050c0a;
+      --shadow: 0 24px 70px rgba(0, 0, 0, .34);
+      --radius: 22px;
+      --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      --sans: Inter, "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 88px; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(45, 166, 119, .18), transparent 32rem),
+        radial-gradient(circle at 93% 17%, rgba(64, 130, 204, .14), transparent 30rem),
+        var(--bg);
+      line-height: 1.72;
+    }
+    a { color: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    code { font-family: var(--mono); }
+
+    .progress {
+      position: fixed;
+      inset: 0 auto auto 0;
+      z-index: 100;
+      height: 3px;
+      width: 0;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      box-shadow: 0 0 14px rgba(85, 230, 170, .6);
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 17, 15, .82);
+      backdrop-filter: blur(18px);
+    }
+    .topbar-inner {
+      width: min(1240px, calc(100% - 36px));
+      min-height: 68px;
+      margin: auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 22px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 11px;
+      text-decoration: none;
+      font-weight: 760;
+      letter-spacing: -.02em;
+    }
+    .brand-mark {
+      width: 34px;
+      aspect-ratio: 1;
+      border: 1px solid rgba(85, 230, 170, .48);
+      border-radius: 11px;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      background: rgba(85, 230, 170, .08);
+      font-family: var(--mono);
+      font-size: 12px;
+      box-shadow: inset 0 0 20px rgba(85, 230, 170, .08);
+    }
+    .topnav {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .topnav::-webkit-scrollbar { display: none; }
+    .topnav a {
+      padding: 8px 11px;
+      border-radius: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: .2s ease;
+    }
+    .topnav a:hover,
+    .topnav a.active {
+      color: var(--text);
+      background: rgba(255, 255, 255, .06);
+    }
+
+    main { overflow: clip; }
+    .wrap { width: min(1160px, calc(100% - 36px)); margin-inline: auto; }
+    .hero {
+      position: relative;
+      min-height: 650px;
+      padding: 92px 0 76px;
+      display: grid;
+      align-items: center;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -190px;
+      top: 70px;
+      border: 1px solid rgba(85, 230, 170, .14);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 54px rgba(85, 230, 170, .025),
+        0 0 0 108px rgba(131, 191, 255, .018);
+      pointer-events: none;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      width: fit-content;
+      padding: 6px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      color: var(--accent);
+      background: rgba(85, 230, 170, .06);
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+    h1 {
+      max-width: 900px;
+      margin: 25px 0 20px;
+      font-size: clamp(46px, 7.4vw, 92px);
+      line-height: .98;
+      letter-spacing: -.065em;
+      font-weight: 820;
+    }
+    .gradient-text {
+      color: transparent;
+      background: linear-gradient(110deg, var(--accent), #b7ffe3 45%, var(--accent-2));
+      background-clip: text;
+      -webkit-background-clip: text;
+    }
+    .hero-lead {
+      max-width: 760px;
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(17px, 2vw, 21px);
+    }
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 34px;
+    }
+    .button {
+      min-height: 44px;
+      padding: 0 17px;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      color: var(--text);
+      background: rgba(255, 255, 255, .045);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 700;
+      transition: transform .2s ease, background .2s ease, border-color .2s ease;
+    }
+    .button:hover { transform: translateY(-2px); border-color: rgba(85, 230, 170, .6); }
+    .button.primary {
+      color: #052219;
+      border-color: transparent;
+      background: var(--accent);
+      box-shadow: 0 12px 34px rgba(85, 230, 170, .2);
+    }
+    .hero-metrics {
+      margin-top: 58px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(13, 26, 23, .72);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .metric {
+      min-height: 126px;
+      padding: 24px;
+      border-right: 1px solid var(--line);
+    }
+    .metric:last-child { border-right: 0; }
+    .metric strong {
+      display: block;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 25px;
+      letter-spacing: -.04em;
+    }
+    .metric span { display: block; margin-top: 7px; color: var(--muted); font-size: 13px; }
+
+    section { padding: 86px 0; border-top: 1px solid var(--line); }
+    .section-head {
+      display: grid;
+      grid-template-columns: .7fr 1.3fr;
+      gap: 48px;
+      align-items: end;
+      margin-bottom: 42px;
+    }
+    .section-index {
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 13px;
+      letter-spacing: .1em;
+    }
+    h2 {
+      margin: 8px 0 0;
+      font-size: clamp(32px, 4vw, 54px);
+      line-height: 1.06;
+      letter-spacing: -.045em;
+    }
+    .section-intro { margin: 0; color: var(--muted); font-size: 17px; }
+    h3 { margin: 0 0 12px; font-size: 20px; letter-spacing: -.025em; }
+    h4 { margin: 0 0 8px; font-size: 15px; }
+    p { margin: 0 0 16px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 13px; }
+
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .card {
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, rgba(18, 35, 31, .88), rgba(10, 23, 20, .86));
+      box-shadow: 0 18px 45px rgba(0, 0, 0, .16);
+    }
+    .card-kicker {
+      margin-bottom: 17px;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .card p:last-child { margin-bottom: 0; }
+
+    .purpose-card { min-height: 255px; }
+    .purpose-icon {
+      width: 48px;
+      height: 48px;
+      margin-bottom: 35px;
+      border: 1px solid var(--line-strong);
+      border-radius: 15px;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      background: rgba(85, 230, 170, .06);
+      font-family: var(--mono);
+      font-weight: 800;
+    }
+
+    .architecture {
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: rgba(5, 12, 10, .58);
+      box-shadow: var(--shadow);
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }
+    .flow-node {
+      position: relative;
+      min-height: 176px;
+      padding: 19px;
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      background: var(--surface);
+    }
+    .flow-node:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      right: -19px;
+      width: 26px;
+      height: 26px;
+      margin-top: -13px;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      background: var(--bg);
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .node-number { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+    .flow-node h3 { margin-top: 22px; font-size: 17px; }
+    .flow-node p { color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .flow-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 14px; }
+    .tag {
+      padding: 3px 7px;
+      border-radius: 999px;
+      color: #c7dbd3;
+      background: rgba(255, 255, 255, .055);
+      font-family: var(--mono);
+      font-size: 10px;
+    }
+    .architecture-note {
+      margin-top: 18px;
+      padding: 18px 20px;
+      border-left: 3px solid var(--accent);
+      border-radius: 5px 14px 14px 5px;
+      color: var(--muted);
+      background: rgba(85, 230, 170, .055);
+      font-size: 14px;
+    }
+
+    .layer-list { display: grid; gap: 12px; }
+    .layer {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 20px;
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(13, 26, 23, .66);
+    }
+    .layer-label { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+    .layer strong { display: block; margin-bottom: 5px; }
+    .layer span { color: var(--muted); font-size: 13px; }
+
+    .steps { position: relative; display: grid; gap: 18px; }
+    .steps::before {
+      content: "";
+      position: absolute;
+      left: 24px;
+      top: 30px;
+      bottom: 30px;
+      width: 1px;
+      background: linear-gradient(var(--accent), rgba(85, 230, 170, .08));
+    }
+    .step {
+      position: relative;
+      display: grid;
+      grid-template-columns: 50px 1fr;
+      gap: 20px;
+    }
+    .step-number {
+      z-index: 1;
+      width: 49px;
+      height: 49px;
+      border: 1px solid rgba(85, 230, 170, .5);
+      border-radius: 15px;
+      display: grid;
+      place-items: center;
+      color: var(--accent);
+      background: var(--bg);
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    .step-content {
+      padding: 22px 23px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(13, 26, 23, .7);
+    }
+
+    .code-shell {
+      position: relative;
+      margin-top: 15px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--code);
+      overflow: hidden;
+    }
+    .code-head {
+      min-height: 38px;
+      padding: 0 11px 0 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, .025);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .copy {
+      padding: 5px 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+    }
+    .copy:hover { color: var(--text); border-color: var(--line-strong); }
+    pre {
+      margin: 0;
+      padding: 18px;
+      overflow: auto;
+      color: #c9eee0;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.65;
+      tab-size: 2;
+    }
+
+    .compare {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .compare-card { position: relative; overflow: hidden; }
+    .compare-card.recommended { border-color: rgba(85, 230, 170, .42); }
+    .ribbon {
+      position: absolute;
+      top: 16px;
+      right: -34px;
+      width: 130px;
+      padding: 4px;
+      transform: rotate(38deg);
+      color: #062018;
+      background: var(--accent);
+      text-align: center;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .08em;
+    }
+    .checklist { margin: 18px 0 0; padding: 0; list-style: none; }
+    .checklist li {
+      position: relative;
+      margin: 9px 0;
+      padding-left: 22px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .checklist li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      color: var(--accent);
+      font-family: var(--mono);
+    }
+
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      overflow-x: auto;
+    }
+    table { width: 100%; border-collapse: collapse; min-width: 700px; background: rgba(13, 26, 23, .62); }
+    th, td { padding: 15px 17px; border-bottom: 1px solid var(--line); text-align: left; font-size: 13px; }
+    th { color: var(--muted); background: rgba(255, 255, 255, .025); font-weight: 650; }
+    tr:last-child td { border-bottom: 0; }
+    td code { color: var(--accent); font-size: 12px; }
+
+    .callout {
+      margin-top: 20px;
+      padding: 20px 22px;
+      border: 1px solid rgba(255, 203, 118, .27);
+      border-radius: 16px;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 14px;
+      color: #e7d7bb;
+      background: rgba(255, 203, 118, .055);
+    }
+    .callout strong { color: var(--warm); }
+    .callout.danger {
+      border-color: rgba(255, 142, 142, .27);
+      color: #e8c5c5;
+      background: rgba(255, 142, 142, .05);
+    }
+    .callout.danger strong { color: var(--danger); }
+
+    .faq { display: grid; gap: 10px; }
+    details {
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(13, 26, 23, .65);
+      overflow: hidden;
+    }
+    summary {
+      padding: 18px 20px;
+      cursor: pointer;
+      font-weight: 700;
+      list-style: none;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; float: right; color: var(--accent); font-family: var(--mono); }
+    details[open] summary::after { content: "−"; }
+    details p { margin: 0; padding: 0 20px 20px; color: var(--muted); font-size: 14px; }
+
+    .final {
+      padding: 82px 0 96px;
+      text-align: center;
+    }
+    .final-box {
+      padding: 52px 28px;
+      border: 1px solid rgba(85, 230, 170, .3);
+      border-radius: 30px;
+      background:
+        linear-gradient(145deg, rgba(85, 230, 170, .09), rgba(131, 191, 255, .045)),
+        var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .final h2 { max-width: 820px; margin-inline: auto; }
+    .final p { max-width: 720px; margin: 18px auto 0; color: var(--muted); }
+    .final .hero-actions { justify-content: center; margin-top: 28px; }
+    footer {
+      padding: 24px 0 40px;
+      color: var(--muted);
+      text-align: center;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    @media (max-width: 900px) {
+      .topbar-inner { width: min(100% - 22px, 1160px); }
+      .brand span:last-child { display: none; }
+      .hero { min-height: auto; padding-top: 70px; }
+      .hero-metrics { grid-template-columns: repeat(2, 1fr); }
+      .metric:nth-child(2) { border-right: 0; }
+      .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .section-head { grid-template-columns: 1fr; gap: 18px; }
+      .grid-3 { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-node { min-height: auto; }
+      .flow-node:not(:last-child)::after {
+        content: "↓";
+        top: auto;
+        bottom: -19px;
+        right: 50%;
+        margin: 0 -13px 0 0;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .wrap { width: min(100% - 24px, 1160px); }
+      .topnav a { padding-inline: 8px; }
+      .hero { padding: 56px 0 58px; }
+      h1 { font-size: clamp(42px, 15vw, 65px); }
+      section { padding: 65px 0; }
+      .hero-metrics, .grid-2, .compare { grid-template-columns: 1fr; }
+      .metric { border-right: 0; border-bottom: 1px solid var(--line); }
+      .metric:last-child { border-bottom: 0; }
+      .architecture { padding: 16px; }
+      .layer { grid-template-columns: 1fr; gap: 8px; }
+      .step { grid-template-columns: 40px 1fr; gap: 12px; }
+      .steps::before { left: 19px; }
+      .step-number { width: 40px; height: 40px; border-radius: 12px; }
+      .step-content { padding: 18px; }
+      pre { font-size: 11px; }
+    }
+
+    @media print {
+      :root { color-scheme: light; --bg: #fff; --surface: #fff; --surface-2: #f7faf8; --text: #11231d; --muted: #53665f; --line: #dbe5e1; }
+      body { background: #fff; }
+      .topbar, .progress, .copy, .hero-actions { display: none !important; }
+      .hero { min-height: 0; padding-top: 40px; }
+      section { break-inside: avoid; padding: 42px 0; }
+      .card, .architecture, .step-content, details { box-shadow: none; background: #fff; }
+      details { break-inside: avoid; }
+      details > * { display: block !important; }
+      pre { color: #173b2f; background: #f4f7f5; white-space: pre-wrap; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress" id="progress" aria-hidden="true"></div>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top" aria-label="返回教程顶部">
+        <span class="brand-mark">CLS</span>
+        <span>CLSTrainer Tutorial</span>
+      </a>
+      <nav class="topnav" aria-label="教程目录">
+        <a href="#purpose">目的</a>
+        <a href="#architecture">架构</a>
+        <a href="#data">数据</a>
+        <a href="#quickstart">使用</a>
+        <a href="#evaluation">评估</a>
+        <a href="#artifacts">产物</a>
+        <a href="#npu">NPU</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <div class="hero wrap">
+      <div>
+        <span class="eyebrow">Production-oriented two-frame classification</span>
+        <h1>把两张连续画面，训练成<span class="gradient-text">可信的分类决策</span></h1>
+        <p class="hero-lead">
+          CLSTrainer 是一个面向多游戏、双帧二分类任务的训练框架。它把数据审计、
+          懒采样、单卡/八卡训练、部署精度评估、错例报告与精确恢复组合成一条可验证的生产链路。
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#quickstart">开始使用 <span aria-hidden="true">→</span></a>
+          <a class="button" href="#architecture">查看技术架构</a>
+        </div>
+        <div class="hero-metrics" aria-label="核心技术规格">
+          <div class="metric"><strong>2 × RGB</strong><span>每个样本由两张连续画面组成</span></div>
+          <div class="metric"><strong>448 × 208</strong><span>生产配置的单帧输入尺寸</span></div>
+          <div class="metric"><strong>[B, 2]</strong><span>模型输出二分类 logits</span></div>
+          <div class="metric"><strong>p₁ &gt; 0.99</strong><span>固定业务分数判定规则</span></div>
+        </div>
+      </div>
+    </div>
+
+    <section id="purpose">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">01 / PURPOSE</span>
+            <h2>项目要解决什么</h2>
+          </div>
+          <p class="section-intro">
+            目标并非只让模型“跑起来”，而是让百万帧数据、严格阈值、多游戏公平性和
+            NPU 分布式训练在同一套可审计契约下工作。
+          </p>
+        </div>
+        <div class="grid-3">
+          <article class="card purpose-card">
+            <div class="purpose-icon" aria-hidden="true">01</div>
+            <h3>捕捉时间变化</h3>
+            <p class="muted">
+              单张画面可能缺少动作上下文。框架同时输入 image0 与 image1，让模型学习两帧之间的变化，而不仅是静态纹理。
+            </p>
+          </article>
+          <article class="card purpose-card">
+            <div class="purpose-icon" aria-hidden="true">08</div>
+            <h3>扩展到多卡训练</h3>
+            <p class="muted">
+              同一套入口支持 CPU/CUDA 调试、Ascend 单卡和 HCCL 八卡训练，并保留每个 rank 的随机状态以实现精确恢复。
+            </p>
+          </article>
+          <article class="card purpose-card">
+            <div class="purpose-icon" aria-hidden="true">99</div>
+            <h3>让指标可以解释</h3>
+            <p class="muted">
+              除全局 F1 外，同时观察 macro-game、worst-game、校准指标和按视频错例，避免大游戏掩盖小游戏退化。
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">02 / ARCHITECTURE</span>
+            <h2>从文件到决策的技术架构</h2>
+          </div>
+          <p class="section-intro">
+            整体采用“离线索引 + 在线懒采样 + 设备端训练 + 分布式流式评估”的分层设计，
+            将大规模数据的内存压力和评估报告的 I/O 压力拆开处理。
+          </p>
+        </div>
+
+        <div class="architecture">
+          <div class="flow" aria-label="CLSTrainer 核心数据流">
+            <article class="flow-node">
+              <span class="node-number">STAGE 01</span>
+              <h3>原始画面</h3>
+              <p>按 split、game、label 组织 PNG，文件名编码 video 与 frame ID。</p>
+              <div class="flow-tags"><span class="tag">PNG</span><span class="tag">SHA-256</span></div>
+            </article>
+            <article class="flow-node">
+              <span class="node-number">STAGE 02</span>
+              <h3>索引与审计</h3>
+              <p>生成 frame/video Parquet，检查尺寸、泄漏和 game × label × delta 覆盖。</p>
+              <div class="flow-tags"><span class="tag">Parquet</span><span class="tag">Audit</span></div>
+            </article>
+            <article class="flow-node">
+              <span class="node-number">STAGE 03</span>
+              <h3>懒采样</h3>
+              <p>按 game → label → video → delta 采样，只生成当前 batch 的 PairRequest。</p>
+              <div class="flow-tags"><span class="tag">Deterministic</span><span class="tag">Balanced</span></div>
+            </article>
+            <article class="flow-node">
+              <span class="node-number">STAGE 04</span>
+              <h3>训练</h3>
+              <p>两帧一致增强，uint8 传输后转 BF16/FP16；只训练名称包含 cls 的参数。</p>
+              <div class="flow-tags"><span class="tag">DDP</span><span class="tag">AMP</span><span class="tag">HCCL</span></div>
+            </article>
+            <article class="flow-node">
+              <span class="node-number">STAGE 05</span>
+              <h3>评估与产物</h3>
+              <p>直方图 AUC、组合选模、流式错例和纯 state_dict/checkpoint 双产物。</p>
+              <div class="flow-tags"><span class="tag">F1@0.99</span><span class="tag">ECE</span><span class="tag">HTML</span></div>
+            </article>
+          </div>
+          <div class="architecture-note">
+            关键约束：<strong>0.99 是业务分数阈值，不等同于真实概率 99%</strong>。
+            训练采用 50/50 平衡采样和阈值间隔损失，因此长期跨版本比较应增加自然分布 calibration 集。
+          </div>
+        </div>
+
+        <div class="grid-2" style="margin-top:18px">
+          <article class="card">
+            <div class="card-kicker">MODEL CONTRACT</div>
+            <h3>模型接口</h3>
+            <div class="layer-list">
+              <div class="layer">
+                <span class="layer-label">INPUT</span>
+                <div><strong>image0, image1</strong><span>两个 `[B, 3, H, W]` Tensor</span></div>
+              </div>
+              <div class="layer">
+                <span class="layer-label">OUTPUT</span>
+                <div><strong>logits</strong><span>形状必须为 `[B, 2]`</span></div>
+              </div>
+              <div class="layer">
+                <span class="layer-label">TRAINABLE</span>
+                <div><strong>名称包含 cls</strong><span>其余主干参数被冻结并检查不变性</span></div>
+              </div>
+            </div>
+          </article>
+          <article class="card">
+            <div class="card-kicker">LOSS &amp; SELECTION</div>
+            <h3>优化目标</h3>
+            <div class="layer-list">
+              <div class="layer">
+                <span class="layer-label">LOSS</span>
+                <div><strong>CE + threshold margin</strong><span>阈值损失包含 warmup 与 ramp</span></div>
+              </div>
+              <div class="layer">
+                <span class="layer-label">BEST</span>
+                <div><strong>Composite score</strong><span>global、macro-game 与 worst-game F1</span></div>
+              </div>
+              <div class="layer">
+                <span class="layer-label">GUARD</span>
+                <div><strong>worst-game floor</strong><span>建立基线后设置非零下限</span></div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="data">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">03 / DATA</span>
+            <h2>数据格式与存储后端</h2>
+          </div>
+          <p class="section-intro">
+            先保证数据正确，再讨论吞吐。严格审计会在 DataLoader 创建前阻止尺寸、
+            文件名、类别覆盖或 train/test 内容泄漏问题。
+          </p>
+        </div>
+
+        <div class="grid-2">
+          <article class="card">
+            <div class="card-kicker">DIRECTORY CONTRACT</div>
+            <h3>目录与文件名</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>dataset tree</span><button class="copy" type="button">复制</button></div>
+              <pre><code>train/
+├── game_A/
+│   ├── 0/
+│   │   ├── 0100001.png
+│   │   └── 0100003.png
+│   └── 1/
+│       ├── 0200001.png
+│       └── 0200003.png
+└── game_B/...
+
+test/
+└── game_A/...</code></pre>
+            </div>
+            <p class="muted small" style="margin-top:14px">
+              文件名格式：两位 video ID + 五位 frame ID + .png。两位 video ID 默认只在 split 内唯一。
+            </p>
+          </article>
+
+          <article class="card">
+            <div class="card-kicker">PREPARATION ORDER</div>
+            <h3>百万帧推荐准备顺序</h3>
+            <div class="steps" style="margin-top:22px">
+              <div class="step"><div class="step-number">1</div><div class="step-content"><strong>复制到本地 NVMe</strong><div class="muted small">避免远程随机小文件链路反复扫描。</div></div></div>
+              <div class="step"><div class="step-number">2</div><div class="step-content"><strong>建索引并计算 SHA-256</strong><div class="muted small">一次性检查完全相同的跨 split 内容。</div></div></div>
+              <div class="step"><div class="step-number">3</div><div class="step-content"><strong>按需生成 packed 数据</strong><div class="muted small">消除训练热路径中的 PNG 解码。</div></div></div>
+              <div class="step"><div class="step-number">4</div><div class="step-content"><strong>审计后再训练</strong><div class="muted small">确认 game × label × delta 覆盖。</div></div></div>
+            </div>
+          </article>
+        </div>
+
+        <div class="compare" style="margin-top:18px">
+          <article class="card compare-card">
+            <div class="card-kicker">BACKEND A</div>
+            <h3>PNG · 默认与兼容</h3>
+            <p class="muted">无需额外转换，适合首次接入、调试和小数据集。</p>
+            <ul class="checklist">
+              <li>直接使用原始路径和 Image.open</li>
+              <li>错例 HTML 可直接引用原图</li>
+              <li>吞吐可能受 PNG 解码与小文件 I/O 限制</li>
+            </ul>
+            <div class="code-shell">
+              <div class="code-head"><span>config</span><button class="copy" type="button">复制</button></div>
+              <pre><code>data:
+  backend: png</code></pre>
+            </div>
+          </article>
+          <article class="card compare-card recommended">
+            <span class="ribbon">HIGH THROUGHPUT</span>
+            <div class="card-kicker">BACKEND B</div>
+            <h3>packed_uint8 · 高吞吐</h3>
+            <p class="muted">预解码为固定 CHW uint8 shard，使用整数 frame index 与 LRU memmap。</p>
+            <ul class="checklist">
+              <li>不建立百万项路径字典</li>
+              <li>shard 路径相对 manifest，可整体移动</li>
+              <li>HTML 仅为有限错例导出 preview PNG</li>
+            </ul>
+            <div class="code-shell">
+              <div class="code-head"><span>production profile</span><button class="copy" type="button">复制</button></div>
+              <pre><code>--config configs/npu_production_packed.yaml</code></pre>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">04 / QUICK START</span>
+            <h2>从零到第一次训练</h2>
+          </div>
+          <p class="section-intro">
+            以下命令按推荐执行顺序排列。NPU 环境必须先安装与服务器 CANN 版本匹配的
+            PyTorch 和 TorchNPU，项目本身不会替换它们。
+          </p>
+        </div>
+
+        <div class="steps">
+          <article class="step">
+            <div class="step-number">01</div>
+            <div class="step-content">
+              <h3>安装项目</h3>
+              <p class="muted small">基础安装用于 Ascend；开发机可安装 CUDA 或 dev 额外依赖。</p>
+              <div class="code-shell">
+                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+                <pre><code>python -m pip install -e .
+
+# CUDA 开发环境
+python -m pip install -e ".[cuda]"
+
+# CPU CI / 测试环境
+python -m pip install -e ".[dev]"</code></pre>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">02</div>
+            <div class="step-content">
+              <h3>建立索引并执行审计</h3>
+              <div class="code-shell">
+                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+                <pre><code>python tools/build_index.py \
+  --train-root /local_nvme/data/train \
+  --test-root /local_nvme/data/test \
+  --output-dir indexes
+
+python tools/audit_dataset.py \
+  --index-dir indexes \
+  --output-dir reports/data_audit \
+  --strict</code></pre>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">03</div>
+            <div class="step-content">
+              <h3>可选：生成 packed 数据</h3>
+              <div class="code-shell">
+                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+                <pre><code>python tools/pack_dataset.py \
+  --frame-index indexes/train_frames.parquet \
+  --output-dir /local_nvme/train_packed
+
+python tools/pack_dataset.py \
+  --frame-index indexes/test_frames.parquet \
+  --output-dir /local_nvme/test_packed</code></pre>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">04</div>
+            <div class="step-content">
+              <h3>先跑 CPU/CUDA 合成数据 smoke</h3>
+              <div class="code-shell">
+                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+                <pre><code>python tools/train.py \
+  --config configs/cuda_debug.yaml \
+  train.max_steps=2 \
+  train.steps_per_epoch=2 \
+  evaluation.quick_test_every_steps=1 \
+  evaluation.full_test_every_steps=2</code></pre>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">05</div>
+            <div class="step-content">
+              <h3>接入真实模型</h3>
+              <p class="muted small">
+                修改生产配置中的 factory 与 checkpoint。工厂函数必须返回接受两张图并输出 `[B,2]` 的 Module。
+              </p>
+              <div class="code-shell">
+                <div class="code-head"><span>configs/npu_production.yaml</span><button class="copy" type="button">复制</button></div>
+                <pre><code>model:
+  factory: your_package.your_module:build_model
+  checkpoint_path: /models/pretrained_backbone.pth
+  trainable_name_contains: cls
+  require_pretrained_backbone: true</code></pre>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="evaluation">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">05 / EVALUATION</span>
+            <h2>评估、选模与错例</h2>
+          </div>
+          <p class="section-intro">
+            quick 用于训练过程中的轻量观察，full 用于完整指标和 best 选择。
+            同一步同时满足两者时只运行 full。
+          </p>
+        </div>
+
+        <div class="grid-3">
+          <article class="card">
+            <div class="card-kicker">QUICK TEST</div>
+            <h3>快速反馈</h3>
+            <p class="muted">每视频时间均匀抽取固定数量的 delta=2 pair，只写 metrics 与有限 FP/FN、临界样本 Parquet。</p>
+          </article>
+          <article class="card">
+            <div class="card-kicker">FULL TEST</div>
+            <h3>完整评估</h3>
+            <p class="muted">枚举全部合法 pair，使用直方图分布式 AUC、整数分组聚合和缓冲 Parquet 写入。</p>
+          </article>
+          <article class="card">
+            <div class="card-kicker">FINAL FULL</div>
+            <h3>最终比较</h3>
+            <p class="muted">训练结束的 full 同样参与组合分数比较，可更新 best checkpoint，不会遗漏最后一步模型。</p>
+          </article>
+        </div>
+
+        <div class="grid-2" style="margin-top:18px">
+          <article class="card">
+            <h3>组合选模</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>selection config</span><button class="copy" type="button">复制</button></div>
+              <pre><code>evaluation:
+  selection_metric: composite
+  selection_weights:
+    global_f1: 0.40
+    macro_game_f1: 0.40
+    worst_game_f1: 0.20
+  minimum_worst_game_f1: null</code></pre>
+            </div>
+            <p class="muted small" style="margin-top:13px">
+              首轮可靠基线完成后再设置非零 worst-game 下限，不要凭空猜测门限。
+            </p>
+          </article>
+          <article class="card">
+            <h3>报告如何解释</h3>
+            <ul class="checklist">
+              <li>正类 game-label：重点看 recall 与 FN rate</li>
+              <li>负类 game-label：重点看 specificity 与 FP rate</li>
+              <li>Brier、ECE：观察分数校准稳定性</li>
+              <li>observed_dev_test：说明该集合参与了选模</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="callout">
+          <span aria-hidden="true">◆</span>
+          <div>
+            <strong>部署精度一致性</strong>
+            <div class="small">生产评估使用 evaluation.amp=true 与 bfloat16，模型选择依据与部署一致的低精度前向，而不是固定 FP32。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="artifacts">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">06 / ARTIFACTS</span>
+            <h2>训练结束后会得到什么</h2>
+          </div>
+          <p class="section-intro">
+            权重、恢复状态和报告相互独立。部署端无需理解 optimizer 或 sampler，
+            训练恢复也不会依赖一个缺少随机状态的“纯权重”文件。
+          </p>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>产物</th><th>用途</th><th>关键契约</th></tr></thead>
+            <tbody>
+              <tr><td><code>model_last.pth</code></td><td>部署或独立推理</td><td>纯 state_dict，可直接 load_state_dict</td></tr>
+              <tr><td><code>model_last.metadata.json</code></td><td>追踪权重来源</td><td>记录 global_step、epoch 与角色</td></tr>
+              <tr><td><code>checkpoint_last.pth</code></td><td>精确恢复训练</td><td>模型、optimizer、scheduler、scaler、sampler 与各 rank RNG</td></tr>
+              <tr><td><code>metrics.json</code></td><td>全局指标</td><td>F1@0.99、AUC、Brier、ECE、置信度分布</td></tr>
+              <tr><td><code>metrics_by_*.csv</code></td><td>分组诊断</td><td>game、game-label 与 video 维度</td></tr>
+              <tr><td><code>false_*.parquet</code></td><td>完整错例集合</td><td>流式写入，不在 rank 0 集中保存 Python 列表</td></tr>
+              <tr><td><code>errors.html</code></td><td>人工复核</td><td>packed 模式自动引用有限的 previews/*.png</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="code-shell" style="margin-top:18px">
+          <div class="code-head"><span>纯权重加载</span><button class="copy" type="button">复制</button></div>
+          <pre><code>import torch
+
+state_dict = torch.load(
+    "runs/your_run/checkpoints/model_last.pth",
+    map_location="cpu",
+    weights_only=True,
+)
+model.load_state_dict(state_dict)</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="npu">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">07 / NPU VALIDATION</span>
+            <h2>正式长跑前的设备门槛</h2>
+          </div>
+          <p class="section-intro">
+            CPU/Gloo 测试只能证明逻辑契约，不能替代 910B2 上的 TorchNPU、HCCL、
+            BF16 算子链和报告合并实测。
+          </p>
+        </div>
+
+        <div class="grid-2">
+          <article class="card">
+            <div class="card-kicker">1P · 100 STEPS</div>
+            <h3>单卡链路验证</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+              <pre><code>bash scripts/smoke_npu_1p.sh</code></pre>
+            </div>
+            <ul class="checklist">
+              <li>BF16 前向、反向与 optimizer</li>
+              <li>quick/full 与报告生成</li>
+              <li>纯权重和 checkpoint 落盘</li>
+            </ul>
+          </article>
+          <article class="card">
+            <div class="card-kicker">8P · 500 STEPS</div>
+            <h3>八卡通信验证</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+              <pre><code>bash scripts/smoke_npu_8p.sh</code></pre>
+            </div>
+            <ul class="checklist">
+              <li>HCCL int64/float32 AllReduce</li>
+              <li>对象 gather/broadcast 与无死锁退出</li>
+              <li>rank 分片、报告合并和精确恢复</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="callout danger">
+          <span aria-hidden="true">!</span>
+          <div>
+            <strong>不要跳过 smoke 直接长跑</strong>
+            <div class="small">只有 1P/8P 均触发 full test、生成 checkpoint，并能从 checkpoint 恢复后，才应启动正式多 epoch 训练。</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:18px">
+          <h3>PNG 与 packed A/B 应记录</h3>
+          <div class="table-wrap" style="margin-top:14px">
+            <table>
+              <thead><tr><th>维度</th><th>为什么重要</th><th>建议观察窗口</th></tr></thead>
+              <tbody>
+                <tr><td><code>wall_samples/s</code></td><td>包含数据等待、评估与保存的真实吞吐</td><td>page cache 稳定后的 500～1000 step</td></tr>
+                <tr><td><code>host_data_wait</code></td><td>判断 DataLoader 是否成为瓶颈</td><td>相同 worker 与 batch 配置</td></tr>
+                <tr><td><code>worker RSS</code></td><td>检查 packed 索引和 LRU 的内存成本</td><td>运行足够久以访问多个 shard</td></tr>
+                <tr><td><code>NPU utilization</code></td><td>识别设备是否持续等待输入</td><td>排除 quick/full 与 checkpoint 窗口</td></tr>
+                <tr><td><code>step P95</code></td><td>发现随机 I/O 与 page fault 长尾</td><td>同时测试 shard 512/1024/2048/4096</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="faq">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">08 / FAQ</span>
+            <h2>常见问题</h2>
+          </div>
+          <p class="section-intro">这些问题通常决定一次训练是“可运行”，还是“结果可信”。</p>
+        </div>
+        <div class="faq">
+          <details>
+            <summary>为什么只训练名称包含 cls 的参数？</summary>
+            <p>这是当前任务的冻结策略：使用完整预训练主干，只更新分类相关模块。正式训练会要求所有非 cls 参数和 buffer 100% 加载，并可验证冻结参数训练前后逐位不变。</p>
+          </details>
+          <details>
+            <summary>为什么 0.99 不能直接称为 99% 真实概率？</summary>
+            <p>训练采样把类别调整为约 50/50，并加入阈值间隔损失，改变了自然先验。当前 0.99 被明确记录为业务分数；如需概率解释，应在自然分布 calibration 集上拟合 temperature 与 bias。</p>
+          </details>
+          <details>
+            <summary>为什么周期 full test 叫 observed_dev_test？</summary>
+            <p>因为它参与最佳模型选择，本质上承担 dev set 角色。若需要对外报告无偏指标，还应准备一个从未参与选模的独立 final test。</p>
+          </details>
+          <details>
+            <summary>什么时候应该使用 packed 后端？</summary>
+            <p>先在本地 NVMe 上做相同参数的 PNG/packed A/B。若 PNG 解码、CPU 或小文件随机读取限制了 NPU 利用率，再使用 packed；不要仅凭实现存在就假设它一定更快。</p>
+          </details>
+          <details>
+            <summary>如何从中断位置继续训练？</summary>
+            <p>将 train.resume_path 指向 checkpoint_last.pth。恢复会校验基础权重哈希和 trainable key 集，并恢复 optimizer、scheduler、scaler、sampler 位置及各 rank 随机状态。</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <div class="final wrap">
+      <div class="final-box">
+        <span class="eyebrow">Ready for hardware validation</span>
+        <h2>先证明链路可靠，再让八张卡长时间工作</h2>
+        <p>
+          推荐顺序是：数据审计 → CPU smoke → 1P smoke → 8P smoke → checkpoint 恢复 →
+          PNG/packed A/B → 正式训练。每一步都有明确产物和停止条件。
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#quickstart">回到使用步骤</a>
+          <a class="button" href="#top">返回顶部</a>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap">CLSTrainer · Local self-contained tutorial · No external assets</div>
+  </footer>
+
+  <script>
+    (() => {
+      const progress = document.getElementById("progress");
+      const navLinks = [...document.querySelectorAll(".topnav a")];
+      const sections = navLinks
+        .map(link => document.querySelector(link.getAttribute("href")))
+        .filter(Boolean);
+
+      const updateProgress = () => {
+        const max = document.documentElement.scrollHeight - innerHeight;
+        const ratio = max > 0 ? scrollY / max : 0;
+        progress.style.width = `${Math.min(1, Math.max(0, ratio)) * 100}%`;
+      };
+
+      const observer = new IntersectionObserver(entries => {
+        const visible = entries
+          .filter(entry => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (!visible) return;
+        navLinks.forEach(link => {
+          const active = link.getAttribute("href") === `#${visible.target.id}`;
+          link.classList.toggle("active", active);
+          if (active) link.setAttribute("aria-current", "location");
+          else link.removeAttribute("aria-current");
+        });
+      }, { rootMargin: "-20% 0px -65% 0px", threshold: [0, .15, .4] });
+
+      sections.forEach(section => observer.observe(section));
+      addEventListener("scroll", updateProgress, { passive: true });
+      addEventListener("resize", updateProgress);
+      updateProgress();
+
+      document.querySelectorAll(".copy").forEach(button => {
+        button.addEventListener("click", async () => {
+          const code = button.closest(".code-shell")?.querySelector("code");
+          if (!code) return;
+          const previous = button.textContent;
+          try {
+            await navigator.clipboard.writeText(code.textContent);
+            button.textContent = "已复制";
+          } catch {
+            const range = document.createRange();
+            range.selectNodeContents(code);
+            const selection = getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            button.textContent = "已选择";
+          }
+          setTimeout(() => { button.textContent = previous; }, 1400);
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

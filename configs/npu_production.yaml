@@ -70,7 +70,6 @@ model:
   freeze_backbone_batchnorm_stats: true
   freeze_cls_batchnorm_stats: true
   require_pretrained_backbone: true
-  require_complete_non_cls_state: true
 
 loss:
   cross_entropy_weight: 1.0
@@ -120,12 +119,13 @@ evaluation:
   auc_histogram_bins: 4096
   quick_save_error_limit: 200
   html_max_errors_per_group: 200
+  parquet_row_group_size: 4096
   selection_metric: composite
   selection_weights:
     global_f1: 0.40
     macro_game_f1: 0.40
     worst_game_f1: 0.20
-  minimum_worst_game_f1: 0.0
+  minimum_worst_game_f1: null
 
 checkpoint:
   save_last_every_steps: 1000

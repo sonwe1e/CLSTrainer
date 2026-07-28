@@ -58,7 +58,13 @@ class EvaluationScheduleTests(unittest.TestCase):
             self.assertTrue(
                 (
                     checkpoints
-                    / "model_best_observed_dev_test_selection_full.pth"
+                    / "model_best_observed_dev_test_selection.pth"
+                ).is_file()
+            )
+            self.assertTrue(
+                (
+                    checkpoints
+                    / "model_best_observed_dev_test_selection.metadata.json"
                 ).is_file()
             )
 

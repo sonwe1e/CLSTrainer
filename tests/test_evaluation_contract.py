@@ -41,6 +41,9 @@ class EvaluationContractTests(unittest.TestCase):
                 return {
                     "images": torch.zeros(2, 3, 8, 8, dtype=torch.uint8),
                     "label": label,
+                    "game_id": 0,
+                    "game_label_id": label,
+                    "video_group_id": label,
                     "meta": {
                         "game": "A",
                         "label": label,
@@ -66,6 +69,20 @@ class EvaluationContractTests(unittest.TestCase):
             torch.device("cpu"),
             amp=True,
             amp_dtype="bfloat16",
+            group_catalogs={
+                "game": ["A"],
+                "game_label": [("A", 0), ("A", 1)],
+                "video": [("A", 0, "01"), ("A", 1, "01")],
+            },
+        )
+        fallback = evaluate(
+            model,
+            DataLoader(
+                Dataset(), batch_size=2, collate_fn=pair_collate
+            ),
+            torch.device("cpu"),
+            amp=True,
+            amp_dtype="bfloat16",
         )
         self.assertEqual(model.seen_dtype, torch.bfloat16)
         rows = result.grouped_metrics["by_video"]
@@ -82,6 +99,7 @@ class EvaluationContractTests(unittest.TestCase):
             {row["primary_metric"] for row in by_label},
             {"positive_recall", "negative_specificity"},
         )
+        self.assertEqual(result.grouped_metrics, fallback.grouped_metrics)
 
     def test_composite_selection_and_worst_game_floor(self) -> None:
         from game_cls.engine.trainer import (

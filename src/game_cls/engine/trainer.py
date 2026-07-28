@@ -115,6 +115,10 @@ def validate_training_config(config: dict) -> None:
         raise ValueError(
             "evaluation.amp_dtype must be float16 or bfloat16"
         )
+    if int(evaluation_cfg.get("parquet_row_group_size", 4096)) <= 0:
+        raise ValueError(
+            "evaluation.parquet_row_group_size must be positive"
+        )
     selection_metric = evaluation_cfg.get(
         "selection_metric", "global_f1_tau099"
     )
@@ -687,6 +691,16 @@ def _run_evaluation(
                 config["device"].get("amp_dtype", "bfloat16"),
             )
         ),
+        parquet_row_group_size=int(
+            config["evaluation"].get(
+                "parquet_row_group_size", 4096
+            )
+        ),
+        group_catalogs=getattr(
+            getattr(dataloader, "dataset", None),
+            "group_catalogs",
+            None,
+        ),
     )
     distributed_barrier()
     if rank == 0:
@@ -720,6 +734,9 @@ def _run_evaluation(
             lightweight=kind == "quick",
             html_max_errors=int(
                 config["evaluation"].get("html_max_errors_per_group", 200)
+            ),
+            preview_decoder=getattr(
+                getattr(dataloader, "dataset", None), "decoder", None
             ),
         )
         result.metrics = metrics

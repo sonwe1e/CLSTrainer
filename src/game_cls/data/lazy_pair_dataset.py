@@ -64,7 +64,7 @@ class LazyTrainingPairDataset:
         self,
         videos: Sequence[VideoEntry],
         transform: Callable[[Any], Any] | None = None,
-        decoder: Callable[[str], Any] | None = None,
+        decoder: Callable[[Any], Any] | None = None,
     ) -> None:
         self.videos = videos
         self.transform = transform
@@ -99,13 +99,39 @@ class EvalPairDataset:
         video_indices: np.ndarray,
         deltas: np.ndarray,
         start_positions: np.ndarray,
-        decoder: Callable[[str], Any] | None = None,
+        decoder: Callable[[Any], Any] | None = None,
     ) -> None:
         self.videos = videos
         self.video_indices = video_indices.astype(np.int32, copy=False)
         self.deltas = deltas.astype(np.int8, copy=False)
         self.start_positions = start_positions.astype(np.int32, copy=False)
         self.decoder = decoder or _decode_image_png
+        game_keys = sorted({video.game for video in videos})
+        game_label_keys = sorted(
+            {(video.game, video.label) for video in videos}
+        )
+        self.group_catalogs = {
+            "game": game_keys,
+            "game_label": game_label_keys,
+            "video": [
+                (video.game, video.label, video.video_id)
+                for video in videos
+            ],
+        }
+        game_to_id = {key: index for index, key in enumerate(game_keys)}
+        game_label_to_id = {
+            key: index for index, key in enumerate(game_label_keys)
+        }
+        self._game_id_by_video = np.asarray(
+            [game_to_id[video.game] for video in videos], dtype=np.int32
+        )
+        self._game_label_id_by_video = np.asarray(
+            [
+                game_label_to_id[(video.game, video.label)]
+                for video in videos
+            ],
+            dtype=np.int32,
+        )
 
     def __len__(self) -> int:
         return len(self.video_indices)
@@ -119,7 +145,18 @@ class EvalPairDataset:
         images, meta = _decode_pair(
             self.videos[request.video_index], request, self.decoder
         )
-        return {"images": images, "label": meta["label"], "meta": meta}
+        return {
+            "images": images,
+            "label": meta["label"],
+            "game_id": int(
+                self._game_id_by_video[request.video_index]
+            ),
+            "game_label_id": int(
+                self._game_label_id_by_video[request.video_index]
+            ),
+            "video_group_id": request.video_index,
+            "meta": meta,
+        }
 
     @property
     def index_nbytes(self) -> int:
@@ -137,7 +174,7 @@ def build_eval_dataset(
     rank: int = 0,
     world_size: int = 1,
     max_pairs_per_video: int | None = None,
-    decoder: Callable[[str], Any] | None = None,
+    decoder: Callable[[Any], Any] | None = None,
 ) -> EvalPairDataset:
     video_indices: list[int] = []
     deltas: list[int] = []

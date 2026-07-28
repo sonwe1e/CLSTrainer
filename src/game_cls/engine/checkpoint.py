@@ -5,6 +5,7 @@ from pathlib import Path
 import random
 import hashlib
 from functools import lru_cache
+import json
 import shutil
 
 
@@ -24,6 +25,16 @@ def _atomic_torch_save(payload, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_json_save(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
 def clone_checkpoint_pair(
     output_dir: str | Path, source_tag: str, target_tag: str
 ) -> None:
@@ -31,8 +42,8 @@ def clone_checkpoint_pair(
     output_dir = Path(output_dir)
     pairs = (
         (
-            output_dir / f"model_{source_tag}_full.pth",
-            output_dir / f"model_{target_tag}_full.pth",
+            output_dir / f"model_{source_tag}.pth",
+            output_dir / f"model_{target_tag}.pth",
         ),
         (
             output_dir / f"checkpoint_{source_tag}.pth",
@@ -50,6 +61,14 @@ def clone_checkpoint_pair(
         except OSError:
             shutil.copy2(source, temporary)
         os.replace(temporary, target)
+    source_metadata = output_dir / f"model_{source_tag}.metadata.json"
+    if source_metadata.is_file():
+        metadata = json.loads(source_metadata.read_text(encoding="utf-8"))
+        metadata["filename"] = f"model_{target_tag}.pth"
+        metadata["alias_source"] = f"model_{source_tag}.pth"
+        _atomic_json_save(
+            metadata, output_dir / f"model_{target_tag}.metadata.json"
+        )
 
 
 @lru_cache(maxsize=8)
@@ -142,13 +161,17 @@ def save_checkpoint_pair(
         raise ValueError(f"Unsupported checkpoint state mode: {state_mode}")
     if write_model_only:
         _atomic_torch_save(
+            full_state_dict,
+            output_dir / f"model_{tag}.pth",
+        )
+        _atomic_json_save(
             {
-                "model": full_state_dict,
-                "artifact_role": "full_model_snapshot",
+                "artifact_role": "pure_model_state_dict",
                 "global_step": global_step,
                 "epoch": epoch,
+                "filename": f"model_{tag}.pth",
             },
-            output_dir / f"model_{tag}_full.pth",
+            output_dir / f"model_{tag}.metadata.json",
         )
     base_checkpoint = config.get("model", {}).get("checkpoint_path")
     base_hash = (

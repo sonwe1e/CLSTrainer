@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -35,15 +36,21 @@ class CheckpointTests(unittest.TestCase):
                 best_metrics={"f1": 0.5},
                 config={"test": True},
             )
-            model_path = Path(directory) / "model_last_full.pth"
+            model_path = Path(directory) / "model_last.pth"
             self.assertTrue(model_path.is_file())
             self.assertTrue((Path(directory) / "checkpoint_last.pth").is_file())
-            model_payload = torch.load(
-                model_path, map_location="cpu", weights_only=False
+            model_state = torch.load(
+                model_path, map_location="cpu", weights_only=True
             )
-            self.assertEqual(model_payload["global_step"], 17)
+            self.assertEqual(set(model_state), set(original))
+            metadata = json.loads(
+                (
+                    Path(directory) / "model_last.metadata.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["global_step"], 17)
             self.assertEqual(
-                model_payload["artifact_role"], "full_model_snapshot"
+                metadata["artifact_role"], "pure_model_state_dict"
             )
             with torch.no_grad():
                 model.weight.zero_()
