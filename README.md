@@ -123,11 +123,42 @@ bash scripts/smoke_npu_1p.sh
 bash scripts/smoke_npu_8p.sh
 ```
 
-它们分别运行 100 和 500 step，并确保触发 quick/full、报告合并和 checkpoint。
-必须在真实 910B2 环境确认通过后，才能把 CPU/Gloo 测试结论扩展到 HCCL。
+单卡脚本按“无 worker 基线 → spawn 1 worker → spawn 2 workers + 增强 → quick
+test → full test”的顺序逐级验收；任一阶段失败都会停止，不会把 DataLoader
+问题误判为模型或算子问题。八卡脚本先固定每 rank 1 个 train worker 和 1 个
+按需启动的 eval worker，运行 100 step 并触发 quick/full 与 checkpoint。必须在
+真实 910B2 环境确认通过后，才能把 CPU/Gloo 测试结论扩展到 HCCL。
 
 NPU 运行时会先导入 `torch_npu`、绑定设备，再初始化 HCCL。训练 batch 在 CPU
 侧保持 `uint8`，一次传输到设备后再转换为 FP32/BF16/FP16 并归一化。
+
+生产配置强制 NPU 多 worker DataLoader 使用 `spawn`，并设置每批最长等待时间，
+避免 NPU runtime 已初始化后再 fork worker 导致静默挂起。train 与 eval 使用独立
+参数：train worker 常驻，quick/full 的 eval worker 不常驻；默认先关闭 pin
+memory，稳定后再通过 A/B 测试决定是否开启：
+
+```yaml
+dataloader:
+  multiprocessing_context: spawn
+  timeout_seconds: 180
+  worker_num_threads: 1
+  train:
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: false
+  eval:
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false
+```
+
+旧配置中的根级 `dataloader.num_workers` 等字段仍可作为 fallback 使用，但角色级
+配置优先。NPU 下只要任一角色的 `num_workers>0`，显式配置 `fork` 或
+`forkserver` 都会在设备初始化前报错。启动日志会打印解析后的 worker、context
+和 timeout，并分别标记开始等待与首 batch 返回时间、shape、dtype；因此 worker
+异常最长在 180 秒内转为明确的 DataLoader timeout，而不是无限等待。
 
 如 Profiler 确认 PNG 解码仍是瓶颈，可预解码为固定大小 uint8 分片：
 

@@ -1099,29 +1099,29 @@ model.load_state_dict(state_dict)</code></pre>
 
         <div class="grid-2">
           <article class="card">
-            <div class="card-kicker">1P · 100 STEPS</div>
-            <h3>单卡链路验证</h3>
+            <div class="card-kicker">1P · STAGED</div>
+            <h3>单卡分阶段验证</h3>
             <div class="code-shell">
               <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
               <pre><code>bash scripts/smoke_npu_1p.sh</code></pre>
             </div>
             <ul class="checklist">
-              <li>BF16 前向、反向与 optimizer</li>
-              <li>quick/full 与报告生成</li>
-              <li>纯权重和 checkpoint 落盘</li>
+              <li>无 worker 基线排除模型与 NPU 算子问题</li>
+              <li>spawn 1→2 worker 与首 batch timeout</li>
+              <li>最后依次加入 quick/full 与 checkpoint</li>
             </ul>
           </article>
           <article class="card">
-            <div class="card-kicker">8P · 500 STEPS</div>
+            <div class="card-kicker">8P · 100 STEPS</div>
             <h3>八卡通信验证</h3>
             <div class="code-shell">
               <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
               <pre><code>bash scripts/smoke_npu_8p.sh</code></pre>
             </div>
             <ul class="checklist">
+              <li>每 rank 1 个 train/eval spawn worker</li>
               <li>HCCL int64/float32 AllReduce</li>
-              <li>对象 gather/broadcast 与无死锁退出</li>
-              <li>rank 分片、报告合并和精确恢复</li>
+              <li>quick/full、报告合并与无死锁退出</li>
             </ul>
           </article>
         </div>

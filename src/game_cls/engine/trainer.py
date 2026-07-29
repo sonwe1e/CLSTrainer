@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import json
 import math
 from pathlib import Path
@@ -104,7 +105,90 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _initialize_data_worker(
+    worker_id: int,
+    *,
+    num_threads: int,
+) -> None:
+    import torch
+
+    # Keep worker-level CPU parallelism from multiplying across DataLoader
+    # processes. This function must remain at module scope for spawn pickling.
+    del worker_id
+    torch.set_num_threads(max(1, int(num_threads)))
+
+
+def _dataloader_option(
+    config: dict,
+    role: str,
+    name: str,
+    default: Any,
+) -> Any:
+    root = config["dataloader"]
+    scoped = root.get(role, {})
+    if not isinstance(scoped, dict):
+        raise TypeError(f"dataloader.{role} must be a mapping")
+    return scoped.get(name, root.get(name, default))
+
+
+def _validate_dataloader_config(config: dict) -> None:
+    accelerator = str(config["device"]["accelerator"])
+    allowed_contexts = {"spawn", "fork", "forkserver"}
+
+    for role in ("train", "eval"):
+        workers = int(
+            _dataloader_option(config, role, "num_workers", 0)
+        )
+        if workers < 0:
+            raise ValueError(
+                f"dataloader.{role}.num_workers must be non-negative"
+            )
+        if workers == 0:
+            continue
+
+        context = _dataloader_option(
+            config,
+            role,
+            "multiprocessing_context",
+            "spawn" if accelerator == "npu" else None,
+        )
+        if context is not None:
+            context = str(context)
+        if context is not None and context not in allowed_contexts:
+            raise ValueError(
+                "dataloader multiprocessing_context must be one of "
+                f"{sorted(allowed_contexts)}, got {context!r}"
+            )
+        if accelerator == "npu" and context != "spawn":
+            raise RuntimeError(
+                f"NPU dataloader.{role} must use spawn, got {context!r}"
+            )
+        if float(
+            _dataloader_option(
+                config, role, "timeout_seconds", 180
+            )
+        ) <= 0:
+            raise ValueError(
+                f"dataloader.{role}.timeout_seconds must be positive"
+            )
+        if int(
+            _dataloader_option(config, role, "prefetch_factor", 2)
+        ) <= 0:
+            raise ValueError(
+                f"dataloader.{role}.prefetch_factor must be positive"
+            )
+        if int(
+            _dataloader_option(
+                config, role, "worker_num_threads", 1
+            )
+        ) <= 0:
+            raise ValueError(
+                f"dataloader.{role}.worker_num_threads must be positive"
+            )
+
+
 def validate_training_config(config: dict) -> None:
+    _validate_dataloader_config(config)
     data_cfg = config["data"]
     ImageSpec.from_config(data_cfg)
     model_cfg = config["model"]
@@ -227,18 +311,84 @@ def build_optimizer_parameter_groups(model, weight_decay: float) -> list[dict]:
     return groups
 
 
-def _loader_common(config: dict) -> dict:
-    workers = int(config["dataloader"].get("num_workers", 0))
+def _loader_common(config: dict, role: str) -> dict:
+    workers = int(_dataloader_option(config, role, "num_workers", 0))
+    if workers < 0:
+        raise ValueError(
+            f"dataloader.{role}.num_workers must be non-negative"
+        )
     common = {
         "num_workers": workers,
-        "pin_memory": config["dataloader"].get("pin_memory", False),
+        "pin_memory": bool(
+            _dataloader_option(config, role, "pin_memory", False)
+        ),
         "collate_fn": pair_collate,
     }
-    if workers > 0:
-        common["persistent_workers"] = config["dataloader"].get(
-            "persistent_workers", True
+    if workers == 0:
+        return common
+
+    accelerator = str(config["device"]["accelerator"])
+    context = _dataloader_option(
+        config, role, "multiprocessing_context", None
+    )
+    if context is None and accelerator == "npu":
+        context = "spawn"
+    if context is not None:
+        context = str(context)
+    allowed_contexts = {"spawn", "fork", "forkserver"}
+    if context is not None and context not in allowed_contexts:
+        raise ValueError(
+            "dataloader multiprocessing_context must be one of "
+            f"{sorted(allowed_contexts)}, got {context!r}"
         )
-        common["prefetch_factor"] = config["dataloader"].get("prefetch_factor", 2)
+    if accelerator == "npu" and context != "spawn":
+        raise RuntimeError(
+            "NPU DataLoader with num_workers > 0 must use "
+            "multiprocessing_context=spawn"
+        )
+
+    timeout = float(
+        _dataloader_option(config, role, "timeout_seconds", 180)
+    )
+    if timeout <= 0:
+        raise ValueError(
+            f"dataloader.{role}.timeout_seconds must be positive "
+            "when num_workers > 0"
+        )
+    prefetch_factor = int(
+        _dataloader_option(config, role, "prefetch_factor", 2)
+    )
+    if prefetch_factor <= 0:
+        raise ValueError(
+            f"dataloader.{role}.prefetch_factor must be positive"
+        )
+    worker_num_threads = int(
+        _dataloader_option(config, role, "worker_num_threads", 1)
+    )
+    if worker_num_threads <= 0:
+        raise ValueError(
+            f"dataloader.{role}.worker_num_threads must be positive"
+        )
+
+    common.update(
+        {
+            "persistent_workers": bool(
+                _dataloader_option(
+                    config,
+                    role,
+                    "persistent_workers",
+                    role == "train",
+                )
+            ),
+            "prefetch_factor": prefetch_factor,
+            "timeout": timeout,
+            "multiprocessing_context": context,
+            "worker_init_fn": partial(
+                _initialize_data_worker,
+                num_threads=worker_num_threads,
+            ),
+        }
+    )
     return common
 
 
@@ -254,7 +404,8 @@ def _make_dataloaders(
     train_cfg = config["train"]
     batch_size = int(train_cfg["local_batch_size"])
     steps_per_epoch = int(train_cfg["steps_per_epoch"])
-    common = _loader_common(config)
+    train_common = _loader_common(config, role="train")
+    eval_common = _loader_common(config, role="eval")
 
     if data_cfg.get("synthetic", False):
         train_length = max(batch_size * steps_per_epoch * world_size, 128)
@@ -283,12 +434,18 @@ def _make_dataloaders(
         )
         quick_indices = list(range(rank, quick_global, world_size))
         return LoaderBundle(
-            train=DataLoader(train_dataset, batch_sampler=sampler, **common),
+            train=DataLoader(
+                train_dataset, batch_sampler=sampler, **train_common
+            ),
             quick_test=DataLoader(
-                Subset(test_dataset, quick_indices), batch_size=batch_size, **common
+                Subset(test_dataset, quick_indices),
+                batch_size=batch_size,
+                **eval_common,
             ),
             full_test=DataLoader(
-                Subset(test_dataset, full_indices), batch_size=batch_size, **common
+                Subset(test_dataset, full_indices),
+                batch_size=batch_size,
+                **eval_common,
             ),
             sampler=sampler,
             data_summary={
@@ -445,9 +602,15 @@ def _make_dataloaders(
     if global_quick <= 0 or global_full <= 0:
         raise RuntimeError("Test index does not contain legal delta=2 pairs")
     return LoaderBundle(
-        train=DataLoader(train_dataset, batch_sampler=sampler, **common),
-        quick_test=DataLoader(quick_dataset, batch_size=batch_size, **common),
-        full_test=DataLoader(full_dataset, batch_size=batch_size, **common),
+        train=DataLoader(
+            train_dataset, batch_sampler=sampler, **train_common
+        ),
+        quick_test=DataLoader(
+            quick_dataset, batch_size=batch_size, **eval_common
+        ),
+        full_test=DataLoader(
+            full_dataset, batch_size=batch_size, **eval_common
+        ),
         sampler=sampler,
         data_summary={
             "storage": "video_index_lazy_pairs",
@@ -819,6 +982,37 @@ def run_training(config: dict[str, Any]) -> dict:
         loaders = _make_dataloaders(config, rank, world_size)
         if rank == 0:
             print("Data pipeline:", json.dumps(loaders.data_summary, ensure_ascii=False))
+            train_workers = int(
+                _dataloader_option(
+                    config, "train", "num_workers", 0
+                )
+            )
+            eval_workers = int(
+                _dataloader_option(config, "eval", "num_workers", 0)
+            )
+            context = _dataloader_option(
+                config,
+                "train",
+                "multiprocessing_context",
+                None,
+            )
+            if (
+                context is None
+                and train_workers > 0
+                and str(config["device"]["accelerator"]) == "npu"
+            ):
+                context = "spawn"
+            timeout = _dataloader_option(
+                config, "train", "timeout_seconds", 180
+            )
+            print(
+                "[DATALOADER] "
+                f"train_workers={train_workers} "
+                f"eval_workers={eval_workers} "
+                f"context={context} "
+                f"timeout={timeout}",
+                flush=True,
+            )
         train_cfg = config["train"]
         total_steps = int(
             train_cfg.get("max_steps")
@@ -911,6 +1105,13 @@ def run_training(config: dict[str, Any]) -> dict:
         }
         timing_steps = 0
         input_shape_validated = False
+        first_batch_wait_started = time.perf_counter()
+        first_batch_logged = False
+        if rank == 0:
+            print(
+                "[DATALOADER] starting train workers and waiting for first batch",
+                flush=True,
+            )
         while global_step < run_until_step:
             loaders.sampler.set_epoch(epoch, start_step=step_in_epoch)
             _set_train_mode(model, config["model"])
@@ -918,6 +1119,16 @@ def run_training(config: dict[str, Any]) -> dict:
             for batch in loaders.train:
                 yielded = True
                 batch_ready = time.perf_counter()
+                if not first_batch_logged:
+                    if rank == 0:
+                        print(
+                            "[DATALOADER] first batch ready: "
+                            f"wait={batch_ready - first_batch_wait_started:.3f}s "
+                            f"shape={tuple(batch['images'].shape)} "
+                            f"dtype={batch['images'].dtype}",
+                            flush=True,
+                        )
+                    first_batch_logged = True
                 timing["host_data_wait"] += batch_ready - last_batch_finished
                 transfer_started = time.perf_counter()
                 images = batch["images"]

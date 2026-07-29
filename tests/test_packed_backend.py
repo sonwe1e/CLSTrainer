@@ -107,6 +107,75 @@ class PackedBackendTests(unittest.TestCase):
                 )
             backend.close()
 
+    def test_packed_dataset_spawn_worker_owns_its_memmap(self) -> None:
+        from torch.utils.data import DataLoader
+
+        from game_cls.data.collate import pair_collate
+        from game_cls.data.image_spec import ImageSpec
+        from game_cls.data.lazy_pair_dataset import build_eval_dataset
+        from game_cls.data.packed_backend import (
+            PackedUint8Backend,
+            pack_frame_index,
+        )
+        from game_cls.data.video_index import read_video_entries_parquet
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = []
+            for frame_id in range(3):
+                array = np.full(
+                    (8, 8, 3), frame_id * 50, dtype=np.uint8
+                )
+                path = root / f"01{frame_id:05d}.png"
+                Image.fromarray(array).save(path)
+                rows.append(
+                    {
+                        "path": str(path),
+                        "game": "game_A",
+                        "label": 0,
+                        "video_id": "01",
+                        "frame_id": frame_id,
+                    }
+                )
+            frame_index = root / "frames.parquet"
+            pq.write_table(pa.Table.from_pylist(rows), frame_index)
+            image_spec = ImageSpec(width=8, height=8, channels=3)
+            packed_index = pack_frame_index(
+                frame_index,
+                root / "packed",
+                image_spec=image_spec,
+                images_per_shard=2,
+            )
+            backend = PackedUint8Backend(
+                packed_index,
+                image_spec=image_spec,
+                max_open_shards=1,
+            )
+            videos = read_video_entries_parquet(
+                root / "packed" / "packed_video_entries.parquet",
+                deltas=(1,),
+            )
+            dataset = build_eval_dataset(videos, 1, decoder=backend)
+            loader = DataLoader(
+                dataset,
+                batch_size=2,
+                num_workers=1,
+                multiprocessing_context="spawn",
+                timeout=20,
+                collate_fn=pair_collate,
+            )
+
+            batches = list(loader)
+
+            self.assertEqual(len(batches), 1)
+            self.assertEqual(
+                tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8)
+            )
+            # Spawn pickling removes parent-owned maps. The worker opens and
+            # closes its own maps without mutating the parent backend.
+            self.assertEqual(backend.open_shard_count, 0)
+            backend.close()
+
 
 if __name__ == "__main__":
     unittest.main()
