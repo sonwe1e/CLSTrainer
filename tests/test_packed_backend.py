@@ -22,7 +22,11 @@ class PackedBackendTests(unittest.TestCase):
             PackedUint8Backend,
             pack_frame_index,
         )
-        from game_cls.data.lazy_pair_dataset import build_eval_dataset
+        from game_cls.data.lazy_pair_dataset import (
+            LazyTrainingPairDataset,
+            PairRequest,
+            build_eval_dataset,
+        )
         from game_cls.data.video_index import read_video_entries_parquet
 
         with tempfile.TemporaryDirectory() as directory:
@@ -65,6 +69,12 @@ class PackedBackendTests(unittest.TestCase):
             for location, tensor in enumerate(expected):
                 self.assertTrue(torch.equal(backend(location), tensor))
                 self.assertLessEqual(backend.open_shard_count, 1)
+            reordered = backend.get_many([4, 0, 3, 1])
+            self.assertEqual(
+                tuple(reordered.shape), (4, 3, 208, 448)
+            )
+            for actual, location in zip(reordered, [4, 0, 3, 1]):
+                self.assertTrue(torch.equal(actual, expected[location]))
             self.assertEqual(
                 len(list((root / "packed").glob("shard_*.bin"))), 3
             )
@@ -79,6 +89,26 @@ class PackedBackendTests(unittest.TestCase):
             sample = dataset[0]
             self.assertEqual(
                 tuple(sample["images"].shape), (2, 3, 208, 448)
+            )
+            batch_samples = dataset.__getitems__([0, 1])
+            self.assertEqual(len(batch_samples), 2)
+            self.assertEqual(
+                tuple(batch_samples[0]["images"].shape),
+                (2, 3, 208, 448),
+            )
+            train_dataset = LazyTrainingPairDataset(
+                videos, decoder=backend
+            )
+            train_samples = train_dataset.__getitems__(
+                [
+                    PairRequest(0, 2, 0, augmentation_seed=1),
+                    PairRequest(0, 2, 1, augmentation_seed=2),
+                ]
+            )
+            self.assertEqual(len(train_samples), 2)
+            self.assertEqual(
+                tuple(train_samples[0]["images"].shape),
+                (2, 3, 208, 448),
             )
             self.assertTrue(
                 sample["meta"]["image0_path"].startswith("packed://frame/")

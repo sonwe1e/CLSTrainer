@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import json
 from pathlib import Path
 from typing import Any
@@ -125,24 +125,47 @@ class PackedUint8Backend:
         return memory_map
 
     def __call__(self, frame_index: int):
+        return self.get_many((frame_index,))[0]
+
+    def get_many(self, frame_indices):
         import numpy as np
         import torch
 
-        location = int(frame_index)
-        if not 0 <= location < len(self.offsets):
-            raise IndexError(f"Packed frame index is out of range: {location}")
-        shard_id = int(self.shard_ids[location])
-        offset = int(self.offsets[location])
-        length = int(self.lengths[location])
-        if length != self.image_bytes:
-            raise ValueError(
-                f"Packed image has {length} bytes, expected "
-                f"{self.image_bytes}: frame={location}"
+        locations = [int(frame_index) for frame_index in frame_indices]
+        output = np.empty(
+            (
+                len(locations),
+                self.channels,
+                self.height,
+                self.width,
+            ),
+            dtype=np.uint8,
+        )
+        by_shard: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for output_index, location in enumerate(locations):
+            if not 0 <= location < len(self.offsets):
+                raise IndexError(
+                    f"Packed frame index is out of range: {location}"
+                )
+            length = int(self.lengths[location])
+            if length != self.image_bytes:
+                raise ValueError(
+                    f"Packed image has {length} bytes, expected "
+                    f"{self.image_bytes}: frame={location}"
+                )
+            by_shard[int(self.shard_ids[location])].append(
+                (output_index, location)
             )
-        array = np.asarray(
-            self._map(shard_id)[offset : offset + length]
-        ).reshape(self.channels, self.height, self.width)
-        return torch.from_numpy(array.copy())
+
+        for shard_id, items in by_shard.items():
+            memory_map = self._map(shard_id)
+            for output_index, location in items:
+                offset = int(self.offsets[location])
+                np.copyto(
+                    output[output_index].reshape(-1),
+                    memory_map[offset : offset + self.image_bytes],
+                )
+        return torch.from_numpy(output)
 
     @property
     def open_shard_count(self) -> int:

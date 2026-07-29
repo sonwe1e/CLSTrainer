@@ -189,7 +189,7 @@ build、audit 和 train/test packed 打包。审计格式、记录的图片规�
 使用 `configs/npu_production_packed.yaml`。正式选择后端前，应保持模型、batch、
 worker 和训练步数完全一致，分别运行 500～1000 step，对比：
 
-- `wall_samples/s` 和 host data wait；
+- 同步后的 `interval_samples/s` 和 `data_wait_ratio`；
 - CPU 使用率及主进程/worker RSS；
 - NPU 利用率和 step P95；
 - page cache 稳定后而非冷启动阶段的吞吐。
@@ -198,6 +198,10 @@ worker 和训练步数完全一致，分别运行 500～1000 step，对比：
 `images_per_shard=512/1024/2048/4096` 与
 `packed_max_open_shards=8/16/32` 的组合；memmap 只建立映射，不等于一次读取
 整个 shard，但 shard 大小和 LRU 数量会影响 page cache 命中率。
+
+packed backend 会通过 `get_many()` 将一个 batch 的帧按 shard 分组，预分配单个
+连续 uint8 输出并执行 `np.copyto`；训练和评估 Dataset 的 `__getitems__()` 会
+把整批 pair 一次交给该接口。PNG 后端仍保持逐图片解码兼容路径。
 
 接入真实模型时，将 `model.factory` 设置为 `包名.模块名:函数名`。工厂函数必须
 返回接受 `(image0, image1)` 并输出 `[B,2]` 的 `torch.nn.Module`。
@@ -281,6 +285,9 @@ best 与 last 时只序列化一次，再创建稳定别名，减少冻结主干
 model.load_state_dict(torch.load("model_last.pth", map_location="cpu"))
 ```
 
-普通训练日志中的分段时间明确标记为 host enqueue 时间，不表示 NPU 实际算子
-耗时；日志同时报告排除评估/保存的 `train_only_samples/s` 和包含全部停顿的
-`wall_samples/s`。设备级瓶颈必须使用 NPU Event 或 TorchNPU Profiler 验证。
+普通训练日志中的细分时间仍明确标记为 host enqueue 时间，不表示 NPU 实际算子
+耗时。每个日志区间结束时会同步 NPU，再报告可比较的
+`interval_samples/s`、`interval_step_time`、`data_wait_ratio`、学习率、梯度
+范数以及评估和 checkpoint 耗时。相同内容同时以逐行 JSON 写入
+`<experiment.output_dir>/train_metrics.jsonl`，可直接用于曲线、TensorBoard
+转换或实验对比。设备级算子瓶颈仍须使用 NPU Event 或 TorchNPU Profiler 验证。

@@ -105,6 +105,23 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _synchronize_device_for_metrics(device) -> None:
+    import torch
+
+    if device.type == "npu":
+        torch.npu.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _append_training_metrics(path: Path, payload: dict) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
+        stream.write("\n")
+
+
 def _initialize_data_worker(
     worker_id: int,
     *,
@@ -1094,8 +1111,14 @@ def run_training(config: dict[str, Any]) -> dict:
 
         started = time.perf_counter()
         last_batch_finished = started
-        train_active_seconds = 0.0
         processed_samples = 0
+        log_interval_start = started
+        log_interval_samples = 0
+        evaluation_seconds = 0.0
+        checkpoint_seconds = 0.0
+        metrics_path = output_dir / "train_metrics.jsonl"
+        if rank == 0 and not resume_path:
+            metrics_path.write_text("", encoding="utf-8")
         timing = {
             "host_data_wait": 0.0,
             "host_h2d_enqueue": 0.0,
@@ -1168,7 +1191,7 @@ def run_training(config: dict[str, Any]) -> dict:
                 backward_started = time.perf_counter()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     train_cfg.get("gradient_clip_norm", 5.0),
                 )
@@ -1182,33 +1205,16 @@ def run_training(config: dict[str, Any]) -> dict:
                 timing["host_optimizer_enqueue"] += (
                     time.perf_counter() - optimizer_started
                 )
-                train_active_seconds += time.perf_counter() - batch_ready
-                processed_samples += (
+                step_samples = (
                     int(train_cfg["local_batch_size"]) * world_size
                 )
+                processed_samples += step_samples
+                log_interval_samples += step_samples
                 global_step += 1
                 step_in_epoch += 1
                 timing_steps += 1
 
                 log_every = int(train_cfg["log_every_steps"])
-                if rank == 0 and global_step % log_every == 0:
-                    elapsed = time.perf_counter() - started
-                    averages = {
-                        key: value / max(1, timing_steps)
-                        for key, value in timing.items()
-                    }
-                    print(
-                        f"step={global_step}/{total_steps} loss={loss.detach().item():.6f} "
-                        f"ce={components['cross_entropy'].item():.6f} "
-                        f"threshold_weight={components['threshold_weight']:.4f} "
-                        f"train_only_samples/s="
-                        f"{processed_samples / max(train_active_seconds, 1e-9):.2f} "
-                        f"wall_samples/s={processed_samples / elapsed:.2f} "
-                        f"host_enqueue_timing={averages}",
-                        flush=True,
-                    )
-                    timing = {key: 0.0 for key in timing}
-                    timing_steps = 0
 
                 quick_every = int(
                     config["evaluation"].get("quick_test_every_steps", 0)
@@ -1225,6 +1231,7 @@ def run_training(config: dict[str, Any]) -> dict:
                     and not run_full
                 )
                 if run_quick:
+                    evaluation_started = time.perf_counter()
                     result = _run_evaluation(
                         kind="quick",
                         model=model,
@@ -1238,9 +1245,13 @@ def run_training(config: dict[str, Any]) -> dict:
                     )
                     evaluation_state["quick_test_count"] += 1
                     _set_train_mode(model, config["model"])
+                    evaluation_seconds += (
+                        time.perf_counter() - evaluation_started
+                    )
 
                 is_best = False
                 if run_full:
+                    evaluation_started = time.perf_counter()
                     result = _run_evaluation(
                         kind="full",
                         model=model,
@@ -1262,6 +1273,9 @@ def run_training(config: dict[str, Any]) -> dict:
                         best_metrics = metrics
                         evaluation_state["best_observed_dev_test_metrics"] = metrics
                     _set_train_mode(model, config["model"])
+                    evaluation_seconds += (
+                        time.perf_counter() - evaluation_started
+                    )
 
                 save_every = int(
                     config["checkpoint"].get("save_last_every_steps", 0)
@@ -1269,7 +1283,9 @@ def run_training(config: dict[str, Any]) -> dict:
                 save_last_due = bool(
                     save_every and global_step % save_every == 0
                 )
+                checkpoint_started = None
                 if is_best and _save_best_enabled(config["checkpoint"]):
+                    checkpoint_started = time.perf_counter()
                     _save_all_ranks(
                         output_dir=output_dir,
                         tag="last",
@@ -1295,6 +1311,7 @@ def run_training(config: dict[str, Any]) -> dict:
                             "best_observed_dev_test_selection",
                         )
                 elif save_last_due:
+                    checkpoint_started = time.perf_counter()
                     _save_all_ranks(
                         output_dir=output_dir,
                         tag="last",
@@ -1312,6 +1329,112 @@ def run_training(config: dict[str, Any]) -> dict:
                         rank=rank,
                         world_size=world_size,
                     )
+                if checkpoint_started is not None:
+                    checkpoint_seconds += (
+                        time.perf_counter() - checkpoint_started
+                    )
+
+                should_log = (
+                    global_step % log_every == 0
+                    or global_step >= run_until_step
+                )
+                if should_log:
+                    _synchronize_device_for_metrics(device)
+                    if rank == 0:
+                        now = time.perf_counter()
+                        interval_seconds = now - log_interval_start
+                        interval_steps = max(1, timing_steps)
+                        elapsed = now - started
+                        averages = {
+                            key: value / interval_steps
+                            for key, value in timing.items()
+                        }
+                        loss_value = float(loss.detach().item())
+                        ce_value = float(
+                            components["cross_entropy"].item()
+                        )
+                        threshold_loss_value = float(
+                            components["threshold_loss"].item()
+                        )
+                        grad_norm_value = float(
+                            grad_norm.detach().item()
+                        )
+                        learning_rate = max(
+                            float(group["lr"])
+                            for group in optimizer.param_groups
+                        )
+                        interval_samples_per_second = (
+                            log_interval_samples
+                            / max(interval_seconds, 1e-9)
+                        )
+                        interval_step_time = (
+                            interval_seconds / interval_steps
+                        )
+                        data_wait_seconds = timing["host_data_wait"]
+                        data_wait_ratio = (
+                            data_wait_seconds
+                            / max(interval_seconds, 1e-9)
+                        )
+                        wall_samples_per_second = (
+                            processed_samples / max(elapsed, 1e-9)
+                        )
+                        metrics_payload = {
+                            "step": global_step,
+                            "total_steps": total_steps,
+                            "loss": loss_value,
+                            "ce": ce_value,
+                            "threshold_loss": threshold_loss_value,
+                            "threshold_weight": float(
+                                components["threshold_weight"]
+                            ),
+                            "interval_samples_per_second": (
+                                interval_samples_per_second
+                            ),
+                            "interval_seconds": interval_seconds,
+                            "interval_step_time": interval_step_time,
+                            "data_wait_seconds": data_wait_seconds,
+                            "data_wait_ratio": data_wait_ratio,
+                            "learning_rate": learning_rate,
+                            "grad_norm": grad_norm_value,
+                            "evaluation_seconds": evaluation_seconds,
+                            "checkpoint_seconds": checkpoint_seconds,
+                            "wall_samples_per_second": (
+                                wall_samples_per_second
+                            ),
+                            "host_enqueue_timing": averages,
+                        }
+                        _append_training_metrics(
+                            metrics_path, metrics_payload
+                        )
+                        print(
+                            f"step={global_step}/{total_steps} "
+                            f"loss={loss_value:.6f} "
+                            f"ce={ce_value:.6f} "
+                            f"threshold_loss={threshold_loss_value:.6f} "
+                            f"threshold_weight="
+                            f"{components['threshold_weight']:.4f} "
+                            f"interval_samples/s="
+                            f"{interval_samples_per_second:.2f} "
+                            f"interval_step_time="
+                            f"{interval_step_time:.4f}s "
+                            f"data_wait_ratio={data_wait_ratio:.2%} "
+                            f"learning_rate={learning_rate:.8g} "
+                            f"grad_norm={grad_norm_value:.6f} "
+                            f"evaluation_seconds="
+                            f"{evaluation_seconds:.3f} "
+                            f"checkpoint_seconds="
+                            f"{checkpoint_seconds:.3f} "
+                            f"wall_samples/s="
+                            f"{wall_samples_per_second:.2f} "
+                            f"host_enqueue_timing={averages}",
+                            flush=True,
+                        )
+                    log_interval_start = time.perf_counter()
+                    log_interval_samples = 0
+                    evaluation_seconds = 0.0
+                    checkpoint_seconds = 0.0
+                    timing = {key: 0.0 for key in timing}
+                    timing_steps = 0
                 last_batch_finished = time.perf_counter()
                 if global_step >= run_until_step:
                     break

@@ -1140,14 +1140,18 @@ model.load_state_dict(state_dict)</code></pre>
             <table>
               <thead><tr><th>维度</th><th>为什么重要</th><th>建议观察窗口</th></tr></thead>
               <tbody>
-                <tr><td><code>wall_samples/s</code></td><td>包含数据等待、评估与保存的真实吞吐</td><td>page cache 稳定后的 500～1000 step</td></tr>
-                <tr><td><code>host_data_wait</code></td><td>判断 DataLoader 是否成为瓶颈</td><td>相同 worker 与 batch 配置</td></tr>
+                <tr><td><code>interval_samples/s</code></td><td>NPU 同步后的区间真实吞吐</td><td>page cache 稳定后的 500～1000 step</td></tr>
+                <tr><td><code>data_wait_ratio</code></td><td>判断 DataLoader 是否成为瓶颈</td><td>相同 worker 与 batch 配置</td></tr>
                 <tr><td><code>worker RSS</code></td><td>检查 packed 索引和 LRU 的内存成本</td><td>运行足够久以访问多个 shard</td></tr>
                 <tr><td><code>NPU utilization</code></td><td>识别设备是否持续等待输入</td><td>排除 quick/full 与 checkpoint 窗口</td></tr>
                 <tr><td><code>step P95</code></td><td>发现随机 I/O 与 page fault 长尾</td><td>同时测试 shard 512/1024/2048/4096</td></tr>
               </tbody>
             </table>
           </div>
+          <p class="muted small" style="margin-top:14px">
+            每个日志区间还会把 step、loss、学习率、梯度范数、评估耗时和 checkpoint
+            耗时写入 <code>train_metrics.jsonl</code>，便于直接生成曲线和比较实验。
+          </p>
         </div>
       </div>
     </section>

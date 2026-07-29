@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -68,6 +69,13 @@ class ExactTrainingResumeTests(unittest.TestCase):
             self.assertEqual(full_state.keys(), resumed_state.keys())
             for key in full_state:
                 self.assertTrue(torch.equal(full_state[key], resumed_state[key]), key)
+            metric_steps = [
+                json.loads(line)["step"]
+                for line in (
+                    root / "resumed" / "train_metrics.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(metric_steps, [2, 4])
 
 
 if __name__ == "__main__":

@@ -28,22 +28,24 @@ def _decode_image_png(path: str):
         return F.to_image(image.convert("RGB"))
 
 
-def _decode_pair(entry: VideoEntry, request: PairRequest, decoder):
-    import torch
-
+def _pair_references(
+    entry: VideoEntry,
+    request: PairRequest,
+) -> tuple[Any, Any, dict[str, Any]]:
     frame0_id, frame1_id, path0, path1 = entry.pair_paths(
         request.delta, request.start_position
     )
-    tensor0 = decoder(path0)
-    tensor1 = decoder(path1)
+
     def display(reference) -> str:
         return (
             reference
             if isinstance(reference, str)
             else f"packed://frame/{int(reference)}"
         )
+
     return (
-        torch.stack((tensor0, tensor1), dim=0),
+        path0,
+        path1,
         {
             "game": entry.game,
             "label": entry.label,
@@ -55,6 +57,40 @@ def _decode_pair(entry: VideoEntry, request: PairRequest, decoder):
             "image1_path": display(path1),
         },
     )
+
+
+def _decode_pair(entry: VideoEntry, request: PairRequest, decoder):
+    import torch
+
+    path0, path1, meta = _pair_references(entry, request)
+    tensor0 = decoder(path0)
+    tensor1 = decoder(path1)
+    return (
+        torch.stack((tensor0, tensor1), dim=0),
+        meta,
+    )
+
+
+def _decode_many_pairs(
+    videos: Sequence[VideoEntry],
+    requests: Sequence[PairRequest],
+    decoder,
+) -> tuple[Any, list[dict[str, Any]]]:
+    references = []
+    metadata = []
+    for request in requests:
+        path0, path1, meta = _pair_references(
+            videos[request.video_index], request
+        )
+        references.extend((path0, path1))
+        metadata.append(meta)
+    decoded = decoder.get_many(references)
+    if decoded.ndim != 4 or decoded.shape[0] != len(requests) * 2:
+        raise ValueError(
+            "Batch decoder must return [2B,C,H,W], got "
+            f"{tuple(decoded.shape)}"
+        )
+    return decoded.reshape(len(requests), 2, *decoded.shape[1:]), metadata
 
 
 class LazyTrainingPairDataset:
@@ -88,6 +124,34 @@ class LazyTrainingPairDataset:
                 torch.manual_seed(request.augmentation_seed)
                 images = self.transform(images)
         return {"images": images, "label": meta["label"], "meta": meta}
+
+    def __getitems__(
+        self, requests: Sequence[PairRequest]
+    ) -> list[dict[str, Any]]:
+        requests = list(requests)
+        if not callable(getattr(self.decoder, "get_many", None)):
+            return [self[request] for request in requests]
+        import torch
+
+        decoded, metadata = _decode_many_pairs(
+            self.videos, requests, self.decoder
+        )
+        samples = []
+        for request, images, meta in zip(
+            requests, decoded, metadata
+        ):
+            if self.transform is not None:
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(request.augmentation_seed)
+                    images = self.transform(images)
+            samples.append(
+                {
+                    "images": images,
+                    "label": meta["label"],
+                    "meta": meta,
+                }
+            )
+        return samples
 
 
 class EvalPairDataset:
@@ -157,6 +221,39 @@ class EvalPairDataset:
             "video_group_id": request.video_index,
             "meta": meta,
         }
+
+    def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+        indices = list(indices)
+        if not callable(getattr(self.decoder, "get_many", None)):
+            return [self[index] for index in indices]
+        requests = [
+            PairRequest(
+                video_index=int(self.video_indices[index]),
+                delta=int(self.deltas[index]),
+                start_position=int(self.start_positions[index]),
+            )
+            for index in indices
+        ]
+        decoded, metadata = _decode_many_pairs(
+            self.videos, requests, self.decoder
+        )
+        return [
+            {
+                "images": images,
+                "label": meta["label"],
+                "game_id": int(
+                    self._game_id_by_video[request.video_index]
+                ),
+                "game_label_id": int(
+                    self._game_label_id_by_video[request.video_index]
+                ),
+                "video_group_id": request.video_index,
+                "meta": meta,
+            }
+            for request, images, meta in zip(
+                requests, decoded, metadata
+            )
+        ]
 
     @property
     def index_nbytes(self) -> int:
