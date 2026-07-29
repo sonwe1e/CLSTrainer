@@ -16,6 +16,7 @@ class EvaluatorReportTests(unittest.TestCase):
         from torch.utils.data import DataLoader
 
         from game_cls.data.collate import pair_collate
+        from game_cls.data.image_spec import ImageSpec
         from game_cls.engine.evaluator import evaluate
         from game_cls.engine.trainer import SyntheticPairDataset
         from game_cls.reports.error_writer import (
@@ -28,7 +29,9 @@ class EvaluatorReportTests(unittest.TestCase):
                 score = image0[:, 0].mean(dim=(1, 2)) * 20 - 5
                 return torch.stack((-score, score), dim=1)
 
-        dataset = SyntheticPairDataset(16, 32, 16, 77)
+        dataset = SyntheticPairDataset(
+            16, ImageSpec(width=16, height=32, channels=3), 77
+        )
         loader = DataLoader(dataset, batch_size=4, collate_fn=pair_collate)
         result = evaluate(
             RedChannelModel(), loader, torch.device("cpu"), checkpoint_step=12

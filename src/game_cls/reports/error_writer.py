@@ -196,7 +196,7 @@ def _image_cell(path: str) -> str:
     escaped = html.escape(path, quote=True)
     return (
         f"<a href='{escaped}'><img src='{escaped}' loading='lazy' "
-        "style='max-width:208px;max-height:448px'></a>"
+        "style='max-width:100%;max-height:320px'></a>"
     )
 
 

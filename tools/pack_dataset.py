@@ -7,6 +7,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from game_cls.config import load_config
+from game_cls.data.image_spec import ImageSpec
 from game_cls.data.packed_backend import pack_frame_index
 
 
@@ -14,18 +16,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Pack decoded CHW uint8 images into memory-mapped shards"
     )
+    parser.add_argument("--config", required=True)
     parser.add_argument("--frame-index", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--images-per-shard", type=int, default=4096)
-    parser.add_argument("--width", type=int, default=208)
-    parser.add_argument("--height", type=int, default=448)
+    parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
+    config = load_config(args.config, args.overrides)
     index_path = pack_frame_index(
         args.frame_index,
         args.output_dir,
+        image_spec=ImageSpec.from_config(config["data"]),
         images_per_shard=args.images_per_shard,
-        expected_width=args.width,
-        expected_height=args.height,
     )
     print(
         json.dumps(

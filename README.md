@@ -1,6 +1,6 @@
 # CLSTrainer
 
-双帧、多游戏二分类训练框架。输入为两张 `[B,3,448,208]` RGB 图像，模型输出
+双帧、多游戏二分类训练框架。输入为两张 `[B,3,208,448]` RGB 图像，模型输出
 `[B,2]`，部署判定固定为第二通道 Softmax 概率严格大于 `0.99`。
 
 希望先了解项目全貌时，可直接在浏览器打开自包含的中文教程
@@ -47,20 +47,32 @@ checkpoint 不存在或非 `cls` 主干权重未完整加载时，训练会立�
 
 ```bash
 python tools/build_index.py \
+  --config configs/npu_production.yaml \
   --train-root /data/train \
   --test-root /data/test \
   --output-dir indexes
 
 python tools/audit_dataset.py \
+  --config configs/npu_production.yaml \
   --index-dir indexes \
   --output-dir reports/data_audit \
   --strict
 ```
 
-默认正式训练启用 `data.strict_audit`。尺寸、通道、文件名、类别完整性或
-test `delta=2` pair 不符合要求时，训练会在创建 DataLoader 前终止。审计报告
-同时列出 `game × label × delta` 的合法 pair 数；生产配置要求每个游戏、每个
-标签至少存在一个 `delta=2` pair。
+索引、审计、packed 和训练共同从 `data.width/height/channels` 创建
+`ImageSpec`。当前生产规格是 `width=448`、`height=208`、`channels=3`，
+因此单帧 tensor 为 `[3,208,448]`，训练输入为 `[B,2,3,208,448]`。系统不会
+自动交换宽高或 resize；首个训练 batch 的形状不一致会立即终止。
+
+扫描器只接受直接位于 `<game>/<0|1>` 下、扩展名符合配置的帧。MP4、JSON 等
+非帧文件会被忽略并计数，`_` 或 `.` 开头及配置命中的缓存目录会被整目录剪枝；
+直接出现的非法命名 PNG 仍是 error，非忽略嵌套目录默认为 warning。ignored
+报告每类只保留有限示例，不会把百万个辅助文件路径写入 JSON。
+
+默认正式训练启用 `data.strict_audit`。尺寸、通道、非法帧、类别完整性或 test
+`delta=2` pair 不符合要求时，训练会在创建 DataLoader 前终止。审计报告同时
+列出 `game × label × delta` 的合法 pair 数；生产配置要求每个游戏、每个标签
+至少存在一个 `delta=2` pair。
 
 训练阶段不会物化数百万个 `PairSample`：内存中只保留视频级帧数组和各 delta
 合法起点，sampler 在每个 step 懒生成 pair。测试 pair 使用 rank-local NumPy
@@ -68,9 +80,10 @@ test `delta=2` pair 不符合要求时，训练会在创建 DataLoader 前终止
 
 索引阶段还会生成 `train_video_entries.parquet` 和
 `test_video_entries.parquet`，训练直接按视频行读取，不再让每个 rank 将百万帧
-转换成 Python dict 和 `FrameRecord`。默认同时计算 SHA-256，严格审计会拒绝
-train/test 中字节完全相同的图片。两位 `video_id` 默认按 split 内编号处理，
-跨 split 重名只作为信息记录；只有确认它在整个项目中全局唯一后，才应启用
+转换成 Python dict 和 `FrameRecord`。默认同时计算 SHA-256：相同内容但标签
+不同属于 fatal error；同标签的跨 split 或 split 内重复属于 warning；仅文件名
+相同只做 info 汇总。两位 `video_id` 默认按 split 内编号处理，跨 split 重名只
+作为信息记录；只有确认它在整个项目中全局唯一后，才应启用
 `require_unique_video_keys_across_splits` 强制检查。
 
 SHA-256 会完整读取每张图片，是一次性但明显的 I/O 成本。百万帧数据推荐按以下
@@ -120,10 +133,12 @@ NPU 运行时会先导入 `torch_npu`、绑定设备，再初始化 HCCL。训�
 
 ```bash
 python tools/pack_dataset.py \
+  --config configs/npu_production.yaml \
   --frame-index indexes/train_frames.parquet \
   --output-dir /local_nvme/train_packed
 
 python tools/pack_dataset.py \
+  --config configs/npu_production.yaml \
   --frame-index indexes/test_frames.parquet \
   --output-dir /local_nvme/test_packed
 ```
@@ -134,6 +149,10 @@ python tools/pack_dataset.py \
 帧，不再为每个 rank 建立百万项路径字典；shard 路径相对 manifest 保存，运行时
 仅维护最多 `packed_max_open_shards` 个 LRU memmap。该后端避免训练热路径中的
 PNG 解压，数据仍应优先复制到本地 NVMe。
+
+尺寸、扫描策略或重复数据策略发生变化后，必须更换或删除旧 `indexes`，重新执行
+build、audit 和 train/test packed 打包。审计格式、记录的图片规格或重复策略与
+当前配置不一致时，训练会明确要求重建，而不会继续使用旧产物。
 
 普通生产配置默认保留 `backend: png`，便于直接接入原始数据；高吞吐训练应显式
 使用 `configs/npu_production_packed.yaml`。正式选择后端前，应保持模型、batch、

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import asdict
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
+from .image_spec import ImageSpec
+from .index_policy import DuplicatePolicy, ScanFindings, ScanPolicy
 from .records import (
     DEFAULT_FILENAME_PATTERN,
     FrameRecord,
@@ -17,6 +19,15 @@ from .records import (
 )
 
 
+AUDIT_FORMAT_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    frames: list[FrameRecord]
+    findings: ScanFindings
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -25,81 +36,148 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def iter_frame_candidates(
+    root: Path,
+    policy: ScanPolicy,
+    findings: ScanFindings,
+) -> Iterator[tuple[str, int, Path]]:
+    """Yield frames directly under <game>/<0|1>, pruning ignored content."""
+
+    for game_dir in sorted(root.iterdir()):
+        if game_dir.is_dir() and policy.ignore_directory(game_dir):
+            findings.add_ignored("ignored_directory", game_dir)
+            continue
+        if not game_dir.is_dir():
+            findings.add_ignored("non_directory_at_game_level", game_dir)
+            continue
+
+        for label_dir in sorted(game_dir.iterdir()):
+            if label_dir.is_dir() and policy.ignore_directory(label_dir):
+                findings.add_ignored("ignored_directory", label_dir)
+                continue
+            if not label_dir.is_dir():
+                findings.add_ignored(
+                    "non_directory_at_label_level", label_dir
+                )
+                continue
+            if label_dir.name not in {"0", "1"}:
+                candidate_frames = [
+                    item
+                    for item in label_dir.iterdir()
+                    if item.is_file()
+                    and not policy.ignore_file(item)
+                    and policy.is_frame_file(item)
+                ]
+                if candidate_frames:
+                    findings.add(
+                        "error",
+                        "invalid_label_directory",
+                        label_dir,
+                        "Directory containing frame files must be named 0 or 1",
+                    )
+                else:
+                    findings.add_ignored(
+                        "non_label_directory_without_frames", label_dir
+                    )
+                continue
+
+            for item in sorted(label_dir.iterdir()):
+                if item.is_dir():
+                    if policy.ignore_directory(item):
+                        findings.add_ignored("ignored_directory", item)
+                    else:
+                        findings.add(
+                            policy.unexpected_nested_directory_severity,
+                            "unexpected_nested_directory",
+                            item,
+                            "Frames must be directly below <game>/<0|1>",
+                        )
+                    continue
+                if not item.is_file():
+                    continue
+                if policy.ignore_file(item):
+                    findings.add_ignored("ignored_file_pattern", item)
+                    continue
+                if not policy.is_frame_file(item):
+                    findings.add_ignored("non_frame_extension", item)
+                    continue
+                yield game_dir.name, int(label_dir.name), item
+
+
 def scan_split(
     root: str | Path,
     split: str,
+    image_spec: ImageSpec,
+    *,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
-    expected_width: int = 208,
-    expected_height: int = 448,
-    expected_channels: int = 3,
+    scan_policy: ScanPolicy,
     compute_content_hash: bool = True,
-) -> tuple[list[FrameRecord], list[dict]]:
+) -> ScanResult:
     root = Path(root).resolve()
+    image_spec.validate()
+    findings = ScanFindings(
+        ignored_example_limit=scan_policy.ignored_example_limit
+    )
     frames: list[FrameRecord] = []
-    issues: list[dict] = []
     if not root.is_dir():
         raise FileNotFoundError(f"{split} root does not exist: {root}")
 
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
-        relative = path.relative_to(root)
-        if len(relative.parts) != 3:
-            issues.append(
-                {
-                    "path": str(path),
-                    "kind": "invalid_layout",
-                    "error": "expected <game>/<0|1>/<frame>.png",
-                }
-            )
-            continue
-        game, label_text, _ = relative.parts
-        if label_text not in {"0", "1"}:
-            issues.append({
-                "path": str(path),
-                "kind": "invalid_label",
-                "error": "label directory must be 0 or 1",
-            })
-            continue
+    for game, label, path in iter_frame_candidates(
+        root, scan_policy, findings
+    ):
         try:
             video_id, frame_id = parse_filename(path.name, filename_pattern)
+        except ValueError as exc:
+            findings.add("error", "invalid_filename", path, str(exc))
+            continue
+        try:
             width, height, channels = read_png_metadata(path)
         except (OSError, ValueError) as exc:
-            issues.append(
-                {"path": str(path), "kind": "invalid_file", "error": str(exc)}
-            )
+            findings.add("error", "invalid_file", path, str(exc))
             continue
         if (width, height, channels) != (
-            expected_width,
-            expected_height,
-            expected_channels,
+            image_spec.width,
+            image_spec.height,
+            image_spec.channels,
         ):
-            issues.append(
-                {
-                    "path": str(path),
-                    "kind": "unexpected_dimensions",
-                    "error": (
-                        f"expected {expected_width}x{expected_height}x"
-                        f"{expected_channels}, got {width}x{height}x{channels}"
-                    ),
-                }
+            findings.add(
+                "error",
+                "unexpected_dimensions",
+                path,
+                (
+                    f"expected {image_spec.width}x{image_spec.height}x"
+                    f"{image_spec.channels}, got {width}x{height}x{channels}"
+                ),
             )
             continue
+        try:
+            file_size = path.stat().st_size
+            content_sha256 = (
+                _sha256(path) if compute_content_hash else ""
+            )
+        except OSError as exc:
+            findings.add("error", "unreadable_file", path, str(exc))
+            continue
+        label_text = str(label)
         frames.append(
             FrameRecord(
-                sample_id=f"{split}:{game}:{label_text}:{video_id}:{frame_id:05d}",
+                sample_id=(
+                    f"{split}:{game}:{label_text}:{video_id}:{frame_id:05d}"
+                ),
                 split=split,
                 game=game,
-                label=int(label_text),
+                label=label,
                 video_id=video_id,
                 frame_id=frame_id,
                 path=str(path),
                 width=width,
                 height=height,
                 channels=channels,
-                file_size=path.stat().st_size,
-                content_sha256=_sha256(path) if compute_content_hash else "",
+                file_size=file_size,
+                content_sha256=content_sha256,
             )
         )
-    return frames, issues
+    return ScanResult(frames=frames, findings=findings)
 
 
 def _pyarrow():
@@ -108,12 +186,15 @@ def _pyarrow():
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise RuntimeError(
-            "Writing Parquet indexes requires pyarrow: python -m pip install pyarrow"
+            "Writing Parquet indexes requires pyarrow: "
+            "python -m pip install pyarrow"
         ) from exc
     return pa, pq
 
 
-def write_parquet(records: Iterable[FrameRecord | VideoRecord], path: str | Path) -> None:
+def write_parquet(
+    records: Iterable[FrameRecord | VideoRecord], path: str | Path
+) -> None:
     pa, pq = _pyarrow()
     rows = [asdict(record) for record in records]
     path = Path(path)
@@ -124,107 +205,193 @@ def write_parquet(records: Iterable[FrameRecord | VideoRecord], path: str | Path
 
 def read_frame_parquet(path: str | Path) -> list[FrameRecord]:
     _, pq = _pyarrow()
-    return [FrameRecord(**row) for row in pq.read_table(path).to_pylist()]
+    return [
+        FrameRecord(**row) for row in pq.read_table(path).to_pylist()
+    ]
+
+
+def analyze_content_duplicates(
+    frames_by_split: dict[str, list[FrameRecord]],
+    policy: DuplicatePolicy,
+) -> dict:
+    by_hash: dict[str, list[FrameRecord]] = defaultdict(list)
+    by_basename: dict[str, list[FrameRecord]] = defaultdict(list)
+    all_frames: list[FrameRecord] = []
+    for frames in frames_by_split.values():
+        for frame in frames:
+            all_frames.append(frame)
+            by_basename[Path(frame.path).name].append(frame)
+            if frame.content_sha256:
+                by_hash[frame.content_sha256].append(frame)
+
+    result: dict[str, object] = {
+        "errors": [],
+        "warnings": [],
+        "info": [],
+        "content_hash_check_enabled": bool(all_frames)
+        and all(bool(frame.content_sha256) for frame in all_frames),
+    }
+    for sha256, records in sorted(by_hash.items()):
+        if len(records) < 2:
+            continue
+        labels = {record.label for record in records}
+        splits = {record.split for record in records}
+        payload = {
+            "sha256": sha256,
+            "count": len(records),
+            "labels": sorted(labels),
+            "splits": sorted(splits),
+            "samples": [
+                {
+                    "split": record.split,
+                    "game": record.game,
+                    "label": record.label,
+                    "video_id": record.video_id,
+                    "frame_id": record.frame_id,
+                    "path": record.path,
+                }
+                for record in records[:20]
+            ],
+        }
+        if len(labels) > 1:
+            severity = policy.cross_label_same_content
+            kind = "identical_content_with_conflicting_labels"
+        elif len(splits) > 1:
+            severity = policy.same_label_cross_split
+            kind = "same_label_content_overlap_across_splits"
+        else:
+            severity = policy.same_label_within_split
+            kind = "duplicate_content_within_split"
+        finding = {
+            **payload,
+            "severity": severity,
+            "kind": kind,
+        }
+        result[f"{severity}s"].append(finding)
+
+    basename_groups = [
+        records for records in by_basename.values() if len(records) > 1
+    ]
+    result["same_basename"] = {
+        "group_count": len(basename_groups),
+        "record_count": sum(len(records) for records in basename_groups),
+        "severity": policy.same_basename,
+        "note": "Filename equality alone is not treated as sample identity",
+    }
+    return result
+
+
+def _split_report(
+    frames: list[FrameRecord], findings: ScanFindings
+) -> dict:
+    dimensions = Counter(
+        (frame.width, frame.height, frame.channels) for frame in frames
+    )
+    videos = summarize_videos(frames)
+    pair_grid_counts: Counter[tuple[str, int, int]] = Counter()
+    for video in videos:
+        for delta in (1, 2, 3):
+            pair_grid_counts[(video.game, video.label, delta)] += getattr(
+                video, f"valid_pair_count_delta{delta}"
+            )
+    games = sorted({frame.game for frame in frames})
+    return {
+        "frame_count": len(frames),
+        "video_count": len(videos),
+        "game_count": len(games),
+        "label_counts": dict(
+            sorted(Counter(frame.label for frame in frames).items())
+        ),
+        "dimensions": [
+            {
+                "width": width,
+                "height": height,
+                "channels": channels,
+                "count": count,
+            }
+            for (width, height, channels), count in sorted(
+                dimensions.items()
+            )
+        ],
+        "findings": findings.to_dict(),
+        "games_missing_labels": {
+            game: sorted(
+                {0, 1}
+                - {
+                    frame.label
+                    for frame in frames
+                    if frame.game == game
+                }
+            )
+            for game in games
+            if {
+                frame.label for frame in frames if frame.game == game
+            }
+            != {0, 1}
+        },
+        "valid_pairs": {
+            str(delta): sum(
+                getattr(video, f"valid_pair_count_delta{delta}")
+                for video in videos
+            )
+            for delta in (1, 2, 3)
+        },
+        "valid_pairs_by_game_label_delta": [
+            {
+                "game": game,
+                "label": label,
+                "delta": delta,
+                "count": count,
+            }
+            for (game, label, delta), count in sorted(
+                pair_grid_counts.items()
+            )
+        ],
+    }
 
 
 def make_audit(
     frames_by_split: dict[str, list[FrameRecord]],
-    issues_by_split: dict[str, list[dict]],
-    expected_width: int = 208,
-    expected_height: int = 448,
-    expected_channels: int = 3,
+    findings_by_split: dict[str, ScanFindings],
+    image_spec: ImageSpec,
+    duplicate_policy: DuplicatePolicy,
 ) -> dict:
-    split_reports = {}
-    for split, frames in frames_by_split.items():
-        dimensions = Counter((f.width, f.height, f.channels) for f in frames)
-        videos = summarize_videos(frames)
-        pair_grid = []
-        for video in videos:
-            for delta in (1, 2, 3):
-                pair_grid.append(
-                    (
-                        video.game,
-                        video.label,
-                        delta,
-                        getattr(video, f"valid_pair_count_delta{delta}"),
-                    )
-                )
-        pair_grid_counts = Counter()
-        for game, label, delta, count in pair_grid:
-            pair_grid_counts[(game, label, delta)] += count
-        split_reports[split] = {
-            "frame_count": len(frames),
-            "video_count": len(videos),
-            "game_count": len({f.game for f in frames}),
-            "label_counts": dict(sorted(Counter(f.label for f in frames).items())),
-            "dimensions": [
-                {"width": w, "height": h, "channels": c, "count": count}
-                for (w, h, c), count in sorted(dimensions.items())
-            ],
-            "unexpected_dimension_count": sum(
-                issue.get("kind") == "unexpected_dimensions"
-                for issue in issues_by_split.get(split, [])
-            ),
-            "parse_or_file_issues": issues_by_split.get(split, []),
-            "games_missing_labels": {
-                game: sorted({0, 1} - {frame.label for frame in frames if frame.game == game})
-                for game in sorted({frame.game for frame in frames})
-                if {frame.label for frame in frames if frame.game == game} != {0, 1}
-            },
-            "valid_pairs": {
-                str(delta): sum(
-                    getattr(video, f"valid_pair_count_delta{delta}") for video in videos
-                )
-                for delta in (1, 2, 3)
-            },
-            "valid_pairs_by_game_label_delta": [
-                {
-                    "game": game,
-                    "label": label,
-                    "delta": delta,
-                    "count": count,
-                }
-                for (game, label, delta), count in sorted(
-                    pair_grid_counts.items()
-                )
-            ],
-        }
     train_frames = frames_by_split.get("train", [])
     test_frames = frames_by_split.get("test", [])
     train_videos = {
-        (frame.game, frame.label, frame.video_id) for frame in train_frames
+        (frame.game, frame.label, frame.video_id)
+        for frame in train_frames
     }
     test_videos = {
-        (frame.game, frame.label, frame.video_id) for frame in test_frames
-    }
-    train_hashes = {
-        frame.content_sha256: frame.path
-        for frame in train_frames
-        if frame.content_sha256
-    }
-    duplicate_hashes = [
-        {
-            "sha256": frame.content_sha256,
-            "train_path": train_hashes[frame.content_sha256],
-            "test_path": frame.path,
-        }
+        (frame.game, frame.label, frame.video_id)
         for frame in test_frames
-        if frame.content_sha256 in train_hashes
-    ]
+    }
     return {
+        "audit_format_version": AUDIT_FORMAT_VERSION,
         "expected": {
-            "width": expected_width,
-            "height": expected_height,
-            "channels": expected_channels,
+            "width": image_spec.width,
+            "height": image_spec.height,
+            "channels": image_spec.channels,
         },
-        "splits": split_reports,
+        "policies": {
+            "duplicate_policy": asdict(duplicate_policy),
+        },
+        "splits": {
+            split: _split_report(
+                frames, findings_by_split.get(split, ScanFindings())
+            )
+            for split, frames in frames_by_split.items()
+        },
+        "duplicates": analyze_content_duplicates(
+            frames_by_split, duplicate_policy
+        ),
         "leakage": {
             "video_keys_across_splits": [
                 {"game": game, "label": label, "video_id": video_id}
-                for game, label, video_id in sorted(train_videos & test_videos)
+                for game, label, video_id in sorted(
+                    train_videos & test_videos
+                )
             ],
-            "content_hashes_across_splits": duplicate_hashes,
-            "content_hash_check_enabled": bool(train_hashes),
             "video_key_check_note": (
                 "Informational unless video IDs are declared globally unique"
             ),
@@ -232,38 +399,111 @@ def make_audit(
     }
 
 
+def audit_warning_messages(audit: dict) -> list[str]:
+    messages: list[str] = []
+    for split, report in audit.get("splits", {}).items():
+        warnings = report.get("findings", {}).get("warnings", [])
+        if warnings:
+            counts = Counter(item.get("kind", "unknown") for item in warnings)
+            messages.append(
+                f"{split} scan warnings: "
+                + ", ".join(
+                    f"{kind}={count}"
+                    for kind, count in sorted(counts.items())
+                )
+            )
+    duplicate_warnings = audit.get("duplicates", {}).get("warnings", [])
+    if duplicate_warnings:
+        counts = Counter(
+            item.get("kind", "unknown") for item in duplicate_warnings
+        )
+        messages.append(
+            "duplicate warnings: "
+            + ", ".join(
+                f"{kind}={count}"
+                for kind, count in sorted(counts.items())
+            )
+        )
+    return messages
+
+
 def validate_audit(
     audit: dict,
     *,
+    image_spec: ImageSpec | None = None,
+    scan_policy: ScanPolicy | None = None,
+    duplicate_policy: DuplicatePolicy | None = None,
     require_test_delta: int = 2,
     require_content_hash: bool = False,
     require_unique_video_keys: bool = False,
     minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
 ) -> None:
     problems: list[str] = []
+    if audit.get("audit_format_version") != AUDIT_FORMAT_VERSION:
+        problems.append(
+            "audit format is obsolete; rebuild indexes with tools/build_index.py"
+        )
+    if image_spec is not None:
+        expected = audit.get("expected", {})
+        actual = (
+            int(expected.get("width", -1)),
+            int(expected.get("height", -1)),
+            int(expected.get("channels", -1)),
+        )
+        configured = (
+            image_spec.width,
+            image_spec.height,
+            image_spec.channels,
+        )
+        if actual != configured:
+            problems.append(
+                f"audit image spec {actual} does not match configured "
+                f"{configured}; rebuild indexes"
+            )
+    if duplicate_policy is not None:
+        recorded_policy = (
+            audit.get("policies", {}).get("duplicate_policy", {})
+        )
+        if recorded_policy != asdict(duplicate_policy):
+            problems.append(
+                "audit duplicate policy does not match configuration; "
+                "rebuild indexes"
+            )
+    if scan_policy is not None:
+        recorded_scan_policy = (
+            audit.get("policies", {}).get("scan_policy", {})
+        )
+        if recorded_scan_policy != scan_policy.to_dict():
+            problems.append(
+                "audit scan policy does not match configuration; "
+                "rebuild indexes"
+            )
+
     for split in ("train", "test"):
         report = audit.get("splits", {}).get(split)
         if report is None:
             problems.append(f"missing {split} audit")
             continue
-        if report.get("unexpected_dimension_count", 0):
+        for finding in report.get("findings", {}).get("errors", []):
             problems.append(
-                f"{split} has {report['unexpected_dimension_count']} invalid dimensions"
-            )
-        if report.get("parse_or_file_issues"):
-            problems.append(
-                f"{split} has {len(report['parse_or_file_issues'])} invalid files"
+                f"{split}: {finding.get('kind', 'error')}: "
+                f"{finding.get('path', '')}"
             )
         if report.get("games_missing_labels"):
-            problems.append(f"{split} games missing labels: {report['games_missing_labels']}")
+            problems.append(
+                f"{split} games missing labels: "
+                f"{report['games_missing_labels']}"
+            )
         if report.get("frame_count", 0) == 0:
             problems.append(f"{split} has no valid frames")
         requirements = minimum_pairs_per_game_label_delta or {}
         if requirements:
             grid = {
-                (str(row["game"]), int(row["label"]), int(row["delta"])): int(
-                    row["count"]
-                )
+                (
+                    str(row["game"]),
+                    int(row["label"]),
+                    int(row["delta"]),
+                ): int(row["count"])
                 for row in report.get(
                     "valid_pairs_by_game_label_delta", []
                 )
@@ -283,12 +523,26 @@ def validate_audit(
                                 f"{split} {game}/label={label}/delta={delta} "
                                 f"has {actual} pairs, requires {minimum}"
                             )
+
     test_report = audit.get("splits", {}).get("test", {})
-    if int(test_report.get("valid_pairs", {}).get(str(require_test_delta), 0)) <= 0:
+    if int(
+        test_report.get("valid_pairs", {}).get(
+            str(require_test_delta), 0
+        )
+    ) <= 0:
         problems.append(f"test has no legal delta={require_test_delta} pairs")
+
+    duplicates = audit.get("duplicates", {})
+    if require_content_hash and not duplicates.get(
+        "content_hash_check_enabled", False
+    ):
+        problems.append("content-hash duplicate check was not performed")
+    for conflict in duplicates.get("errors", []):
+        problems.append(
+            f"duplicate conflict: {conflict.get('kind', 'error')} "
+            f"sha256={conflict.get('sha256', '')}"
+        )
     leakage = audit.get("leakage", {})
-    if require_content_hash and not leakage.get("content_hash_check_enabled", False):
-        problems.append("content-hash leakage check was not performed")
     if (
         require_unique_video_keys
         and leakage.get("video_keys_across_splits")
@@ -297,18 +551,18 @@ def validate_audit(
             "train/test share video keys: "
             f"{leakage['video_keys_across_splits'][:20]}"
         )
-    if leakage.get("content_hashes_across_splits"):
-        problems.append(
-            "train/test contain identical file hashes: "
-            f"{len(leakage['content_hashes_across_splits'])}"
-        )
     if problems:
-        raise RuntimeError("Strict dataset audit failed: " + "; ".join(problems))
+        raise RuntimeError(
+            "Strict dataset audit failed: " + "; ".join(problems[:100])
+        )
 
 
 def validate_audit_file(
     path: str | Path,
     *,
+    image_spec: ImageSpec | None = None,
+    scan_policy: ScanPolicy | None = None,
+    duplicate_policy: DuplicatePolicy | None = None,
     require_test_delta: int = 2,
     require_content_hash: bool = False,
     require_unique_video_keys: bool = False,
@@ -322,6 +576,9 @@ def validate_audit_file(
     audit = json.loads(path.read_text(encoding="utf-8"))
     validate_audit(
         audit,
+        image_spec=image_spec,
+        scan_policy=scan_policy,
+        duplicate_policy=duplicate_policy,
         require_test_delta=require_test_delta,
         require_content_hash=require_content_hash,
         require_unique_video_keys=require_unique_video_keys,
@@ -334,32 +591,53 @@ def write_index_bundle(
     train_root: str | Path,
     test_root: str | Path,
     output_dir: str | Path,
+    image_spec: ImageSpec,
+    scan_policy: ScanPolicy,
+    duplicate_policy: DuplicatePolicy,
+    *,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
     compute_content_hash: bool = True,
 ) -> dict:
     output_dir = Path(output_dir)
     frames_by_split: dict[str, list[FrameRecord]] = {}
-    issues_by_split: dict[str, list[dict]] = {}
+    findings_by_split: dict[str, ScanFindings] = {}
     for split, root in (("train", train_root), ("test", test_root)):
-        frames, issues = scan_split(
+        result = scan_split(
             root,
             split,
-            filename_pattern,
+            image_spec,
+            filename_pattern=filename_pattern,
+            scan_policy=scan_policy,
             compute_content_hash=compute_content_hash,
         )
-        frames_by_split[split] = frames
-        issues_by_split[split] = issues
-        write_parquet(frames, output_dir / f"{split}_frames.parquet")
-        write_parquet(summarize_videos(frames), output_dir / f"{split}_videos.parquet")
-        from .video_index import build_video_entries, write_video_entries_parquet
+        frames_by_split[split] = result.frames
+        findings_by_split[split] = result.findings
+        write_parquet(
+            result.frames, output_dir / f"{split}_frames.parquet"
+        )
+        write_parquet(
+            summarize_videos(result.frames),
+            output_dir / f"{split}_videos.parquet",
+        )
+        from .video_index import (
+            build_video_entries,
+            write_video_entries_parquet,
+        )
 
         write_video_entries_parquet(
-            build_video_entries(frames),
+            build_video_entries(result.frames),
             output_dir / f"{split}_video_entries.parquet",
         )
-    audit = make_audit(frames_by_split, issues_by_split)
+    audit = make_audit(
+        frames_by_split,
+        findings_by_split,
+        image_spec,
+        duplicate_policy,
+    )
+    audit["policies"]["scan_policy"] = scan_policy.to_dict()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "audit.json").write_text(
-        json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(audit, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
     return audit

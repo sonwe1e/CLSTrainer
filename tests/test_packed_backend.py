@@ -17,6 +17,7 @@ except ImportError:
 @unittest.skipIf(torch is None, "packed backend dependencies are not installed")
 class PackedBackendTests(unittest.TestCase):
     def test_packed_decode_matches_png_pixels(self) -> None:
+        from game_cls.data.image_spec import ImageSpec
         from game_cls.data.packed_backend import (
             PackedUint8Backend,
             pack_frame_index,
@@ -29,7 +30,9 @@ class PackedBackendTests(unittest.TestCase):
             rows = []
             expected = []
             for index in range(5):
-                array = np.full((8, 6, 3), index * 40, dtype=np.uint8)
+                array = np.full(
+                    (208, 448, 3), index * 40, dtype=np.uint8
+                )
                 array[:, :, 1] += 5
                 path = root / f"image_{index}.png"
                 Image.fromarray(array).save(path)
@@ -47,18 +50,16 @@ class PackedBackendTests(unittest.TestCase):
                 ))
             frame_index = root / "frames.parquet"
             pq.write_table(pa.Table.from_pylist(rows), frame_index)
+            image_spec = ImageSpec(width=448, height=208, channels=3)
             packed_index = pack_frame_index(
                 frame_index,
                 root / "packed",
+                image_spec=image_spec,
                 images_per_shard=2,
-                expected_width=6,
-                expected_height=8,
             )
             backend = PackedUint8Backend(
                 packed_index,
-                channels=3,
-                height=8,
-                width=6,
+                image_spec=image_spec,
                 max_open_shards=1,
             )
             for location, tensor in enumerate(expected):
@@ -76,14 +77,34 @@ class PackedBackendTests(unittest.TestCase):
             )
             dataset = build_eval_dataset(videos, 2, decoder=backend)
             sample = dataset[0]
-            self.assertEqual(tuple(sample["images"].shape), (2, 3, 8, 6))
+            self.assertEqual(
+                tuple(sample["images"].shape), (2, 3, 208, 448)
+            )
             self.assertTrue(
                 sample["meta"]["image0_path"].startswith("packed://frame/")
             )
-            manifest = (
+            manifest_path = (
                 root / "packed" / "packed_manifest.json"
-            ).read_text(encoding="utf-8")
-            self.assertNotIn(str((root / "packed").resolve()), manifest)
+            )
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+            self.assertNotIn(
+                str((root / "packed").resolve()), manifest_text
+            )
+            import json
+
+            manifest = json.loads(manifest_text)
+            self.assertEqual(manifest["width"], 448)
+            self.assertEqual(manifest["height"], 208)
+            self.assertEqual(manifest["channels"], 3)
+            with self.assertRaisesRegex(
+                ValueError, "does not match configured shape"
+            ):
+                PackedUint8Backend(
+                    packed_index,
+                    image_spec=ImageSpec(
+                        width=208, height=448, channels=3
+                    ),
+                )
             backend.close()
 
 

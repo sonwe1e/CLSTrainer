@@ -641,7 +641,7 @@
         </div>
         <div class="hero-metrics" aria-label="核心技术规格">
           <div class="metric"><strong>2 × RGB</strong><span>每个样本由两张连续画面组成</span></div>
-          <div class="metric"><strong>448 × 208</strong><span>生产配置的单帧输入尺寸</span></div>
+          <div class="metric"><strong>448 × 208</strong><span>单帧 tensor 为 [3, 208, 448]</span></div>
           <div class="metric"><strong>[B, 2]</strong><span>模型输出二分类 logits</span></div>
           <div class="metric"><strong>p₁ &gt; 0.99</strong><span>固定业务分数判定规则</span></div>
         </div>
@@ -787,8 +787,8 @@
             <h2>数据格式与存储后端</h2>
           </div>
           <p class="section-intro">
-            先保证数据正确，再讨论吞吐。严格审计会在 DataLoader 创建前阻止尺寸、
-            文件名、类别覆盖或 train/test 内容泄漏问题。
+            先保证数据正确，再讨论吞吐。图像规格、扫描规则和重复数据严重程度都来自
+            同一个配置；严格审计只阻止 errors，warnings 会保留并继续训练。
           </p>
         </div>
 
@@ -812,7 +812,8 @@ test/
 └── game_A/...</code></pre>
             </div>
             <p class="muted small" style="margin-top:14px">
-              文件名格式：两位 video ID + 五位 frame ID + .png。两位 video ID 默认只在 split 内唯一。
+              文件名格式：两位 video ID + 五位 frame ID + .png。MP4、JSON 和缓存目录
+              按策略忽略；非法命名的直接 PNG 仍会报错。
             </p>
           </article>
 
@@ -821,7 +822,7 @@ test/
             <h3>百万帧推荐准备顺序</h3>
             <div class="steps" style="margin-top:22px">
               <div class="step"><div class="step-number">1</div><div class="step-content"><strong>复制到本地 NVMe</strong><div class="muted small">避免远程随机小文件链路反复扫描。</div></div></div>
-              <div class="step"><div class="step-number">2</div><div class="step-content"><strong>建索引并计算 SHA-256</strong><div class="muted small">一次性检查完全相同的跨 split 内容。</div></div></div>
+              <div class="step"><div class="step-number">2</div><div class="step-content"><strong>建索引并计算 SHA-256</strong><div class="muted small">同内容异标签报错；同标签重复只警告。</div></div></div>
               <div class="step"><div class="step-number">3</div><div class="step-content"><strong>按需生成 packed 数据</strong><div class="muted small">消除训练热路径中的 PNG 解码。</div></div></div>
               <div class="step"><div class="step-number">4</div><div class="step-content"><strong>审计后再训练</strong><div class="muted small">确认 game × label × delta 覆盖。</div></div></div>
             </div>
@@ -902,11 +903,13 @@ python -m pip install -e ".[dev]"</code></pre>
               <div class="code-shell">
                 <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
                 <pre><code>python tools/build_index.py \
+  --config configs/npu_production.yaml \
   --train-root /local_nvme/data/train \
   --test-root /local_nvme/data/test \
   --output-dir indexes
 
 python tools/audit_dataset.py \
+  --config configs/npu_production.yaml \
   --index-dir indexes \
   --output-dir reports/data_audit \
   --strict</code></pre>
@@ -921,10 +924,12 @@ python tools/audit_dataset.py \
               <div class="code-shell">
                 <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
                 <pre><code>python tools/pack_dataset.py \
+  --config configs/npu_production.yaml \
   --frame-index indexes/train_frames.parquet \
   --output-dir /local_nvme/train_packed
 
 python tools/pack_dataset.py \
+  --config configs/npu_production.yaml \
   --frame-index indexes/test_frames.parquet \
   --output-dir /local_nvme/test_packed</code></pre>
               </div>

@@ -14,8 +14,9 @@ data:
   audit_path: indexes/audit.json
   train_index: indexes/train_frames.parquet
   test_index: indexes/test_frames.parquet
-  width: 208
-  height: 448
+  width: 448
+  height: 208
+  channels: 3
 
 pair:
   train_delta_probability: {1: 0.15, 2: 0.70, 3: 0.15}

@@ -21,6 +21,7 @@ def _distributed_eval_worker(
     from torch.utils.data import DataLoader, Subset
 
     from game_cls.data.collate import pair_collate
+    from game_cls.data.image_spec import ImageSpec
     from game_cls.engine.evaluator import evaluate
     from game_cls.engine.trainer import SyntheticPairDataset
     from game_cls.reports.error_writer import prepare_evaluation_directory
@@ -32,7 +33,9 @@ def _distributed_eval_worker(
         world_size=world_size,
     )
     try:
-        dataset = SyntheticPairDataset(16, 16, 8, 91)
+        dataset = SyntheticPairDataset(
+            16, ImageSpec(width=8, height=16, channels=3), 91
+        )
         local = Subset(dataset, list(range(rank, len(dataset), world_size)))
         loader = DataLoader(local, batch_size=2, collate_fn=pair_collate)
 

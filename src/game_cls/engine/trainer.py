@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from game_cls.data.collate import pair_collate
+from game_cls.data.image_spec import ImageSpec
 from game_cls.engine.checkpoint import (
     capture_random_state,
     clone_checkpoint_pair,
@@ -44,10 +45,11 @@ from game_cls.reports.error_writer import (
 
 
 class SyntheticPairDataset:
-    def __init__(self, length: int, height: int, width: int, seed: int) -> None:
+    def __init__(
+        self, length: int, image_spec: ImageSpec, seed: int
+    ) -> None:
         self.length = length
-        self.height = height
-        self.width = width
+        self.image_spec = image_spec
         self.seed = seed
 
     def __len__(self) -> int:
@@ -61,12 +63,12 @@ class SyntheticPairDataset:
         images = torch.randint(
             0,
             96,
-            (2, 3, self.height, self.width),
+            (2, *self.image_spec.chw),
             dtype=torch.uint8,
             generator=generator,
         )
         if label:
-            images[:, 0, : self.height // 2] += 128
+            images[:, 0, : self.image_spec.height // 2] += 128
         return {
             "images": images,
             "label": label,
@@ -104,6 +106,7 @@ def _seed_everything(seed: int) -> None:
 
 def validate_training_config(config: dict) -> None:
     data_cfg = config["data"]
+    ImageSpec.from_config(data_cfg)
     model_cfg = config["model"]
     evaluation_cfg = config["evaluation"]
     evaluation_amp_dtype = str(
@@ -247,6 +250,7 @@ def _make_dataloaders(
     from game_cls.data.video_sampler import DeterministicIndexBatchSampler
 
     data_cfg = config["data"]
+    image_spec = ImageSpec.from_config(data_cfg)
     train_cfg = config["train"]
     batch_size = int(train_cfg["local_batch_size"])
     steps_per_epoch = int(train_cfg["steps_per_epoch"])
@@ -256,14 +260,12 @@ def _make_dataloaders(
         train_length = max(batch_size * steps_per_epoch * world_size, 128)
         train_dataset = SyntheticPairDataset(
             train_length,
-            data_cfg["height"],
-            data_cfg["width"],
+            image_spec,
             config["experiment"]["seed"],
         )
         test_dataset = SyntheticPairDataset(
             64,
-            data_cfg["height"],
-            data_cfg["width"],
+            image_spec,
             config["experiment"]["seed"] + 99,
         )
         sampler = DeterministicIndexBatchSampler(
@@ -298,7 +300,11 @@ def _make_dataloaders(
         )
 
     from game_cls.data.augment import ConsistentPairAugment
-    from game_cls.data.indexing import validate_audit_file
+    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+    from game_cls.data.indexing import (
+        audit_warning_messages,
+        validate_audit_file,
+    )
     from game_cls.data.lazy_pair_dataset import (
         LazyTrainingPairDataset,
         build_eval_dataset,
@@ -313,8 +319,11 @@ def _make_dataloaders(
         audit_path = data_cfg.get("audit_path")
         if not audit_path:
             audit_path = str(Path(data_cfg["train_index"]).parent / "audit.json")
-        validate_audit_file(
+        audit = validate_audit_file(
             audit_path,
+            image_spec=image_spec,
+            scan_policy=ScanPolicy.from_config(data_cfg),
+            duplicate_policy=DuplicatePolicy.from_config(data_cfg),
             require_test_delta=int(config["pair"]["test_delta"]),
             require_content_hash=bool(
                 data_cfg.get("require_content_hash_audit", False)
@@ -331,6 +340,9 @@ def _make_dataloaders(
                 ).items()
             },
         )
+        if rank == 0:
+            for warning in audit_warning_messages(audit):
+                print(f"[WARNING] {warning}", flush=True)
     delta_probability = {
         int(key): float(value)
         for key, value in config["pair"]["train_delta_probability"].items()
@@ -376,18 +388,14 @@ def _make_dataloaders(
 
         train_decoder = PackedUint8Backend(
             data_cfg["train_packed_index"],
-            channels=3,
-            height=int(data_cfg["height"]),
-            width=int(data_cfg["width"]),
+            image_spec=image_spec,
             max_open_shards=int(
                 data_cfg.get("packed_max_open_shards", 16)
             ),
         )
         test_decoder = PackedUint8Backend(
             data_cfg["test_packed_index"],
-            channels=3,
-            height=int(data_cfg["height"]),
-            width=int(data_cfg["width"]),
+            image_spec=image_spec,
             max_open_shards=int(
                 data_cfg.get("packed_max_open_shards", 16)
             ),
@@ -748,6 +756,7 @@ def run_training(config: dict[str, Any]) -> dict:
     import torch
 
     validate_training_config(config)
+    image_spec = ImageSpec.from_config(config["data"])
     rank, world_size, local_rank, device = initialize_runtime(config)
     try:
         seed = int(config["experiment"]["seed"])
@@ -901,6 +910,7 @@ def run_training(config: dict[str, Any]) -> dict:
             "host_optimizer_enqueue": 0.0,
         }
         timing_steps = 0
+        input_shape_validated = False
         while global_step < run_until_step:
             loaders.sampler.set_epoch(epoch, start_step=step_in_epoch)
             _set_train_mode(model, config["model"])
@@ -910,7 +920,11 @@ def run_training(config: dict[str, Any]) -> dict:
                 batch_ready = time.perf_counter()
                 timing["host_data_wait"] += batch_ready - last_batch_finished
                 transfer_started = time.perf_counter()
-                images = batch["images"].to(device, non_blocking=True)
+                images = batch["images"]
+                if not input_shape_validated:
+                    image_spec.validate_pair_batch_shape(images.shape)
+                    input_shape_validated = True
+                images = images.to(device, non_blocking=True)
                 if images.dtype == torch.uint8:
                     compute_dtype = (
                         torch.bfloat16

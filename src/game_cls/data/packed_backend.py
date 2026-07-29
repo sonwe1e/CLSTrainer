@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .image_spec import ImageSpec
+
 
 class PackedUint8Backend:
     """Read fixed-size CHW uint8 frames by compact integer location."""
@@ -13,9 +15,7 @@ class PackedUint8Backend:
         self,
         index_path: str | Path,
         *,
-        channels: int = 3,
-        height: int = 448,
-        width: int = 208,
+        image_spec: ImageSpec,
         max_open_shards: int = 16,
     ) -> None:
         try:
@@ -27,11 +27,20 @@ class PackedUint8Backend:
             ) from exc
         if max_open_shards <= 0:
             raise ValueError("max_open_shards must be positive")
+        image_spec.validate()
+        if image_spec.channels != 3:
+            raise ValueError(
+                "Packed uint8 backend requires RGB images with 3 channels, "
+                f"got {image_spec.channels}"
+            )
         self.index_path = Path(index_path).resolve()
-        self.channels = channels
-        self.height = height
-        self.width = width
-        self.image_bytes = channels * height * width
+        self.image_spec = image_spec
+        self.channels = image_spec.channels
+        self.height = image_spec.height
+        self.width = image_spec.width
+        self.image_bytes = (
+            image_spec.channels * image_spec.height * image_spec.width
+        )
         self.max_open_shards = int(max_open_shards)
         schema_names = set(pq.read_schema(self.index_path).names)
         required = {"frame_index", "shard_id", "offset", "length"}
@@ -85,10 +94,10 @@ class PackedUint8Backend:
             int(manifest["height"]),
             int(manifest["width"]),
         )
-        if manifest_shape != (channels, height, width):
+        if manifest_shape != image_spec.chw:
             raise ValueError(
                 f"Packed shape {manifest_shape} does not match configured "
-                f"shape {(channels, height, width)}"
+                f"shape {image_spec.chw}"
             )
         self._memory_maps: OrderedDict[int, Any] = OrderedDict()
 
@@ -166,9 +175,8 @@ def pack_frame_index(
     frame_index: str | Path,
     output_dir: str | Path,
     *,
+    image_spec: ImageSpec,
     images_per_shard: int = 4096,
-    expected_width: int = 208,
-    expected_height: int = 448,
 ) -> Path:
     try:
         import numpy as np
@@ -181,6 +189,12 @@ def pack_frame_index(
         ) from exc
     if images_per_shard <= 0:
         raise ValueError("images_per_shard must be positive")
+    image_spec.validate()
+    if image_spec.channels != 3:
+        raise ValueError(
+            "Packing requires RGB images with 3 channels, "
+            f"got {image_spec.channels}"
+        )
     parquet_file = pq.ParquetFile(frame_index)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -221,9 +235,9 @@ def pack_frame_index(
                 with Image.open(row["path"]) as image:
                     array = np.asarray(image.convert("RGB"), dtype=np.uint8)
                 if tuple(array.shape) != (
-                    expected_height,
-                    expected_width,
-                    3,
+                    image_spec.height,
+                    image_spec.width,
+                    image_spec.channels,
                 ):
                     raise ValueError(
                         f"Unexpected image shape {array.shape}: {row['path']}"
@@ -270,10 +284,12 @@ def pack_frame_index(
         index_writer.close()
     manifest = {
         "format_version": 2,
-        "channels": 3,
-        "height": expected_height,
-        "width": expected_width,
-        "image_bytes": 3 * expected_height * expected_width,
+        "channels": image_spec.channels,
+        "height": image_spec.height,
+        "width": image_spec.width,
+        "image_bytes": (
+            image_spec.channels * image_spec.height * image_spec.width
+        ),
         "frame_count": index,
         "shards": shard_names,
     }
