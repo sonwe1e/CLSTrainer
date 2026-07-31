@@ -1053,31 +1053,6 @@ def _run_training_loop_legacy(config: dict[str, Any]) -> dict:
     return _run_training_loop(config)
 
 
-def _build_runtime(config: dict[str, Any]) -> Any:
-    from game_cls.runtime.factories import build_runtime
-
-    runtime_cfg = config.get("runtime", {})
-    accelerator = runtime_cfg.get("accelerator", {}).get(
-        "type", config.get("device", {}).get("accelerator", "cpu")
-    )
-    distributed_cfg = runtime_cfg.get("distributed", {})
-    distributed = distributed_cfg.get("type", "single_process")
-    distributed_params = dict(distributed_cfg.get("params", {}) or {})
-
-    class _Sel:
-        pass
-
-    acc_sel = _Sel()
-    acc_sel.type = accelerator
-    dist_sel = _Sel()
-    dist_sel.type = distributed
-    dist_sel.params = distributed_params
-    runtime_sel = _Sel()
-    runtime_sel.accelerator = acc_sel
-    runtime_sel.distributed = dist_sel
-    return build_runtime(runtime_sel)
-
-
 def _build_trainable_policy(config: dict[str, Any]) -> Any:
     from game_cls.trainable.build import build_trainable_policy
 

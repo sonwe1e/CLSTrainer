@@ -51,10 +51,15 @@ class LegacyGameVideoDataModule:
         # Track backends for cleanup. The datasets hold references to the
         # backends; we collect them here so we can close memmaps/file
         # descriptors when training finishes.
+        # NOTE: eval DataLoaders wrap their dataset in a torch.utils.data.Subset,
+        # so we must unwrap Subset to reach the underlying dataset's decoder.
         for loader in (bundle.train, bundle.quick_test, bundle.full_test):
             dataset = getattr(loader, "dataset", None)
             if dataset is None:
                 continue
+            # Unwrap Subset to reach the underlying dataset.
+            if hasattr(dataset, "dataset"):
+                dataset = dataset.dataset
             decoder = getattr(dataset, "decoder", None)
             if decoder is not None and decoder not in self._backends:
                 self._backends.append(decoder)

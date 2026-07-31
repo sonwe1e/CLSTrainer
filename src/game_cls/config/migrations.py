@@ -98,7 +98,11 @@ def _migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
 
     evaluation = config.setdefault("evaluation", {})
     if "suite" not in evaluation:
-        evaluation["suite"] = {"type": "binary_threshold"}
+        # The new BinaryThresholdEvaluatorSuite still has device/distributed
+        # bugs, so the registered suite is the legacy adapter
+        # (LegacyEvaluatorSuite) which wraps the battle-tested evaluate().
+        # The migration must emit the REGISTERED name, not the new suite's.
+        evaluation["suite"] = {"type": "legacy_binary"}
     if "decision" not in evaluation:
         evaluation["decision"] = {
             "type": "threshold",

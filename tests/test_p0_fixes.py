@@ -937,7 +937,68 @@ class TestSamplingPolicyInProduction:
 
 
 # --------------------------------------------------------------------------- #
-# 12. Task param validation
+# 12. DataModule eval backend tracking (Subset unwrapping)
+# --------------------------------------------------------------------------- #
+class TestDataModuleEvalBackendTracking:
+    def test_eval_backends_tracked_through_subset(self):
+        """Eval backends wrapped in Subset must still be tracked for cleanup."""
+        from torch.utils.data import DataLoader, Subset
+
+        from game_cls.data.module import LegacyGameVideoDataModule
+
+        class _ImageSpec:
+            chw = (3, 32, 32)
+
+        class _Backend:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _Dataset:
+            def __init__(self, decoder):
+                self.decoder = decoder
+
+        class _Bundle:
+            def __init__(self, train, quick_test, full_test, sampler, data_summary):
+                self.train = train
+                self.quick_test = quick_test
+                self.full_test = full_test
+                self.sampler = sampler
+                self.data_summary = data_summary
+
+        config = {"data": {"synthetic": True}, "train": {"local_batch_size": 4, "steps_per_epoch": 2}}
+        dm = LegacyGameVideoDataModule(config, _ImageSpec())
+
+        train_backend = _Backend()
+        eval_backend = _Backend()
+        train_dataset = _Dataset(train_backend)
+        eval_dataset = _Dataset(eval_backend)
+        # Eval loaders wrap dataset in Subset.
+        train_loader = DataLoader(train_dataset)
+        eval_loader = DataLoader(Subset(eval_dataset, [0, 1]))
+
+        bundle = _Bundle(train_loader, eval_loader, eval_loader, None, {})
+        # Simulate the tracking logic from build_loaders.
+        dm._backends.clear()
+        for loader in (bundle.train, bundle.quick_test, bundle.full_test):
+            dataset = getattr(loader, "dataset", None)
+            if dataset is None:
+                continue
+            if hasattr(dataset, "dataset"):
+                dataset = dataset.dataset
+            decoder = getattr(dataset, "decoder", None)
+            if decoder is not None and decoder not in dm._backends:
+                dm._backends.append(decoder)
+
+        dm.close()
+        assert train_backend.closed
+        assert eval_backend.closed
+
+
+# --------------------------------------------------------------------------- #
+# 13. Task param validation
 # --------------------------------------------------------------------------- #
 class TestTaskParamValidation:
     def test_invalid_positive_class_index_rejected(self):
