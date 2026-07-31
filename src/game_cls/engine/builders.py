@@ -21,6 +21,7 @@ class ExperimentComponents:
     trainable_selection: TrainableSelection
     model: Any
     image_spec: Any
+    data_module: Any = None
     evaluator: EvaluatorSuite | None = None
     load_report: Any = None
     # The following are built lazily by the runner because they depend on
@@ -56,6 +57,17 @@ def build_task(selector: Any, *, image_spec: Any, loss_config: Any) -> Any:
     return factory(selector, image_spec=image_spec, loss_config=loss_config)
 
 
+def _build_data_module(config: dict[str, Any], image_spec: Any) -> Any:
+    """Build the DataModule from config.
+
+    The default implementation wraps the legacy data pipeline. Future
+    configurations can select different DataModule implementations.
+    """
+    from ..data.module import LegacyGameVideoDataModule
+
+    return LegacyGameVideoDataModule(config, image_spec)
+
+
 def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     """Build the components that don't depend on dataloaders or resume state.
 
@@ -81,6 +93,10 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     task = build_task(task_selector, image_spec=image_spec, loss_config=config["loss"])
 
     trainable_policy = build_trainable_policy(_trainable_selector(config))
+
+    # Build the data module. The default implementation wraps the legacy
+    # data pipeline behind the DataModule interface.
+    data_module = _build_data_module(config, image_spec)
 
     # Model is built AFTER seed is set (by the caller), so initialization
     # is deterministic and reproducible across runs.
@@ -127,6 +143,7 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
         trainable_selection=selection,
         model=model,
         image_spec=image_spec,
+        data_module=data_module,
         evaluator=evaluator,
         load_report=load_report,
     )

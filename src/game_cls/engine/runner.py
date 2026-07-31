@@ -70,6 +70,7 @@ class ExperimentRunner:
             model=self.components.model,
             evaluator=self.components.evaluator,
             image_spec=self.components.image_spec,
+            data_module=self.components.data_module,
         )
 
     def run_train_step(self, batch: Any) -> Any:

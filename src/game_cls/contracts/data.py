@@ -142,3 +142,39 @@ class SamplingPolicy(Protocol):
     def load_state_dict(self, state: dict) -> None: ...
 
     def update_feedback(self, feedback: list[SamplingFeedback]) -> None: ...
+
+
+# --------------------------------------------------------------------------- #
+# DataModule
+# --------------------------------------------------------------------------- #
+@dataclass
+class LoaderBundle:
+    """The dataloaders and sampler for a training run."""
+    train: Any
+    quick_test: Any
+    full_test: Any
+    sampler: Any
+    data_summary: dict
+
+
+class DataModule(Protocol):
+    """Owns the data pipeline: indexing, backend, sampling, DataLoader.
+
+    The trainer talks to this facade and never branches on backend name or
+    sampling algorithm directly.
+    """
+
+    @property
+    def config(self) -> Any: ...
+
+    @property
+    def image_spec(self) -> Any: ...
+
+    def build_loaders(
+        self,
+        *,
+        runtime: Any,
+        state_mode: str = "full",
+    ) -> LoaderBundle:
+        """Build the dataloaders for a training run."""
+        ...

@@ -1293,6 +1293,7 @@ def _run_training_loop(
     model: Any = None,
     evaluator: Any = None,
     image_spec: Any = None,
+    data_module: Any = None,
 ) -> dict:
     import torch
 
@@ -1410,7 +1411,13 @@ def _run_training_loop(
                 f"Ratio={trainable_count / max(trainable_count + frozen_count, 1):.4%}"
             )
 
-        loaders = _make_dataloaders(config, rank, world_size)
+        # Build dataloaders through the DataModule interface when available.
+        # This allows the data pipeline to be swapped without modifying the
+        # training loop.
+        if data_module is not None:
+            loaders = data_module.build_loaders(runtime=runtime)
+        else:
+            loaders = _make_dataloaders(config, rank, world_size)
         if rank == 0:
             print("Data pipeline:", json.dumps(loaders.data_summary, ensure_ascii=False))
             train_workers = int(
