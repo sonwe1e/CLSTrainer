@@ -142,3 +142,22 @@ class NameTokenTrainablePolicy(TrainablePolicyBase):
                 f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
             )
         return 1.0
+
+
+def build_policy(**kwargs: Any) -> NameTokenTrainablePolicy:
+    """Factory function referenced by the V2 config migration.
+
+    The migration writes ``trainable.policy.factory =
+    game_cls.trainable.name_token:build_policy`` so that the policy can be
+    swapped without modifying the builder.
+    """
+    return NameTokenTrainablePolicy(
+        token=str(kwargs.get("token", "cls")),
+        case_sensitive=bool(kwargs.get("case_sensitive", True)),
+        freeze_trainable_batchnorm_stats=bool(
+            kwargs.get("freeze_trainable_batchnorm_stats", True)
+        ),
+        freeze_frozen_batchnorm_stats=bool(
+            kwargs.get("freeze_frozen_batchnorm_stats", True)
+        ),
+    )

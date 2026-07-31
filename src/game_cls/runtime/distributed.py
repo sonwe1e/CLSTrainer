@@ -119,12 +119,30 @@ class DdpDistributed:
     def barrier(self) -> None:
         import torch.distributed as dist
 
+        # Guard against a destroyed/uninitialized process group. If cleanup()
+        # has already been called (or setup() never succeeded), skip the
+        # collective rather than raising "process group has been destroyed".
+        if not dist.is_available() or not dist.is_initialized():
+            return
         dist.barrier()
 
     def all_reduce(self, tensor: Any, op: str = "sum") -> Any:
         import torch.distributed as dist
 
-        reduce_op = dist.ReduceOp.SUM if op == "sum" else dist.ReduceOp.from_str(op)  # type: ignore[attr-defined]
+        # Map string op names to ReduceOp enum members. ``ReduceOp`` has no
+        # ``from_str`` method, so we resolve the enum directly.
+        _OP_MAP = {
+            "sum": dist.ReduceOp.SUM,
+            "avg": dist.ReduceOp.AVG,
+            "min": dist.ReduceOp.MIN,
+            "max": dist.ReduceOp.MAX,
+            "product": dist.ReduceOp.PRODUCT,
+        }
+        reduce_op = _OP_MAP.get(op)
+        if reduce_op is None:
+            raise ValueError(
+                f"Unsupported all_reduce op: {op!r}. Supported: {sorted(_OP_MAP)}"
+            )
         dist.all_reduce(tensor, op=reduce_op)
         return tensor
 
@@ -132,6 +150,8 @@ class DdpDistributed:
         import torch.distributed as dist
 
         if self._world_size <= 1:
+            return [value]
+        if not dist.is_available() or not dist.is_initialized():
             return [value]
         results = [None for _ in range(self._world_size)] if self._rank == dst else None
         dist.gather_object(value, results, dst=dst)
@@ -143,6 +163,8 @@ class DdpDistributed:
         import torch.distributed as dist
 
         if self._world_size <= 1:
+            return
+        if not dist.is_available() or not dist.is_initialized():
             return
         dist.broadcast_object_list(object_list, src=src)
 

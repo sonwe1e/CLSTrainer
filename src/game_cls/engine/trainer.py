@@ -656,6 +656,10 @@ def _save_all_ranks(
     save_epoch, save_step = _normalized_position(
         epoch, step_in_epoch, int(config["train"]["steps_per_epoch"])
     )
+    # Rank 0 writes the checkpoint; other ranks wait. Capture any save error
+    # so we can broadcast it to all ranks and fail consistently instead of
+    # having rank 0 crash while other ranks proceed to the next step.
+    save_error: str | None = None
     if rank == 0:
         sampler_state = sampler.state_dict(save_step)
         sampler_state["epoch"] = save_epoch
@@ -675,27 +679,46 @@ def _save_all_ranks(
         manifest = trainable_selection.trainable_state if trainable_selection is not None else None
         policy_name = trainable_policy.policy_name if trainable_policy is not None else None
         policy_version = trainable_policy.state_version if trainable_policy is not None else None
-        save_checkpoint_pair(
-            output_dir / "checkpoints",
-            tag,
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            save_epoch,
-            global_step,
-            best_metrics,
-            config,
-            step_in_epoch=save_step,
-            sampler_state=sampler_state,
-            rank_random_states=states,
-            evaluation_state=evaluation_state,
-            state_mode=state_mode,
-            write_model_only=write_model_only,
-            trainable_state_manifest=manifest,
-            trainable_policy_name=policy_name,
-            trainable_policy_version=policy_version,
-        )
+        try:
+            save_checkpoint_pair(
+                output_dir / "checkpoints",
+                tag,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                save_epoch,
+                global_step,
+                best_metrics,
+                config,
+                step_in_epoch=save_step,
+                sampler_state=sampler_state,
+                rank_random_states=states,
+                evaluation_state=evaluation_state,
+                state_mode=state_mode,
+                write_model_only=write_model_only,
+                trainable_state_manifest=manifest,
+                trainable_policy_name=policy_name,
+                trainable_policy_version=policy_version,
+            )
+        except Exception as exc:
+            save_error = repr(exc)
+    # Broadcast the save result so all ranks agree on success/failure, then
+    # barrier so no rank proceeds to mutate model state until the file is
+    # fully written to disk. In single-process mode there is nothing to
+    # broadcast — rank 0 is the only rank.
+    payload = [save_error]
+    if runtime is not None:
+        runtime.distributed.broadcast_object_list(payload, src=0)
+        runtime.barrier()
+    else:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast_object_list(payload, src=0)
+            dist.barrier()
+    if payload[0] is not None:
+        raise RuntimeError(f"Checkpoint save failed on rank 0: {payload[0]}")
 
 
 def _selection_score(metrics: dict, evaluation_config: dict) -> tuple[float, bool]:

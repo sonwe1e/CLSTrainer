@@ -172,9 +172,8 @@ class _DecisionSelector(_PluginSelector):
     pass
 
 
-class _SuiteSelector(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: str
+class _SuiteSelector(_PluginSelector):
+    factory: str = ""
 
 
 # ----------------------------------------------------------------------- #
@@ -222,6 +221,7 @@ class _EvaluationConfig(BaseModel):
     quick_test_every_steps: int = Field(default=0, ge=0)
     full_test_every_steps: int = Field(default=0, ge=0)
     full_test_at_end: bool = True
+    save_all_errors: bool = False
     html_max_errors_per_group: int = Field(default=200, ge=1)
 
 
@@ -324,26 +324,6 @@ class _CheckpointSection(BaseModel):
     save_best_selection: bool = True
     periodic_state_mode: str = "full"
     full_model_every_steps: int = Field(default=0, ge=0)
-
-
-class _EvaluationLegacySection(BaseModel):
-    """Legacy flat evaluation keys (threshold, amp, selection_metric, ...)."""
-    model_config = ConfigDict(extra="forbid")
-    threshold: float = Field(default=0.99, ge=0.0, le=1.0)
-    amp: bool = False
-    amp_dtype: str = "bfloat16"
-    full_auc_mode: str = "histogram"
-    auc_histogram_bins: int = Field(default=4096, ge=1)
-    quick_save_error_limit: int = Field(default=200, ge=0)
-    quick_test_pairs_per_video: int = Field(default=128, ge=1)
-    parquet_row_group_size: int = Field(default=4096, ge=1)
-    selection_metric: str = "global_f1_tau099"
-    minimum_worst_game_f1: float | None = None
-    selection_weights: dict[str, float] = Field(default_factory=dict)
-    quick_test_every_steps: int = Field(default=0, ge=0)
-    full_test_every_steps: int = Field(default=0, ge=0)
-    full_test_at_end: bool = True
-    html_max_errors_per_group: int = Field(default=200, ge=1)
 
 
 class ExperimentConfig(BaseModel):

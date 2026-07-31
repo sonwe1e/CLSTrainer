@@ -71,9 +71,24 @@ def build_task(selector: Any, *, image_spec: Any, loss_config: Any) -> Any:
 def _build_data_module(config: dict[str, Any], image_spec: Any) -> Any:
     """Build the DataModule from config.
 
-    The default implementation wraps the legacy data pipeline. Future
-    configurations can select different DataModule implementations.
+    Uses the ``data.module_factory`` selector (if present) to dynamically
+    resolve the DataModule implementation, falling back to the default
+    :class:`LegacyGameVideoDataModule`. This allows the data pipeline to be
+    swapped without modifying the builder.
     """
+    from ..registry import import_from_path
+
+    data_cfg = config.get("data", {})
+    factory_path = str(data_cfg.get("module_factory", ""))
+    if factory_path:
+        try:
+            factory = import_from_path(factory_path)
+            return factory(config, image_spec)
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                f"Failed to import DataModule factory {factory_path!r}: {exc}"
+            ) from exc
+
     from ..data.module import LegacyGameVideoDataModule
 
     return LegacyGameVideoDataModule(config, image_spec)

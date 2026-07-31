@@ -81,8 +81,9 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
         all_names = list(dict.fromkeys(name for name, _ in model.named_parameters()))
         frozen_names = [name for name in all_names if name not in trainable_set]
 
-        # Classify persistent buffers. The model may declare buffer_names in a
-        # group; otherwise we infer from the buffer's owning module.
+        # Classify persistent buffers by inferring ownership from the buffer's
+        # owning module: a buffer is trainable iff its parent module contains
+        # at least one trainable parameter.
         parameter_name_set = set(dict(model.named_parameters()))
         try:
             persistent_buffer_names = set(
@@ -129,10 +130,19 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
             name.rsplit(".", 1)[0] if "." in name else name
             for name in trainable_param_names
         }
+        from torch import nn
+
         model.eval()
         for module_name, module in model.named_modules():
             if module_name in trainable_module_names:
                 module.train()
+        # Apply BatchNorm freezing consistent with NameToken/Regex policies.
+        # ModelDeclaredPolicy has no constructor flags for these (the model
+        # declares its own groups), so we default to freezing all BatchNorm
+        # stats — the safest behavior for a frozen backbone.
+        for module_name, module in model.named_modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
 
     def validate_loaded_state(
         self, model: Any, load_report: Any, selection: TrainableSelection

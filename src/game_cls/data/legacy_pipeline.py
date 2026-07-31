@@ -365,15 +365,17 @@ def build_legacy_loader_bundle(
         key: policy_params[key] if key in policy_params else sampler_cfg.get(key)
         for key in ("game_alpha", "class_probability", "deduplicate_within_global_batch")
     }
-    # Use the SamplingPolicy interface instead of directly constructing
-    # VideoBalancedPairBatchSampler. The policy wraps the algorithm and
-    # exposes the BatchSampler protocol (__iter__, __len__, set_epoch,
-    # state_dict, load_state_dict) so the DataLoader sees a single object.
+    # Use the SamplingPolicy interface (USERPLAN §11 D3). The policy wraps
+    # the sampling algorithm; PolicyBatchSampler adapts it to PyTorch's
+    # BatchSampler protocol so the DataLoader sees a single object. This lets
+    # new sampling algorithms be added by implementing the policy protocol —
+    # the training loop and DataModule never branch on the algorithm name.
+    from game_cls.data.policy_batch_sampler import PolicyBatchSampler
     from game_cls.data.sampling.balanced_game_label_delta import (
         BalancedGameLabelDeltaPolicy,
     )
 
-    sampler = BalancedGameLabelDeltaPolicy.from_config(
+    sampling_policy = BalancedGameLabelDeltaPolicy.from_config(
         train_videos,
         batch_size,
         steps_per_epoch,
@@ -391,6 +393,15 @@ def build_legacy_loader_bundle(
         deduplicate_within_global_batch=resolved_params.get(
             "deduplicate_within_global_batch", True
         ),
+    )
+    # Wrap the policy in PolicyBatchSampler so the DataLoader depends only on
+    # the BatchSampler protocol, not on the concrete policy type. The wrapper
+    # delegates to the policy's own __iter__/__len__ when available (preserving
+    # exact-resume semantics).
+    sampler = PolicyBatchSampler(
+        policy=sampling_policy,
+        catalog=None,  # BalancedGameLabelDeltaPolicy uses its own index
+        steps_per_epoch=steps_per_epoch,
     )
     quick_dataset = build_eval_dataset(
         test_videos,

@@ -15,8 +15,8 @@ def cross_validate(config: dict[str, Any]) -> None:
     distributed_type = str(distributed.get("type", "single_process"))
 
     threshold = _decision_threshold(config)
-    if threshold is not None and not (0.0 < threshold < 1.0):
-        raise ValueError(f"evaluation.decision.threshold must be in (0,1), got {threshold}")
+    if threshold is not None and not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"evaluation.decision.threshold must be in [0,1], got {threshold}")
 
     if distributed_type == "ddp":
         import os

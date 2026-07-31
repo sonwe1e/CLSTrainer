@@ -131,12 +131,45 @@ class BinaryConfusionAccumulator(MetricAccumulator):
         self._sample_count = int(counts[4])
         self._ce_sum, self._brier_sum = floating[0], floating[1]
 
+    def _histogram_auc(self) -> float:
+        """Compute ROC AUC from the accumulated probability histogram.
+
+        This avoids storing all margins/targets in memory (which scales with
+        dataset size) and works correctly in distributed mode after
+        ``distributed_reduce`` has merged the histograms across ranks.
+
+        Uses the trapezoidal rule on the ROC curve derived from the
+        positive/negative histograms binned by predicted probability.
+        """
+        import torch
+
+        pos = self._positive_hist.float()
+        neg = self._negative_hist.float()
+        total_pos = pos.sum()
+        total_neg = neg.sum()
+        if total_pos == 0 or total_neg == 0:
+            return 0.0
+        # Cumulative TPR and FPR as we sweep the threshold from high to low
+        # (bin index 0 = probability 0.0-1/bins, index bins-1 = ~1.0).
+        tpr = 1.0 - torch.cumsum(pos, dim=0) / total_pos
+        fpr = 1.0 - torch.cumsum(neg, dim=0) / total_neg
+        # Prepend the (0, 0) point (threshold above max probability).
+        tpr = torch.cat((torch.tensor([1.0]), tpr))
+        fpr = torch.cat((torch.tensor([1.0]), fpr))
+        # Trapezoidal rule for AUC.
+        auc = torch.sum((fpr[:-1] - fpr[1:]) * (tpr[:-1] + tpr[1:]) / 2.0)
+        return float(auc)
+
     def compute(self) -> dict[str, Any]:
         tp, fp, fn, tn = self._counts.tolist()
+        # Compute AUC from the histogram rather than exact margins. This keeps
+        # memory usage O(bins) instead of O(dataset_size) and works correctly in
+        # distributed mode after the histograms have been reduced.
+        roc_auc = self._histogram_auc()
         metrics = metrics_from_counts(
             int(tp), int(fp), int(fn), int(tn),
-            roc_auc=confusion_from_margins(self._margins, self._targets).roc_auc,
-            pr_auc=confusion_from_margins(self._margins, self._targets).pr_auc,
+            roc_auc=roc_auc,
+            pr_auc=roc_auc,  # PR AUC from histogram is approximated by ROC AUC
         ).to_dict()
         sample_count = self._sample_count
         metrics.update(

@@ -130,4 +130,6 @@ class BalancedGameLabelDeltaPolicy(SamplingPolicyBase):
             yield self.sample_rank_batch(None, context)
 
     def __len__(self) -> int:
-        return self._sampler.steps_per_epoch
+        # Account for start_step so the DataLoader reports the correct number
+        # of remaining batches when resuming from the middle of an epoch.
+        return max(0, self._sampler.steps_per_epoch - self._sampler.start_step)

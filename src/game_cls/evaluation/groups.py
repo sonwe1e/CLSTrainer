@@ -61,8 +61,66 @@ class BinaryGroupAggregator(GroupAggregator):
             conf["max"] = max(conf["max"], probabilities[index])
 
     def distributed_reduce(self, runtime: Any) -> None:
-        # Group aggregation merges gathered dicts on rank 0 in compute().
-        del runtime
+        """Gather group dicts from all ranks and merge on rank 0.
+
+        Without this, rank 0 would only see its own group metrics in
+        distributed mode. After this call on rank 0, ``self._game`` /
+        ``self._game_label`` / ``self._video`` / ``self._video_confidence``
+        contain the merged data from all ranks.
+        """
+        dist = runtime.distributed
+        if dist.world_size <= 1:
+            return
+
+        # Gather local dicts to rank 0.
+        local_data = {
+            "game": self._game,
+            "game_label": {f"{k[0]}|{k[1]}": v for k, v in self._game_label.items()},
+            "video": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in self._video.items()},
+            "video_confidence": {
+                f"{k[0]}|{k[1]}|{k[2]}": v for k, v in self._video_confidence.items()
+            },
+        }
+        gathered = dist.gather_object(local_data, dst=0)
+
+        if dist.rank != 0:
+            return
+
+        # Merge gathered dicts from all ranks.
+        self._game = {}
+        self._game_label = {}
+        self._video = {}
+        self._video_confidence = {}
+
+        for rank_data in gathered:
+            if rank_data is None:
+                continue
+            for key, value in rank_data["game"].items():
+                self._game.setdefault(key, [0, 0, 0, 0])
+                for i in range(4):
+                    self._game[key][i] += value[i]
+            for key, value in rank_data["game_label"].items():
+                parts = key.split("|", 1)
+                k = (parts[0], int(parts[1]))
+                self._game_label.setdefault(k, [0, 0, 0, 0])
+                for i in range(4):
+                    self._game_label[k][i] += value[i]
+            for key, value in rank_data["video"].items():
+                parts = key.split("|", 2)
+                k = (parts[0], int(parts[1]), parts[2])
+                self._video.setdefault(k, [0, 0, 0, 0])
+                for i in range(4):
+                    self._video[k][i] += value[i]
+            for key, value in rank_data["video_confidence"].items():
+                parts = key.split("|", 2)
+                k = (parts[0], int(parts[1]), parts[2])
+                existing = self._video_confidence.setdefault(
+                    k, {"count": 0, "sum": 0.0, "min": 1.0, "max": 0.0}
+                )
+                existing["count"] += value["count"]
+                existing["sum"] += value["sum"]
+                existing["min"] = min(existing["min"], value["min"])
+                existing["max"] = max(existing["max"], value["max"])
 
     def compute(self) -> dict[str, Any]:
         by_game = []

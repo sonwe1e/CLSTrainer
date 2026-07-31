@@ -34,7 +34,10 @@ def load_and_validate_config(
     migrated = migrate_to_latest(raw)
     overridden = apply_overrides(migrated, overrides or [])
     config = validate_and_normalize_config(overridden)
-    cross_validate(overridden)
+    # Cross-validate against the validated/normalized config so that type
+    # coercion and default-filling applied by Pydantic are reflected in the
+    # cross-field checks (e.g. threshold range, DDP/WORLD_SIZE consistency).
+    cross_validate(config.model_dump())
     return config
 
 
@@ -94,6 +97,22 @@ def legacy_runtime_view(config: dict[str, Any]) -> dict[str, Any]:
         decision_params = decision.get("params") or {}
         if "threshold" in decision_params:
             legacy["evaluation"]["threshold"] = decision_params["threshold"]
+
+    # sampler.policy.params.* → sampler.* (flatten V2 selector params so the
+    # legacy pipeline can read ``sampler.game_alpha`` etc. without branching
+    # on config version). V2 selector takes precedence: if a key exists in
+    # both the V2 selector and the legacy flat fields, the V2 value wins.
+    sampler = legacy.get("sampler", {})
+    policy = sampler.get("policy", {})
+    if isinstance(policy, dict):
+        policy_params = policy.get("params") or {}
+        for key in (
+            "game_alpha",
+            "class_probability",
+            "deduplicate_within_global_batch",
+        ):
+            if key in policy_params:
+                sampler[key] = policy_params[key]
 
     return legacy
 

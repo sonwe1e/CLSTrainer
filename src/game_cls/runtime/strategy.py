@@ -36,7 +36,16 @@ class ComposedRuntimeStrategy:
         # The distributed adapter initializes its process group here (e.g.
         # ``dist.init_process_group`` for DDP). The adapter falls back to its
         # own configured backend when ``None`` is passed.
-        self._distributed.setup(None)
+        try:
+            self._distributed.setup(None)
+        except Exception:
+            # distributed.setup failed (e.g. init_process_group raised). The
+            # accelerator is already set up, so mark the strategy as setup
+            # anyway so that cleanup() will tear down both halves. Without
+            # this, cleanup() would early-return and leak the accelerator state
+            # (and any partial process-group state).
+            self._is_setup = True
+            raise
         self._is_setup = True
 
     def wrap_model(self, model: Any) -> Any:

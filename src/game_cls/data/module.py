@@ -43,16 +43,20 @@ class LegacyGameVideoDataModule:
         """
         from .legacy_pipeline import build_legacy_loader_bundle
 
-        # Clear any previously tracked backends (e.g. on rebuild).
-        self._backends.clear()
+        # Close any previously tracked backends (e.g. on rebuild) before
+        # clearing references. Using close() ensures memmaps and file
+        # descriptors are released rather than leaked.
+        self.close()
         bundle = build_legacy_loader_bundle(
             self._config, self._image_spec, runtime
         )
         # Track backends for cleanup. The datasets hold references to the
         # backends; we collect them here so we can close memmaps/file
         # descriptors when training finishes.
-        # NOTE: eval DataLoaders wrap their dataset in a torch.utils.data.Subset,
-        # so we must unwrap Subset to reach the underlying dataset's decoder.
+        # NOTE: in the synthetic path, eval DataLoaders wrap their dataset in a
+        # torch.utils.data.Subset, so we unwrap Subset (if present) to reach
+        # the underlying dataset's decoder. In the production path the datasets
+        # are not wrapped, so the unwrap is a no-op.
         for loader in (bundle.train, bundle.quick_test, bundle.full_test):
             dataset = getattr(loader, "dataset", None)
             if dataset is None:
@@ -73,3 +77,15 @@ class LegacyGameVideoDataModule:
             except Exception:
                 pass
         self._backends.clear()
+
+
+def build_game_video_pair_data_module(config: Any, image_spec: Any) -> LegacyGameVideoDataModule:
+    """Factory function referenced by the V2 config migration.
+
+    The migration writes ``data.module_factory =
+    game_cls.data.module:build_game_video_pair_data_module`` so that the
+    DataModule can be swapped without modifying the builder. This factory
+    returns the default :class:`LegacyGameVideoDataModule` that wraps the
+    existing legacy data pipeline.
+    """
+    return LegacyGameVideoDataModule(config, image_spec)
