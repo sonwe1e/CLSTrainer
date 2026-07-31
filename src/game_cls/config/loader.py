@@ -73,13 +73,17 @@ def _collect_dotted_keys(config: dict[str, Any], prefix: str = "") -> set[str]:
     return keys
 
 
-def load_config(
-    path: str | Path, overrides: list[str] | None = None
-) -> dict[str, Any]:
+def load_config(path: str | Path) -> dict[str, Any]:
+    """Read a YAML config file, resolving any ``base`` inheritance.
+
+    This function does **not** apply overrides — callers that need overrides
+    should use :func:`apply_overrides` separately (typically *after* V1→V2
+    migration so that users can override the new component-selector fields).
+    """
     config_path = Path(path).resolve()
     raw = _yaml().safe_load(config_path.read_text(encoding="utf-8")) or {}
     base_name = raw.pop("base", None)
     if base_name:
         base = load_config(config_path.parent / base_name)
         raw = deep_merge(base, raw)
-    return apply_overrides(raw, overrides or [])
+    return raw

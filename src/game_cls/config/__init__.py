@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .loader import deep_merge, load_config
+from .loader import apply_overrides, deep_merge, load_config
 from .migrations import migrate_to_latest
 from .plugin_validation import cross_validate
 from .schema import (
@@ -15,22 +15,26 @@ from .schema import (
 def load_and_validate_config(
     path: str, overrides: list[str] | None = None
 ) -> ExperimentConfig:
-    """Production entry point: load → migrate → validate → cross-validate.
+    """Production entry point: load → migrate → override → validate.
 
     This is the *only* config loader that should be used by training entry
     points. It runs the full V2 pipeline:
 
-    1. :func:`load_config` reads YAML + applies overrides.
+    1. :func:`load_config` reads YAML (without applying overrides yet).
     2. :func:`migrate_to_latest` normalizes V1 configs to V2.
-    3. :func:`validate_and_normalize_config` validates against the Pydantic
+    3. Overrides are applied **after** migration so that users can override
+       the new component-selector fields (e.g. ``task.params.positive_class_index``,
+       ``runtime.distributed.params.broadcast_buffers``).
+    4. :func:`validate_and_normalize_config` validates against the Pydantic
        schema and rejects unknown component-selector keys.
-    4. :func:`cross_validate` runs cross-field checks (threshold range,
+    5. :func:`cross_validate` runs cross-field checks (threshold range,
        DDP/WORLD_SIZE consistency).
     """
-    raw = load_config(path, overrides)
+    raw = load_config(path)
     migrated = migrate_to_latest(raw)
-    config = validate_and_normalize_config(migrated)
-    cross_validate(migrated)
+    overridden = apply_overrides(migrated, overrides or [])
+    config = validate_and_normalize_config(overridden)
+    cross_validate(overridden)
     return config
 
 

@@ -33,14 +33,22 @@ def test_unknown_selector_key_rejected() -> None:
         validate_and_normalize_config(bad)
 
 
-def test_unknown_key_inside_params_tolerated_at_top_level() -> None:
-    """Plugin ``params`` are open dicts at the top level; per-plugin validation
-    happens at build time (USERPLAN §8.2). The top-level schema only enforces
-    the selector keys (type/factory/params)."""
+def test_unknown_key_inside_params_rejected() -> None:
+    """Plugin ``params`` are validated against per-plugin Pydantic models, so a
+    typo like ``threshhold`` (instead of ``threshold``) fails fast
+    (USERPLAN §8.4)."""
     config = _v2_config()
-    config["evaluation"]["decision"]["params"]["threshhold"] = 0.5  # typo, but inside params
-    cfg = validate_and_normalize_config(config)
-    assert cfg.evaluation.decision.type == "threshold"
+    config["evaluation"]["decision"]["params"]["threshhold"] = 0.5  # typo
+    with pytest.raises(ValidationError, match="threshhold"):
+        validate_and_normalize_config(config)
+
+
+def test_out_of_range_param_rejected() -> None:
+    """Numeric params are validated against their declared ranges."""
+    config = _v2_config()
+    config["evaluation"]["decision"]["params"]["threshold"] = 1.5  # must be < 1
+    with pytest.raises(ValidationError):
+        validate_and_normalize_config(config)
 
 
 def test_legacy_top_level_key_tolerated() -> None:

@@ -91,6 +91,11 @@ class DdpDistributed:
     def wrap_model(self, model: Any, device: Any) -> Any:
         from torch.nn.parallel import DistributedDataParallel
 
+        # Move the model to the target device *before* wrapping it in DDP.
+        # DDP does not move parameters itself; passing a model that lives on
+        # the wrong device would raise a "model parameters are not on device"
+        # error at the first forward/backward pass.
+        model = model.to(device)
         return DistributedDataParallel(
             model,
             device_ids=[self._local_rank],
@@ -118,7 +123,16 @@ class DdpDistributed:
             return [value]
         results = [None for _ in range(self._world_size)] if self._rank == dst else None
         dist.gather_object(value, results, dst=dst)
+        # ``results`` is ``None`` on non-dst ranks; return an empty list so
+        # callers can treat the return value uniformly.
         return results if results is not None else []
+
+    def broadcast_object_list(self, object_list: list[Any], src: int = 0) -> None:
+        import torch.distributed as dist
+
+        if self._world_size <= 1:
+            return
+        dist.broadcast_object_list(object_list, src=src)
 
     def cleanup(self) -> None:
         import torch.distributed as dist

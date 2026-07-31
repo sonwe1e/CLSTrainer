@@ -699,9 +699,10 @@ def _gather_random_states_via_runtime(runtime: Any) -> list[dict] | None:
     dist = runtime.distributed
     if dist.world_size <= 1:
         return [local]
-    gathered = [None for _ in range(dist.world_size)] if dist.rank == 0 else None
-    dist.gather_object(local, dst=0)
-    return gathered
+    # The adapter's gather_object returns the gathered list on the dst rank
+    # and an empty list on other ranks. Capture the return value — the
+    # pre-allocated list would otherwise still hold ``None`` placeholders.
+    return dist.gather_object(local, dst=0)
 
 
 def _normalized_position(
@@ -946,6 +947,158 @@ def _run_evaluation(
     return result
 
 
+def _run_evaluation_via_suite(
+    *,
+    kind: str,
+    model,
+    dataloader,
+    device,
+    config: dict,
+    output_dir: Path,
+    global_step: int,
+    rank: int,
+    world_size: int,
+    evaluator: Any,
+    task: Any,
+    runtime: Any,
+) -> EvaluationOutput:
+    """Run evaluation through the EvaluatorSuite interface.
+
+    This is the migration path for the new evaluator component. The default
+    impl is :class:`LegacyEvaluatorSuite` which wraps the battle-tested
+    ``evaluate`` function (USERPLAN §10 E1).
+    """
+    from game_cls.contracts.task import StepContext
+
+    report_dir = output_dir / "reports" / f"{kind}_step_{global_step:08d}"
+    prepare_evaluation_directory(report_dir, rank)
+    if runtime is not None:
+        runtime.barrier()
+    else:
+        distributed_barrier()
+
+    context = StepContext(
+        global_step=global_step,
+        total_steps=global_step,
+        epoch=0,
+        device=device,
+        use_amp=bool(config["evaluation"].get("amp", config["device"].get("amp", False))),
+        amp_dtype=str(config["evaluation"].get("amp_dtype", config["device"].get("amp_dtype", "bfloat16"))),
+    )
+    suite_result = evaluator.evaluate(
+        model,
+        dataloader,
+        runtime,
+        task,
+        context,
+        checkpoint_step=global_step,
+        evaluation_kind=kind,
+        output_dir=report_dir,
+    )
+    if runtime is not None:
+        runtime.barrier()
+    else:
+        distributed_barrier()
+
+    # Build an EvaluationOutput-compatible result and write the merged
+    # report files (metrics.json, errors.html, etc.) on rank 0.
+    metrics = None
+    grouped_metrics = None
+    near_threshold = getattr(suite_result, "near_threshold", [])
+    if rank == 0 or world_size <= 1:
+        metrics = dict(suite_result.metrics or {})
+        grouped_metrics = dict(suite_result.grouped_metrics or {})
+        metrics.update(
+            {
+                "evaluation_kind": kind,
+                "evaluation_role": "observed_dev_test",
+                "checkpoint_step": global_step,
+                "evaluation_amp": bool(
+                    config["evaluation"].get("amp", config["device"].get("amp", False))
+                ),
+                "evaluation_amp_dtype": str(
+                    config["evaluation"].get("amp_dtype", config["device"].get("amp_dtype", "bfloat16"))
+                ),
+            }
+        )
+        _annotate_selection(metrics, config["evaluation"])
+        write_evaluation_report(
+            report_dir,
+            metrics,
+            grouped_metrics,
+            merge_shards=True,
+            lightweight=kind == "quick",
+            html_max_errors=int(
+                config["evaluation"].get("html_max_errors_per_group", 200)
+            ),
+            preview_decoder=getattr(
+                getattr(dataloader, "dataset", None), "decoder", None
+            ),
+        )
+
+    if runtime is not None:
+        runtime.barrier()
+    else:
+        distributed_barrier()
+
+    return EvaluationOutput(
+        metrics=metrics,
+        grouped_metrics=grouped_metrics,
+        errors=[],
+        near_threshold=near_threshold,
+    )
+
+
+def _dispatch_evaluation(
+    *,
+    kind: str,
+    model,
+    dataloader,
+    device,
+    config: dict,
+    output_dir: Path,
+    global_step: int,
+    rank: int,
+    world_size: int,
+    task: Any = None,
+    evaluator: Any = None,
+    runtime: Any = None,
+) -> EvaluationOutput:
+    """Dispatch to the EvaluatorSuite path when an evaluator is provided.
+
+    During the migration, the runner builds an ``EvaluatorSuite`` (by default
+    :class:`LegacyEvaluatorSuite`). When that component is present we route
+    evaluation through it; otherwise we fall back to the legacy standalone
+    ``_run_evaluation`` so the loop still works as a standalone entry point.
+    """
+    if evaluator is not None and task is not None:
+        return _run_evaluation_via_suite(
+            kind=kind,
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            config=config,
+            output_dir=output_dir,
+            global_step=global_step,
+            rank=rank,
+            world_size=world_size,
+            evaluator=evaluator,
+            task=task,
+            runtime=runtime,
+        )
+    return _run_evaluation(
+        kind=kind,
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        config=config,
+        output_dir=output_dir,
+        global_step=global_step,
+        rank=rank,
+        world_size=world_size,
+    )
+
+
 def run_training(config: dict[str, Any]) -> dict:
     """Compatibility entry point (USERPLAN §9.4).
 
@@ -974,31 +1127,16 @@ def _run_training_loop_legacy(config: dict[str, Any]) -> dict:
 
 
 def _build_components_for_runner(config: dict[str, Any]) -> Any:
-    """Build the task and runtime components the runner needs."""
-    from game_cls.data.image_spec import ImageSpec
+    """Build the task and runtime components the runner needs.
 
-    from .builders import ExperimentComponents
-    from .runner import ExperimentRunner  # noqa: F401
+    This is the compatibility entry point used by ``run_training()``. It
+    delegates to :func:`build_core_components` so the same component graph
+    (task, trainable policy, model, evaluator, runtime) is built here as in
+    the runner path.
+    """
+    from .builders import build_core_components
 
-    image_spec = ImageSpec.from_config(config["data"])
-    from game_cls.tasks.dual_frame_binary import DualFrameBinaryTask
-
-    task = DualFrameBinaryTask(image_spec=image_spec, loss_config=config["loss"])
-    runtime = _build_runtime(config)
-
-    class _Cfg:
-        pass
-
-    cfg = _Cfg()
-    return ExperimentComponents(
-        config=cfg,
-        raw_config=config,
-        runtime=runtime,
-        task=task,
-        trainable_policy=_build_trainable_policy(config),
-        model=None,
-        image_spec=image_spec,
-    )
+    return build_core_components(config)
 
 
 def _build_runtime(config: dict[str, Any]) -> Any:
@@ -1042,20 +1180,39 @@ def _build_trainable_policy(config: dict[str, Any]) -> Any:
     return build_trainable_policy(sel)
 
 
+def _trainable_selector_from_config(config: dict[str, Any]) -> Any:
+    """Build a trainable-policy selector namespace from a raw config dict.
+
+    This is the standalone-entrypoint version of the selector builder in
+    ``builders._trainable_selector`` so the loop can build a policy when it
+    was not supplied by the runner.
+    """
+    trainable_cfg = config.get("trainable", {})
+    policy = trainable_cfg.get("policy", {})
+
+    class _Sel:
+        pass
+
+    sel = _Sel()
+    sel.type = policy.get("type", "name_token")
+    sel.factory = policy.get("factory", "")
+    sel.params = dict(policy.get("params", {}) or {})
+    return sel
+
+
 def _run_training_loop(
-    config: dict[str, Any], *, runtime: Any = None
+    config: dict[str, Any],
+    *,
+    runtime: Any = None,
+    task: Any = None,
+    trainable_policy: Any = None,
+    model: Any = None,
+    evaluator: Any = None,
+    image_spec: Any = None,
 ) -> dict:
     import torch
 
     validate_training_config(config)
-    image_spec = ImageSpec.from_config(config["data"])
-    from game_cls.tasks.dual_frame_binary import DualFrameBinaryTask
-
-    task = DualFrameBinaryTask(
-        image_spec=image_spec,
-        loss_config=config["loss"],
-        task_config=None,
-    )
 
     # When a runtime is supplied (from the runner's component graph) we use it
     # directly; otherwise we fall back to the legacy ``initialize_runtime``
@@ -1078,19 +1235,37 @@ def _run_training_loop(
                 json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
-        model = build_model(config["model"])
+        # Use the components supplied by the runner when present. The runner
+        # builds the configured task, trainable policy, model and evaluator;
+        # the loop must not rebuild them from scratch, or the configuration
+        # (e.g. ``task.type=...``, ``trainable.policy.type=...``) would be
+        # silently ignored (USERPLAN §9 R1–R3).
+        if image_spec is None:
+            image_spec = ImageSpec.from_config(config["data"])
+        if task is None:
+            from game_cls.tasks.dual_frame_binary import DualFrameBinaryTask
+
+            task = DualFrameBinaryTask(
+                image_spec=image_spec,
+                loss_config=config["loss"],
+                task_config=None,
+            )
+        if trainable_policy is None:
+            from game_cls.trainable.build import build_trainable_policy
+
+            trainable_policy = build_trainable_policy(_trainable_selector_from_config(config))
+
+        resolved_model = model
+        if resolved_model is None:
+            resolved_model = build_model(config["model"])
         checkpoint_path = config["model"].get("checkpoint_path")
         if checkpoint_path:
-            report = load_model_checkpoint(model, checkpoint_path)
+            report = load_model_checkpoint(resolved_model, checkpoint_path)
             if not config["data"].get("synthetic", False) and config["model"].get(
                 "require_pretrained_backbone", True
             ):
-                coverage = validate_production_load(
-                    model,
-                    report,
-                    trainable_name_contains=config["model"].get(
-                        "trainable_name_contains", "cls"
-                    ),
+                coverage = trainable_policy.validate_loaded_state(
+                    resolved_model, report, trainable_policy.select(resolved_model)
                 )
             else:
                 coverage = None
@@ -1101,32 +1276,38 @@ def _run_training_loop(
                 print(f"Missing: {report.missing}")
                 print(f"Unexpected: {report.unexpected}")
                 print(f"Shape mismatch: {report.shape_mismatch}")
-        summary = configure_trainable_parameters(
-            model, config["model"].get("trainable_name_contains", "cls")
-        )
-        _set_train_mode(model, config["model"])
+        selection = trainable_policy.select(resolved_model)
+        trainable_policy.configure_module_modes(resolved_model, selection)
         if runtime is None:
-            model.to(device)
+            resolved_model.to(device)
             if world_size > 1:
                 from torch.nn.parallel import DistributedDataParallel
 
-                model = DistributedDataParallel(
-                    model,
+                resolved_model = DistributedDataParallel(
+                    resolved_model,
                     device_ids=[local_rank],
                     find_unused_parameters=False,
                     broadcast_buffers=False,
                     gradient_as_bucket_view=True,
                 )
         else:
-            model = runtime.wrap_model(model)
+            resolved_model = runtime.wrap_model(resolved_model)
         frozen_snapshot = None
         if rank == 0:
+            trainable_names = list(selection.trainable_state.parameter_keys)
+            frozen_names = list(selection.frozen_state.parameter_keys)
+            trainable_count = sum(
+                p.numel() for p in resolved_model.parameters() if p.requires_grad
+            )
+            frozen_count = sum(
+                p.numel() for p in resolved_model.parameters() if not p.requires_grad
+            )
             print("Trainable parameters:")
-            for name in summary.trainable_names:
+            for name in trainable_names:
                 print(f"  {name}")
             print(
-                f"Trainable={summary.trainable_count:,} Frozen={summary.frozen_count:,} "
-                f"Ratio={summary.trainable_ratio:.4%}"
+                f"Trainable={trainable_count:,} Frozen={frozen_count:,} "
+                f"Ratio={trainable_count / max(trainable_count + frozen_count, 1):.4%}"
             )
 
         loaders = _make_dataloaders(config, rank, world_size)
@@ -1170,7 +1351,7 @@ def _run_training_loop(
         )
         optimizer = torch.optim.AdamW(
             build_optimizer_parameter_groups(
-                model, float(config["optimizer"]["weight_decay"])
+                resolved_model, float(config["optimizer"]["weight_decay"])
             ),
             lr=config["optimizer"]["learning_rate"],
         )
@@ -1197,7 +1378,7 @@ def _run_training_loop(
         if resume_path:
             checkpoint = restore_training_checkpoint(
                 resume_path,
-                model,
+                resolved_model,
                 optimizer,
                 scheduler,
                 scaler,
@@ -1232,7 +1413,7 @@ def _run_training_loop(
                 f"Resume step {global_step} is not below target max step {total_steps}"
             )
         if config["train"].get("verify_frozen_parameters", False):
-            frozen_snapshot = snapshot_frozen_parameters(model)
+            frozen_snapshot = snapshot_frozen_parameters(resolved_model)
         stop_after_steps = train_cfg.get("stop_after_steps")
         run_until_step = (
             min(total_steps, int(stop_after_steps))
@@ -1273,7 +1454,7 @@ def _run_training_loop(
             )
         while global_step < run_until_step:
             loaders.sampler.set_epoch(epoch, start_step=step_in_epoch)
-            _set_train_mode(model, config["model"])
+            trainable_policy.configure_module_modes(resolved_model, selection)
             yielded = False
             for batch in loaders.train:
                 yielded = True
@@ -1315,7 +1496,7 @@ def _run_training_loop(
                     )
                 )
                 with autocast_ctx:
-                    task_output = task.forward(model, device_batch, context)
+                    task_output = task.forward(resolved_model, device_batch, context)
                     loss_output = task.compute_loss(task_output, device_batch, context)
                 timing["host_forward_enqueue"] += (
                     time.perf_counter() - forward_started
@@ -1324,7 +1505,7 @@ def _run_training_loop(
                 scaler.scale(loss_output.total).backward()
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
+                    [p for p in resolved_model.parameters() if p.requires_grad],
                     train_cfg.get("gradient_clip_norm", 5.0),
                 )
                 timing["host_backward_enqueue"] += (
@@ -1364,9 +1545,9 @@ def _run_training_loop(
                 )
                 if run_quick:
                     evaluation_started = time.perf_counter()
-                    result = _run_evaluation(
+                    result = _dispatch_evaluation(
                         kind="quick",
-                        model=model,
+                        model=resolved_model,
                         dataloader=loaders.quick_test,
                         device=device,
                         config=config,
@@ -1374,9 +1555,12 @@ def _run_training_loop(
                         global_step=global_step,
                         rank=rank,
                         world_size=world_size,
+                        task=task,
+                        evaluator=evaluator,
+                        runtime=runtime,
                     )
                     evaluation_state["quick_test_count"] += 1
-                    _set_train_mode(model, config["model"])
+                    trainable_policy.configure_module_modes(resolved_model, selection)
                     evaluation_seconds += (
                         time.perf_counter() - evaluation_started
                     )
@@ -1384,9 +1568,9 @@ def _run_training_loop(
                 is_best = False
                 if run_full:
                     evaluation_started = time.perf_counter()
-                    result = _run_evaluation(
+                    result = _dispatch_evaluation(
                         kind="full",
-                        model=model,
+                        model=resolved_model,
                         dataloader=loaders.full_test,
                         device=device,
                         config=config,
@@ -1394,6 +1578,9 @@ def _run_training_loop(
                         global_step=global_step,
                         rank=rank,
                         world_size=world_size,
+                        task=task,
+                        evaluator=evaluator,
+                        runtime=runtime,
                     )
                     evaluation_state["full_test_count"] += 1
                     if runtime is None:
@@ -1409,7 +1596,7 @@ def _run_training_loop(
                     if is_best:
                         best_metrics = metrics
                         evaluation_state["best_observed_dev_test_metrics"] = metrics
-                    _set_train_mode(model, config["model"])
+                    trainable_policy.configure_module_modes(resolved_model, selection)
                     evaluation_seconds += (
                         time.perf_counter() - evaluation_started
                     )
@@ -1426,7 +1613,7 @@ def _run_training_loop(
                     _save_all_ranks(
                         output_dir=output_dir,
                         tag="last",
-                        model=model,
+                        model=resolved_model,
                         optimizer=optimizer,
                         scheduler=scheduler,
                         scaler=scaler,
@@ -1453,7 +1640,7 @@ def _run_training_loop(
                     _save_all_ranks(
                         output_dir=output_dir,
                         tag="last",
-                        model=model,
+                        model=resolved_model,
                         optimizer=optimizer,
                         scheduler=scheduler,
                         scaler=scaler,
@@ -1633,9 +1820,9 @@ def _run_training_loop(
                 == global_step
             )
             if not already_full:
-                result = _run_evaluation(
+                result = _dispatch_evaluation(
                     kind="full_final",
-                    model=model,
+                    model=resolved_model,
                     dataloader=loaders.full_test,
                     device=device,
                     config=config,
@@ -1643,6 +1830,9 @@ def _run_training_loop(
                     global_step=global_step,
                     rank=rank,
                     world_size=world_size,
+                    task=task,
+                    evaluator=evaluator,
+                    runtime=runtime,
                 )
                 evaluation_state["full_test_count"] += 1
                 if runtime is None:
@@ -1663,7 +1853,7 @@ def _run_training_loop(
         _save_all_ranks(
             output_dir=output_dir,
             tag="last",
-            model=model,
+            model=resolved_model,
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
@@ -1695,7 +1885,7 @@ def _run_training_loop(
             runtime.barrier()
         if rank == 0:
             if frozen_snapshot is not None:
-                assert_frozen_parameters_unchanged(frozen_snapshot, model)
+                assert_frozen_parameters_unchanged(frozen_snapshot, resolved_model)
                 print("Verified: every frozen parameter remained bitwise unchanged.")
             summary_payload = {
                 "global_step": global_step,

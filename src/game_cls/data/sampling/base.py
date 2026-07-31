@@ -26,7 +26,7 @@ class SamplingPolicyBase:
     policy_name = "base"
     state_version = 1
 
-    def sample_global_batch(
+    def sample_rank_batch(
         self, catalog: SamplingCatalog, context: SamplingContext
     ) -> list[Any]:
         raise NotImplementedError

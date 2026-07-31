@@ -55,6 +55,10 @@ class PackedUint8Backend(FrameBackend):
 
     def __setstate__(self, state: dict) -> None:
         # Rebuild from the serializable spec on the worker side.
+        # The legacy PackedUint8Backend now implements ``__setstate__`` so we
+        # can restore it directly. We use ``__new__`` to avoid the expensive
+        # ``__init__`` (which re-reads the index) and let the memory maps
+        # reopen lazily on first access.
         from game_cls.data.packed_backend import PackedUint8Backend as _Legacy
 
         backend_state = state["_backend_state"]

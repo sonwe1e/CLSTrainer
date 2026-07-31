@@ -30,10 +30,18 @@ class ExperimentRunner:
 
     def run(self) -> dict:
         # Delegate to the legacy loop through the adapter, passing the
-        # component runtime so the loop uses *our* runtime instead of building
-        # its own. This is the first step (R1) of the runner taking ownership:
-        # the runtime lifecycle now flows through the runner.
-        return self._adapter.train(self.components.raw_config)
+        # component runtime *and* the components the runner built. The loop
+        # must use these components instead of rebuilding them from scratch —
+        # this is how the configured task, trainable policy, model and
+        # evaluator actually drive training (USERPLAN §9 R1–R3).
+        return self._adapter.train(
+            self.components.raw_config,
+            task=self.components.task,
+            trainable_policy=self.components.trainable_policy,
+            model=self.components.model,
+            evaluator=self.components.evaluator,
+            image_spec=self.components.image_spec,
+        )
 
     def run_train_step(self, batch: Any) -> Any:
         raise NotImplementedError("Per-step API reserved for future streaming runners.")

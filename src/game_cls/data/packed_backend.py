@@ -187,6 +187,17 @@ class PackedUint8Backend:
         state["_memory_maps"] = OrderedDict()
         return state
 
+    def __setstate__(self, state: dict) -> None:
+        """Restore from a pickled state, reopening memory maps lazily.
+
+        The legacy backend is sent to worker processes via pickle. On the
+        worker side we rebuild the object from the serializable state and let
+        the memory maps reopen lazily on first access (``_map``).
+        """
+        self.__dict__.update(state)
+        # Memory maps are not picklable; they are reopened lazily by ``_map``.
+        self._memory_maps = OrderedDict()
+
     def __del__(self):
         try:
             self.close()

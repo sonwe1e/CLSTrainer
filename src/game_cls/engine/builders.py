@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..contracts.evaluation import EvaluatorSuite
 from ..contracts.runtime import RuntimeStrategy
 from ..contracts.task import TaskAdapter
 from ..contracts.trainable import TrainablePolicy
@@ -19,6 +20,7 @@ class ExperimentComponents:
     trainable_policy: TrainablePolicy
     model: Any
     image_spec: Any
+    evaluator: EvaluatorSuite | None = None
     # The following are built lazily by the runner because they depend on
     # dataloaders / resume state that is only known at run time.
     optimizer: Any = None
@@ -52,6 +54,7 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     """
     from game_cls.data.image_spec import ImageSpec
 
+    from ..evaluation.legacy_adapter import LegacyEvaluatorSuite
     from ..tasks.dual_frame_binary import DualFrameBinaryTask
 
     image_spec = ImageSpec.from_config(config["data"])
@@ -66,6 +69,29 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     if load_report is not None and not config["data"].get("synthetic", False):
         trainable_policy.validate_loaded_state(model, load_report, selection)
 
+    # Build the evaluator suite. During the migration we use the legacy
+    # adapter which wraps the battle-tested ``evaluate`` function behind the
+    # EvaluatorSuite interface (USERPLAN §10 E1).
+    # Support both V2 (evaluation.decision.params.threshold) and legacy
+    # (evaluation.threshold) config layouts.
+    evaluation_cfg = config.get("evaluation", {})
+    decision_cfg = evaluation_cfg.get("decision", {})
+    decision_params = decision_cfg.get("params", {}) if isinstance(decision_cfg, dict) else {}
+    threshold = float(
+        decision_params.get("threshold")
+        if isinstance(decision_params, dict) and decision_params.get("threshold") is not None
+        else evaluation_cfg.get("threshold", 0.99)
+    )
+    evaluator = LegacyEvaluatorSuite(
+        threshold=threshold,
+        amp=bool(evaluation_cfg.get("amp", False)),
+        amp_dtype=str(evaluation_cfg.get("amp_dtype", "bfloat16")),
+        full_auc_mode=str(evaluation_cfg.get("full_auc_mode", "histogram")),
+        auc_histogram_bins=int(evaluation_cfg.get("auc_histogram_bins", 4096)),
+        quick_error_limit=int(evaluation_cfg.get("quick_save_error_limit", 200)),
+        parquet_row_group_size=int(evaluation_cfg.get("parquet_row_group_size", 4096)),
+    )
+
     return ExperimentComponents(
         config=_extract_structured_config(config),
         raw_config=config,
@@ -74,6 +100,7 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
         trainable_policy=trainable_policy,
         model=model,
         image_spec=image_spec,
+        evaluator=evaluator,
     )
 
 

@@ -52,6 +52,84 @@ def _unknown_keys(data: Any, model: type[BaseModel], path: str = "") -> list[str
 
 
 # ----------------------------------------------------------------------- #
+# Plugin parameter models (strict validation for each component's params)
+# ----------------------------------------------------------------------- #
+class _ThresholdDecisionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    threshold: float = Field(ge=0.0, le=1.0)
+
+
+class _NameTokenPolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    token: str = "cls"
+    case_sensitive: bool = True
+    freeze_trainable_batchnorm_stats: bool = True
+    freeze_frozen_batchnorm_stats: bool = True
+
+
+class _RegexPolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    include: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=list)
+    freeze_trainable_batchnorm_stats: bool = True
+    freeze_frozen_batchnorm_stats: bool = True
+
+
+class _ModelDeclaredPolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # Model-declared policy takes no params; the model itself declares groups.
+
+
+class _DdpRuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    backend: str = "nccl"
+    find_unused_parameters: bool = False
+    broadcast_buffers: bool = False
+    gradient_as_bucket_view: bool = True
+
+
+class _PngBackendConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # PNG backend takes no params.
+
+
+class _PackedBackendConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    index_path: str = ""
+    max_open_shards: int = Field(default=16, ge=1)
+
+
+class _BalancedSamplerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    game_alpha: float = Field(default=0.25, ge=0.0, le=1.0)
+    class_probability: dict[int, float] = Field(default_factory=lambda: {0: 0.5, 1: 0.5})
+    deduplicate_within_global_batch: bool = True
+
+
+class _DualFrameBinaryTaskConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    positive_class_index: int = 1
+    num_classes: int = 2
+
+
+# Mapping from (selector_type, plugin_type) → params Pydantic model.
+# Used by ``_check_plugin_params`` to validate plugin params strictly so
+# that a typo like ``threshhold`` fails fast instead of being silently
+# ignored (USERPLAN §8.4).
+_PLUGIN_PARAMS_MODELS: dict[tuple[str, str], type[BaseModel]] = {
+    ("evaluation", "threshold"): _ThresholdDecisionConfig,
+    ("trainable", "name_token"): _NameTokenPolicyConfig,
+    ("trainable", "regex"): _RegexPolicyConfig,
+    ("trainable", "model_declared"): _ModelDeclaredPolicyConfig,
+    ("runtime", "ddp"): _DdpRuntimeConfig,
+    ("data", "png"): _PngBackendConfig,
+    ("data", "packed_uint8"): _PackedBackendConfig,
+    ("sampler", "balanced_game_label_delta"): _BalancedSamplerConfig,
+    ("task", "dual_frame_binary"): _DualFrameBinaryTaskConfig,
+}
+
+
+# ----------------------------------------------------------------------- #
 # Plugin selector models
 # ----------------------------------------------------------------------- #
 class _PluginSelector(BaseModel):
@@ -202,5 +280,50 @@ def _check_selector_keys(raw: dict[str, Any]) -> None:
     if problems:
         raise ValidationError(
             "Configuration contains unknown component-selector keys:\n  "
+            + "\n  ".join(problems)
+        )
+    # Validate plugin params against their specific Pydantic models so that
+    # a typo like ``threshhold`` (instead of ``threshold``) fails fast.
+    _check_plugin_params(raw)
+
+
+def _check_plugin_params(raw: dict[str, Any]) -> None:
+    """Validate plugin ``params`` against their specific Pydantic models.
+
+    For each component selector that has a registered params model, this
+    checks that the params dict conforms to the model — rejecting unknown
+    keys, type mismatches, and out-of-range values.
+    """
+    plugin_sections: list[tuple[str, str, dict[str, Any]]] = [
+        ("task", "type", raw.get("task", {})),
+        ("trainable", "type", (raw.get("trainable", {}) or {}).get("policy", {})),
+        ("sampler", "type", (raw.get("sampler", {}) or {}).get("policy", {})),
+        ("runtime", "type", (raw.get("runtime", {}) or {}).get("distributed", {})),
+        ("evaluation", "type", (raw.get("evaluation", {}) or {}).get("decision", {})),
+        ("data", "type", (raw.get("data", {}) or {}).get("backend", {})),
+    ]
+    problems: list[str] = []
+    for section, type_key, selector in plugin_sections:
+        if not isinstance(selector, dict):
+            continue
+        plugin_type = selector.get(type_key)
+        if not plugin_type:
+            continue
+        model = _PLUGIN_PARAMS_MODELS.get((section, str(plugin_type)))
+        if model is None:
+            # No strict model registered for this plugin type; skip.
+            continue
+        params = selector.get("params") or {}
+        if not isinstance(params, dict):
+            continue
+        try:
+            model(**params)
+        except PydanticValidationError as exc:
+            for error in exc.errors():
+                loc = ".".join(str(item) for item in error["loc"])
+                problems.append(f"{section}.params.{loc}: {error['msg']}")
+    if problems:
+        raise ValidationError(
+            "Configuration contains invalid plugin params:\n  "
             + "\n  ".join(problems)
         )

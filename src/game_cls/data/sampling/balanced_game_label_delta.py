@@ -55,10 +55,13 @@ class BalancedGameLabelDeltaPolicy(SamplingPolicyBase):
         )
         return cls(sampler)
 
-    def sample_global_batch(
+    def sample_rank_batch(
         self, catalog: SamplingCatalog, context: SamplingContext
     ) -> list[Any]:
         del catalog
+        # The wrapped ``VideoBalancedPairBatchSampler`` already returns a
+        # rank-local batch (it shards by rank/world_size internally). This
+        # method therefore returns the *rank-local* batch, not a global batch.
         # Rebuild the iterator once per epoch, not once per step. Keying on
         # (epoch, step) would rebuild on every batch and turn epoch work O(N²).
         if context.step == 0 or self._iter_key != context.epoch or self._iterator is None:

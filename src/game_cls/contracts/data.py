@@ -133,7 +133,7 @@ class SamplingPolicy(Protocol):
     @property
     def state_version(self) -> int: ...
 
-    def sample_global_batch(
+    def sample_rank_batch(
         self, catalog: SamplingCatalog, context: SamplingContext
     ) -> list[Any]: ...
 
