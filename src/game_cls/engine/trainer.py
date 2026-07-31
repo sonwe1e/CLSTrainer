@@ -9,6 +9,7 @@ import random
 import time
 from typing import Any
 
+from game_cls.contracts.task import StepContext
 from game_cls.data.collate import pair_collate
 from game_cls.data.image_spec import ImageSpec
 from game_cls.engine.checkpoint import (
@@ -27,7 +28,6 @@ from game_cls.engine.distributed import (
     is_distributed,
 )
 from game_cls.engine.evaluator import EvaluationOutput, evaluate
-from game_cls.losses.threshold_loss import combined_loss
 from game_cls.model.builder import build_model
 from game_cls.model.checkpoint_loader import (
     load_model_checkpoint,
@@ -933,10 +933,104 @@ def _run_evaluation(
 
 
 def run_training(config: dict[str, Any]) -> dict:
+    """Compatibility entry point (USERPLAN §9.4).
+
+    Builds the extensible component graph and delegates to an
+    :class:`ExperimentRunner`. The external signature is unchanged so
+    ``tools/train.py`` and existing callers keep working.
+    """
+    from .runner import ExperimentRunner
+
+    components = _build_components_for_runner(config)
+    runner = ExperimentRunner(components)
+    try:
+        runner.setup()
+        return runner.run()
+    finally:
+        runner.close()
+
+
+def _build_components_for_runner(config: dict[str, Any]) -> Any:
+    """Build the task and runtime components the runner needs."""
+    from game_cls.data.image_spec import ImageSpec
+
+    from .builders import ExperimentComponents
+    from .runner import ExperimentRunner  # noqa: F401
+
+    image_spec = ImageSpec.from_config(config["data"])
+    from game_cls.tasks.dual_frame_binary import DualFrameBinaryTask
+
+    task = DualFrameBinaryTask(image_spec=image_spec, loss_config=config["loss"])
+    runtime = _build_runtime(config)
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    return ExperimentComponents(
+        config=cfg,
+        raw_config=config,
+        runtime=runtime,
+        task=task,
+        trainable_policy=_build_trainable_policy(config),
+        model=None,
+        image_spec=image_spec,
+    )
+
+
+def _build_runtime(config: dict[str, Any]) -> Any:
+    from game_cls.runtime.factories import build_runtime
+
+    runtime_cfg = config.get("runtime", {})
+    accelerator = runtime_cfg.get("accelerator", {}).get(
+        "type", config.get("device", {}).get("accelerator", "cpu")
+    )
+    distributed_cfg = runtime_cfg.get("distributed", {})
+    distributed = distributed_cfg.get("type", "single_process")
+    distributed_params = dict(distributed_cfg.get("params", {}) or {})
+
+    class _Sel:
+        pass
+
+    acc_sel = _Sel()
+    acc_sel.type = accelerator
+    dist_sel = _Sel()
+    dist_sel.type = distributed
+    dist_sel.params = distributed_params
+    runtime_sel = _Sel()
+    runtime_sel.accelerator = acc_sel
+    runtime_sel.distributed = dist_sel
+    return build_runtime(runtime_sel)
+
+
+def _build_trainable_policy(config: dict[str, Any]) -> Any:
+    from game_cls.trainable.build import build_trainable_policy
+
+    trainable_cfg = config.get("trainable", {})
+    policy = trainable_cfg.get("policy", {})
+
+    class _Sel:
+        pass
+
+    sel = _Sel()
+    sel.type = policy.get("type", "name_token")
+    sel.factory = policy.get("factory", "")
+    sel.params = dict(policy.get("params", {}) or {})
+    return build_trainable_policy(sel)
+
+
+def _run_training_loop(config: dict[str, Any]) -> dict:
     import torch
 
     validate_training_config(config)
     image_spec = ImageSpec.from_config(config["data"])
+    from game_cls.tasks.dual_frame_binary import DualFrameBinaryTask
+
+    task = DualFrameBinaryTask(
+        image_spec=image_spec,
+        loss_config=config["loss"],
+        task_config=None,
+    )
     rank, world_size, local_rank, device = initialize_runtime(config)
     try:
         seed = int(config["experiment"]["seed"])
@@ -1154,21 +1248,18 @@ def run_training(config: dict[str, Any]) -> dict:
                     first_batch_logged = True
                 timing["host_data_wait"] += batch_ready - last_batch_finished
                 transfer_started = time.perf_counter()
-                images = batch["images"]
                 if not input_shape_validated:
-                    image_spec.validate_pair_batch_shape(images.shape)
+                    task.validate_cpu_batch(batch)
                     input_shape_validated = True
-                images = images.to(device, non_blocking=True)
-                if images.dtype == torch.uint8:
-                    compute_dtype = (
-                        torch.bfloat16
-                        if use_amp and config["device"]["amp_dtype"] == "bfloat16"
-                        else torch.float16
-                        if use_amp and config["device"]["amp_dtype"] == "float16"
-                        else torch.float32
-                    )
-                    images = images.to(compute_dtype).div_(255.0)
-                labels = batch["labels"].to(device, non_blocking=True)
+                context = StepContext(
+                    global_step=global_step,
+                    total_steps=total_steps,
+                    epoch=epoch,
+                    device=device,
+                    use_amp=use_amp,
+                    amp_dtype=config["device"].get("amp_dtype", "float16"),
+                )
+                device_batch = task.move_batch_to_device(batch, context)
                 timing["host_h2d_enqueue"] += (
                     time.perf_counter() - transfer_started
                 )
@@ -1177,19 +1268,13 @@ def run_training(config: dict[str, Any]) -> dict:
                 with autocast_context(
                     device, use_amp, config["device"].get("amp_dtype", "float16")
                 ):
-                    logits = model(images[:, 0], images[:, 1])
-                    if logits.ndim != 2 or logits.shape[1] != 2:
-                        raise ValueError(
-                            f"Model must return [B,2], got {tuple(logits.shape)}"
-                        )
-                    loss, components = combined_loss(
-                        logits, labels, config["loss"], global_step, total_steps
-                    )
+                    task_output = task.forward(model, device_batch, context)
+                    loss_output = task.compute_loss(task_output, device_batch, context)
                 timing["host_forward_enqueue"] += (
                     time.perf_counter() - forward_started
                 )
                 backward_started = time.perf_counter()
-                scaler.scale(loss).backward()
+                scaler.scale(loss_output.total).backward()
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
@@ -1349,12 +1434,12 @@ def run_training(config: dict[str, Any]) -> dict:
                             key: value / interval_steps
                             for key, value in timing.items()
                         }
-                        loss_value = float(loss.detach().item())
+                        loss_value = float(loss_output.total.detach().item())
                         ce_value = float(
-                            components["cross_entropy"].item()
+                            loss_output.components["cross_entropy"].item()
                         )
                         threshold_loss_value = float(
-                            components["threshold_loss"].item()
+                            loss_output.components["threshold_loss"].item()
                         )
                         grad_norm_value = float(
                             grad_norm.detach().item()
@@ -1385,7 +1470,7 @@ def run_training(config: dict[str, Any]) -> dict:
                             "ce": ce_value,
                             "threshold_loss": threshold_loss_value,
                             "threshold_weight": float(
-                                components["threshold_weight"]
+                                loss_output.components["threshold_weight"]
                             ),
                             "interval_samples_per_second": (
                                 interval_samples_per_second
@@ -1412,7 +1497,7 @@ def run_training(config: dict[str, Any]) -> dict:
                             f"ce={ce_value:.6f} "
                             f"threshold_loss={threshold_loss_value:.6f} "
                             f"threshold_weight="
-                            f"{components['threshold_weight']:.4f} "
+                            f"{loss_output.components['threshold_weight']:.4f} "
                             f"interval_samples/s="
                             f"{interval_samples_per_second:.2f} "
                             f"interval_step_time="

@@ -35,6 +35,84 @@ Ascend 环境应先按服务器 CANN 版本安装匹配的 PyTorch 和 TorchNPU�
 其中的 `model.factory` 和 `model.checkpoint_path` 必须替换为真实模型；未替换、
 checkpoint 不存在或非 `cls` 主干权重未完整加载时，训练会立即终止。
 
+## 可扩展架构
+
+CLSTrainer 当前的实现是**双帧二分类**，但训练主循环已经被拆成可替换的组件。
+新增一个任务时，不需要同时修改 trainer、dataset、sampler、evaluator 和 report，
+只需要新增对应组件并注册即可。
+
+```text
+ExperimentRunner
+│
+├── TypedExperimentConfig       严格 Pydantic schema，V1 自动迁移到 V2
+├── RuntimeStrategy             AcceleratorAdapter + DistributedAdapter
+├── DataModule                  LogicalDataSchema + IndexCodec + DataBackend + SamplingPolicy
+├── TaskAdapter                 batch / forward / loss / prediction
+├── TrainablePolicy             可训练参数选择（name_token / regex / model_declared）
+└── EvaluatorSuite              DecisionPolicy + MetricAccumulator + GroupAggregator + ...
+```
+
+默认组件组合：
+
+```text
+DualFrameBinaryTask
+GameVideoPairDataModule
+LegacyGameBinaryIndexCodec
+PngBackend / PackedUint8Backend
+BalancedGameLabelDeltaPolicy
+NameTokenTrainablePolicy(token="cls")
+BinaryThresholdEvaluatorSuite + BinaryThresholdDecision(threshold=0.99)
+NpuAccelerator + DdpDistributedAdapter
+```
+
+### 关键目录
+
+```text
+src/game_cls/
+├── config/        严格 schema、V1→V2 migration、override 校验
+├── contracts/     所有组件的 Protocol 接口（task / data / evaluation / runtime / trainable）
+├── registry/       组件注册与解析
+├── tasks/          TaskAdapter 实现（默认 dual_frame_binary）
+├── data/           backends/（png、packed_uint8）、index_codecs/、sampling/
+├── trainable/      TrainablePolicy 实现
+├── evaluation/     EvaluatorSuite 组件
+├── runtime/        AcceleratorAdapter / DistributedAdapter / RuntimeStrategy
+└── engine/         ExperimentRunner + builders + state
+```
+
+### 配置版本
+
+- **V1**（当前生产配置）：扁平的 `experiment/device/data/pair/sampler/model/...` 结构，
+  加载时自动迁移到 V2 并打印 `[CONFIG MIGRATION]` 提示。
+- **V2**：组件选择器结构，顶层 `task/trainable/data/sampler/runtime/evaluation`，
+  未知的选择器键会报错，legacy 顶层键在迁移期继续容忍。
+
+```yaml
+config_version: 2
+task:
+  type: dual_frame_binary
+  factory: game_cls.tasks.dual_frame_binary:build_task
+trainable:
+  policy:
+    type: name_token
+    params: {token: cls}
+runtime:
+  accelerator: {type: npu}
+  distributed: {type: single_process}
+```
+
+### 添加第二个任务
+
+未来实现第二个任务时，主要新增：
+
+- 一个 `TaskAdapter`（`tasks/`）
+- 一个 `DataModule/IndexCodec`（如需要）
+- 一个 `SamplingPolicy`（如需要）
+- 一个 `EvaluatorSuite`
+- 一份严格配置
+
+而不再修改现有双帧任务的 trainer、loss、evaluator 和报告代码。
+
 ## 数据索引和严格审计
 
 目录必须满足：

@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError as PydanticValidationError
+
+
+class ValidationError(Exception):
+    """Raised when a configuration fails schema validation or migration."""
+
+
+def _wrap_pydantic_error(exc: PydanticValidationError) -> ValidationError:
+    messages = []
+    for error in exc.errors():
+        loc = ".".join(str(item) for item in error["loc"])
+        messages.append(f"{loc}: {error['msg']}")
+    return ValidationError(
+        "Configuration validation failed:\n  " + "\n  ".join(messages)
+    )
+
+
+def _field_names(model: type[BaseModel]) -> set[str]:
+    return set(model.model_fields)
+
+
+def _unknown_keys(data: Any, model: type[BaseModel], path: str = "") -> list[str]:
+    """Return dotted paths for keys not present in the Pydantic model.
+
+    Used to surface unknown top- and first-level plugin-param keys while still
+    allowing arbitrary leaf params inside an explicit ``params`` dict.
+    """
+    unknown: list[str] = []
+    if not isinstance(data, dict) or not issubclass(model, BaseModel):
+        return unknown
+    known = _field_names(model)
+    for key, value in data.items():
+        dotted = f"{path}.{key}" if path else key
+        if key not in known:
+            unknown.append(dotted)
+            continue
+        field_info = model.model_fields[key]
+        target = field_info.annotation
+        # Only descend one model level; plugin params stay open.
+        if (
+            isinstance(target, type)
+            and issubclass(target, BaseModel)
+            and isinstance(value, dict)
+        ):
+            unknown.extend(_unknown_keys(value, target, dotted))
+    return unknown
+
+
+# ----------------------------------------------------------------------- #
+# Plugin selector models
+# ----------------------------------------------------------------------- #
+class _PluginSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class _TaskSelector(_PluginSelector):
+    factory: str = ""
+
+
+class _TrainableSelector(_PluginSelector):
+    factory: str = ""
+
+
+class _IndexCodecSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: str
+
+
+class _BackendSelector(_PluginSelector):
+    pass
+
+
+class _SamplerSelector(_PluginSelector):
+    pass
+
+
+class _AcceleratorSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: str
+
+
+class _DistributedSelector(_PluginSelector):
+    pass
+
+
+class _DecisionSelector(_PluginSelector):
+    pass
+
+
+class _SuiteSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: str
+
+
+# ----------------------------------------------------------------------- #
+# Top-level V2 sections. The layout follows USERPLAN §8.4: selectors are
+# nested one level (trainable.policy, sampler.policy, runtime.{accelerator,
+# distributed}, evaluation.{suite, decision}, data.{index_codec, backend}).
+# ----------------------------------------------------------------------- #
+# Intermediate sections tolerate legacy flat keys (extra="allow") during the
+# migration period. Strictness is enforced at the leaf component-selector
+# level by _check_selector_keys, so a typo in a new plugin selector still
+# fails fast while migrated V1 keys pass through.
+class _TrainableConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    policy: _TrainableSelector
+
+
+class _SamplerConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    policy: _SamplerSelector
+
+
+class _RuntimeConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    accelerator: _AcceleratorSelector
+    distributed: _DistributedSelector
+
+
+class _EvaluationConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    suite: _SuiteSelector
+    decision: _DecisionSelector
+
+
+class _DataConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    module_factory: str = "game_cls.data.module:build_game_video_pair_data_module"
+    index_codec: _IndexCodecSelector
+    backend: _BackendSelector
+
+
+class ExperimentConfig(BaseModel):
+    """V2 experiment configuration.
+
+    The new *component-selector* sections (task, trainable, data, sampler,
+    runtime, evaluation) are strict: an unknown key inside them is rejected so
+    that a typo in an extensible component fails fast. Legacy top-level sections
+    (experiment, device, model, loss, train, dataloader, checkpoint, ...) are
+    tolerated with ``extra="allow"`` during the migration period, because a
+    migrated V1 config retains its original flat keys alongside the new
+    selectors (USERPLAN §8.4, §14).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    config_version: Literal[2] = 2
+    task: _TaskSelector
+    trainable: _TrainableConfig
+    data: _DataConfig
+    sampler: _SamplerConfig
+    runtime: _RuntimeConfig
+    evaluation: _EvaluationConfig
+
+
+def validate_and_normalize_config(raw: dict[str, Any]) -> ExperimentConfig:
+    """Validate a raw config mapping against the V2 schema.
+
+    The loader has already performed V1 migration and override application, so
+    this is purely structural validation with friendly error messages. Unknown
+    keys inside the strict *component selectors* are rejected; legacy top-level
+    sections are tolerated during the migration period.
+    """
+    if not isinstance(raw, dict):
+        raise ValidationError("Configuration must be a YAML mapping at the top level.")
+    # Check for unknown keys inside the strict component selectors before
+    # handing the whole mapping to Pydantic (which tolerates legacy top-level
+    # keys via extra="allow").
+    _check_selector_keys(raw)
+    try:
+        config = ExperimentConfig(**raw)
+    except PydanticValidationError as exc:
+        raise _wrap_pydantic_error(exc) from exc
+    return config
+
+
+def _check_selector_keys(raw: dict[str, Any]) -> None:
+    """Reject unknown keys inside the strict component-selector sections."""
+    selector_sections: list[tuple[Any, type[BaseModel], str]] = [
+        (raw.get("task"), _TaskSelector, "task"),
+        (raw.get("trainable", {}).get("policy"), _TrainableSelector, "trainable.policy"),
+        (raw.get("sampler", {}).get("policy"), _SamplerSelector, "sampler.policy"),
+        (raw.get("runtime", {}).get("accelerator"), _AcceleratorSelector, "runtime.accelerator"),
+        (raw.get("runtime", {}).get("distributed"), _DistributedSelector, "runtime.distributed"),
+        (raw.get("evaluation", {}).get("suite"), _SuiteSelector, "evaluation.suite"),
+        (raw.get("evaluation", {}).get("decision"), _DecisionSelector, "evaluation.decision"),
+        (raw.get("data", {}).get("index_codec"), _IndexCodecSelector, "data.index_codec"),
+        (raw.get("data", {}).get("backend"), _BackendSelector, "data.backend"),
+    ]
+    problems: list[str] = []
+    for value, model, path in selector_sections:
+        if isinstance(value, dict):
+            for unknown in _unknown_keys(value, model, path):
+                problems.append(f"Unknown key in {unknown}")
+    if problems:
+        raise ValidationError(
+            "Configuration contains unknown component-selector keys:\n  "
+            + "\n  ".join(problems)
+        )
