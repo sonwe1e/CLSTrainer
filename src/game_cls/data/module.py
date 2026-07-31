@@ -18,6 +18,7 @@ class LegacyGameVideoDataModule:
     def __init__(self, config: Any, image_spec: Any) -> None:
         self._config = config
         self._image_spec = image_spec
+        self._backends: list[Any] = []
 
     @property
     def config(self) -> Any:
@@ -33,9 +34,37 @@ class LegacyGameVideoDataModule:
         runtime: Any,
         state_mode: str = "full",
     ) -> LoaderBundle:
-        """Build dataloaders using the legacy pipeline."""
-        from ..engine.trainer import _make_dataloaders
+        """Build dataloaders using the legacy pipeline.
 
-        rank = int(runtime.distributed.rank)
-        world_size = int(runtime.distributed.world_size)
-        return _make_dataloaders(self._config, rank, world_size)
+        Delegates to :func:`build_legacy_loader_bundle` in
+        ``data.legacy_pipeline`` — the single source of truth for the default
+        data loading behavior. This avoids the circular import that would arise
+        if we imported ``_make_dataloaders`` from ``engine.trainer`` directly.
+        """
+        from .legacy_pipeline import build_legacy_loader_bundle
+
+        # Clear any previously tracked backends (e.g. on rebuild).
+        self._backends.clear()
+        bundle = build_legacy_loader_bundle(
+            self._config, self._image_spec, runtime
+        )
+        # Track backends for cleanup. The datasets hold references to the
+        # backends; we collect them here so we can close memmaps/file
+        # descriptors when training finishes.
+        for loader in (bundle.train, bundle.quick_test, bundle.full_test):
+            dataset = getattr(loader, "dataset", None)
+            if dataset is None:
+                continue
+            decoder = getattr(dataset, "decoder", None)
+            if decoder is not None and decoder not in self._backends:
+                self._backends.append(decoder)
+        return bundle
+
+    def close(self) -> None:
+        """Close all tracked backends (memmaps, file descriptors)."""
+        for backend in self._backends:
+            try:
+                backend.close()
+            except Exception:
+                pass
+        self._backends.clear()

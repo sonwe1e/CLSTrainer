@@ -96,9 +96,21 @@ class DdpDistributed:
         # the wrong device would raise a "model parameters are not on device"
         # error at the first forward/backward pass.
         model = model.to(device)
+        # CPU/Gloo DDP must use ``device_ids=None``; CUDA/NPU use the rank's
+        # device index. Passing ``device_ids=[local_rank]`` for CPU raises
+        # "Invalid device id" because there is no CUDA/NPU device at that index.
+        if device.type == "cpu":
+            return DistributedDataParallel(
+                model,
+                device_ids=None,
+                find_unused_parameters=self._find_unused_parameters,
+                broadcast_buffers=self._broadcast_buffers,
+                gradient_as_bucket_view=self._gradient_as_bucket_view,
+            )
         return DistributedDataParallel(
             model,
-            device_ids=[self._local_rank],
+            device_ids=[device.index if device.index is not None else self._local_rank],
+            output_device=device.index if device.index is not None else self._local_rank,
             find_unused_parameters=self._find_unused_parameters,
             broadcast_buffers=self._broadcast_buffers,
             gradient_as_bucket_view=self._gradient_as_bucket_view,

@@ -12,6 +12,16 @@ class DualFrameBinaryTaskConfig:
     positive_class_index: int = 1
     num_classes: int = 2
 
+    def __post_init__(self) -> None:
+        if self.num_classes != 2:
+            raise ValueError(
+                f"DualFrameBinaryTask requires num_classes==2, got {self.num_classes}"
+            )
+        if self.positive_class_index not in (0, 1):
+            raise ValueError(
+                f"positive_class_index must be 0 or 1, got {self.positive_class_index}"
+            )
+
 
 class DualFrameBinaryTask:
     """Default task adapter for dual-frame binary classification.

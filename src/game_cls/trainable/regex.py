@@ -53,15 +53,35 @@ class RegexTrainablePolicy(TrainablePolicyBase):
                 "RegexTrainablePolicy matched no parameters. "
                 f"include={self.include} exclude={self.exclude}"
             )
+        # Classify persistent buffers for frozen coverage validation.
+        parameter_name_set = set(dict(model.named_parameters()))
+        try:
+            persistent_buffer_names = set(
+                name for name, _ in model.named_buffers(recurse=True)
+                if name in model.state_dict()
+            )
+        except Exception:
+            persistent_buffer_names = {
+                key
+                for key in model.state_dict()
+                if key not in parameter_name_set and not key.startswith("_")
+            }
+        trainable_buffer_names = {
+            name for name in persistent_buffer_names if self._match(name)
+        }
+        frozen_buffer_names = list(persistent_buffer_names - trainable_buffer_names)
+
         head = _group_spec("head", trainable_names, lr_multiplier=1.0)
         return TrainableSelection(
             groups=(head,),
             frozen_parameter_names=tuple(frozen_names),
             trainable_state=StateSelection(
-                parameter_keys=tuple(trainable_names), buffer_keys=()
+                parameter_keys=tuple(trainable_names),
+                buffer_keys=tuple(sorted(trainable_buffer_names)),
             ),
             frozen_state=StateSelection(
-                parameter_keys=tuple(frozen_names), buffer_keys=()
+                parameter_keys=tuple(frozen_names),
+                buffer_keys=tuple(frozen_buffer_names),
             ),
         )
 
@@ -94,19 +114,20 @@ class RegexTrainablePolicy(TrainablePolicyBase):
     def validate_loaded_state(
         self, model: Any, load_report: Any, selection: TrainableSelection
     ) -> float:
-        # Validate that the frozen backbone parameters are fully covered by the
-        # loaded checkpoint. For regex policies the frozen set is explicit in
-        # the selection, so we check coverage directly against those keys rather
-        # than trying to reverse a regex into a token.
-        frozen_keys = set(selection.frozen_state.parameter_keys)
+        # Validate that the frozen backbone parameters AND persistent buffers
+        # are fully covered by the loaded checkpoint.
+        frozen_keys = set(selection.frozen_state.parameter_keys) | set(
+            selection.frozen_state.buffer_keys
+        )
         if not frozen_keys:
             return 1.0
         loaded = set(getattr(load_report, "loaded", ()))
         missing = frozen_keys - loaded
         if missing:
             raise RuntimeError(
-                "Production checkpoint must load 100% of the frozen backbone. "
-                f"Missing {len(missing)} frozen parameter(s): "
+                "Production checkpoint must load 100% of the frozen backbone "
+                "(parameters + persistent buffers). "
+                f"Missing {len(missing)} frozen state(s): "
                 f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
             )
         return 1.0

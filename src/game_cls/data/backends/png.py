@@ -31,6 +31,9 @@ class PngBackend(FrameBackend):
         decoded = [self._decoder(ref) for ref in references]
         return torch.stack(decoded)
 
+    def __call__(self, reference: Any) -> Any:
+        return self.get(reference)
+
     def preview(self, reference: Any, output_path: Any) -> None:
         from PIL import Image
 

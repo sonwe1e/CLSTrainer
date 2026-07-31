@@ -36,6 +36,10 @@ class BinaryThresholdEvaluatorSuite:
     ``evaluate`` behavior exactly; a future task supplies a different suite.
     """
 
+    #: Task names this evaluator suite supports.
+    supported_task_names: set[str] = {"dual_frame_binary"}
+    suite_name = "binary_threshold"
+
     def __init__(
         self,
         task: Any,

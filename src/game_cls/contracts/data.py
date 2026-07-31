@@ -68,6 +68,14 @@ class FrameBackend(Protocol):
 
     def close(self) -> None: ...
 
+    def __call__(self, reference: Any) -> Any:
+        """Decode a single frame reference (convenience alias for ``get``).
+
+        The legacy single-sample dataset path calls ``decoder(reference)``.
+        Implementations should return the same result as ``get(reference)``.
+        """
+        ...
+
 
 class DataBackendFactory(Protocol):
     @property
@@ -177,4 +185,8 @@ class DataModule(Protocol):
         state_mode: str = "full",
     ) -> LoaderBundle:
         """Build the dataloaders for a training run."""
+        ...
+
+    def close(self) -> None:
+        """Close any resources held by the data module (backends, memmaps, ...)."""
         ...

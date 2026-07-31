@@ -49,14 +49,22 @@ def _load_base_checkpoint(model: Any, config: dict[str, Any]) -> Any:
 
 
 def build_task(selector: Any, *, image_spec: Any, loss_config: Any) -> Any:
-    """Build a TaskAdapter from a task selector using the registry."""
+    """Build a TaskAdapter from a task selector.
+
+    Supports both registry-based resolution (``type``) and dynamic factory-path
+    import (``factory``) so users can plug in custom tasks without modifying
+    the registry (USERPLAN §12 factory-path support).
+    """
     # Ensure all built-in tasks are registered.
     import game_cls.tasks.dual_frame_binary  # noqa: F401
 
-    from ..registry import resolve
+    from ..registry import resolve_component
 
-    task_type = str(selector.type)
-    factory = resolve("task", task_type)
+    factory = resolve_component(
+        "task",
+        str(selector.type),
+        factory_path=getattr(selector, "factory", "") or "",
+    )
     return factory(selector, image_spec=image_spec, loss_config=loss_config)
 
 
@@ -71,7 +79,11 @@ def _build_data_module(config: dict[str, Any], image_spec: Any) -> Any:
     return LegacyGameVideoDataModule(config, image_spec)
 
 
-def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
+def build_core_components(
+    config: dict[str, Any],
+    *,
+    runtime: Any = None,
+) -> ExperimentComponents:
     """Build the components that don't depend on dataloaders or resume state.
 
     This is the single place that turns a raw config into the extensible
@@ -82,13 +94,22 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     the seed has been set. Model initialization is sensitive to the RNG
     state, and for exact training resume to work, every run must see the
     same initial weights given the same seed.
+
+    Args:
+        config: The raw configuration dict.
+        runtime: The already-set-up runtime instance. When provided (the normal
+            runner path), this function reuses it instead of creating a new one.
+            There must be exactly ONE runtime per training run.
     """
     from game_cls.data.image_spec import ImageSpec
 
     from ..evaluation.legacy_adapter import LegacyEvaluatorSuite
 
     image_spec = ImageSpec.from_config(config["data"])
-    runtime = build_runtime(_runtime_selector(config))
+    if runtime is None:
+        # Standalone path: create a runtime here. The runner path always passes
+        # in the runtime it already set up so there is only one instance.
+        runtime = build_runtime(_runtime_selector(config))
 
     # Build task via registry so that config task.type can select different
     # task implementations.
@@ -114,12 +135,21 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     if load_report is not None and not config["data"].get("synthetic", False):
         trainable_policy.validate_loaded_state(model, load_report, selection)
 
-    # Build the evaluator suite. During the migration we use the legacy
-    # adapter which wraps the battle-tested ``evaluate`` function behind the
-    # EvaluatorSuite interface (USERPLAN §10 E1).
-    # Support both V2 (evaluation.decision.params.threshold) and legacy
-    # (evaluation.threshold) config layouts.
+    # Build the evaluator suite. The default is the legacy adapter which wraps
+    # the battle-tested ``evaluate`` function behind the EvaluatorSuite
+    # interface (USERPLAN §10 E1). The suite is selected by
+    # ``evaluation.suite.type`` via the registry so that custom suites can be
+    # plugged in without modifying the builder.
     evaluation_cfg = config.get("evaluation", {})
+    suite_selector = _suite_selector(config)
+    from ..registry import resolve_component
+
+    suite_factory = resolve_component(
+        "evaluation_suite",
+        str(suite_selector.type),
+        factory_path=getattr(suite_selector, "factory", "") or "",
+    )
+    # Build the suite with the decision threshold and AMP settings.
     decision_cfg = evaluation_cfg.get("decision", {})
     decision_params = decision_cfg.get("params", {}) if isinstance(decision_cfg, dict) else {}
     threshold = float(
@@ -127,7 +157,7 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
         if isinstance(decision_params, dict) and decision_params.get("threshold") is not None
         else evaluation_cfg.get("threshold", 0.99)
     )
-    evaluator = LegacyEvaluatorSuite(
+    evaluator = suite_factory(
         threshold=threshold,
         amp=bool(evaluation_cfg.get("amp", False)),
         amp_dtype=str(evaluation_cfg.get("amp_dtype", "bfloat16")),
@@ -136,6 +166,8 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
         quick_error_limit=int(evaluation_cfg.get("quick_save_error_limit", 200)),
         parquet_row_group_size=int(evaluation_cfg.get("parquet_row_group_size", 4096)),
     )
+    # Fail fast if the evaluator suite is incompatible with the task.
+    _validate_task_evaluator_compatibility(task, evaluator)
 
     return ExperimentComponents(
         config=_extract_structured_config(config),
@@ -199,6 +231,35 @@ def _trainable_selector(config: dict[str, Any]) -> Any:
     sel.factory = policy.get("factory", "")
     sel.params = dict(policy.get("params", {}) or {})
     return sel
+
+
+def _suite_selector(config: dict[str, Any]) -> Any:
+    evaluation_cfg = config.get("evaluation", {})
+    suite_cfg = evaluation_cfg.get("suite", {})
+
+    class _Sel:
+        pass
+
+    sel = _Sel()
+    sel.type = suite_cfg.get("type", "legacy_binary")
+    sel.factory = suite_cfg.get("factory", "")
+    sel.params = dict(suite_cfg.get("params", {}) or {})
+    return sel
+
+
+def _validate_task_evaluator_compatibility(task: Any, evaluator: Any) -> None:
+    """Fail fast if the evaluator suite does not support the configured task."""
+    supported = getattr(evaluator, "supported_task_names", None)
+    if supported is None:
+        return
+    task_name = getattr(task, "task_name", None)
+    if task_name is None:
+        return
+    if task_name not in supported:
+        raise RuntimeError(
+            f"EvaluatorSuite {type(evaluator).__name__!r} does not support "
+            f"task {task_name!r}. Supported tasks: {sorted(supported)}"
+        )
 
 
 def _extract_structured_config(config: dict[str, Any]) -> Any:

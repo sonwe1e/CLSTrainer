@@ -203,9 +203,26 @@ class _RuntimeConfig(BaseModel):
 
 
 class _EvaluationConfig(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
     suite: _SuiteSelector
     decision: _DecisionSelector
+    # Legacy flat evaluation keys (threshold, amp, selection_metric, ...).
+    # Included here so that typos like ``threshhold`` fail fast.
+    threshold: float = Field(default=0.99, ge=0.0, le=1.0)
+    amp: bool = False
+    amp_dtype: str = "bfloat16"
+    full_auc_mode: str = "histogram"
+    auc_histogram_bins: int = Field(default=4096, ge=1)
+    quick_save_error_limit: int = Field(default=200, ge=0)
+    quick_test_pairs_per_video: int = Field(default=128, ge=1)
+    parquet_row_group_size: int = Field(default=4096, ge=1)
+    selection_metric: str = "global_f1_tau099"
+    minimum_worst_game_f1: float | None = None
+    selection_weights: dict[str, float] = Field(default_factory=dict)
+    quick_test_every_steps: int = Field(default=0, ge=0)
+    full_test_every_steps: int = Field(default=0, ge=0)
+    full_test_at_end: bool = True
+    html_max_errors_per_group: int = Field(default=200, ge=1)
 
 
 class _DataConfig(BaseModel):
@@ -215,6 +232,120 @@ class _DataConfig(BaseModel):
     backend: _BackendSelector
 
 
+# ----------------------------------------------------------------------- #
+# Legacy section models (strict — ``extra="forbid"`` catches typos like
+# ``local_batch_szie`` or ``learning_ratae`` that would otherwise be silently
+# ignored, causing hard-to-debug training behavior).
+# ----------------------------------------------------------------------- #
+class _ExperimentSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = "default"
+    seed: int = 42
+    output_dir: str = "runs/default"
+
+
+class _DeviceSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accelerator: str = "cpu"
+    amp: bool = False
+    amp_dtype: str = "bfloat16"
+
+
+class _ModelSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    factory: str = ""
+    checkpoint_path: str | None = None
+    trainable_name_contains: str = "cls"
+    num_classes: int = Field(default=2, ge=2)
+    freeze_batchnorm_stats: bool | None = None
+    freeze_backbone_batchnorm_stats: bool = True
+    freeze_cls_batchnorm_stats: bool = True
+    require_pretrained_backbone: bool = True
+
+
+class _LossSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cross_entropy_weight: float = Field(default=1.0, ge=0.0)
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    threshold_loss_weight: float = Field(default=0.2, ge=0.0)
+    threshold_safety_margin: float = Field(default=0.2, ge=0.0)
+    threshold_temperature: float = Field(default=0.5, ge=0.0)
+    threshold_warmup_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    threshold_ramp_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
+    pos_weight: float | None = None
+
+
+class _OptimizerSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = "AdamW"
+    learning_rate: float = Field(default=1e-3, gt=0.0)
+    weight_decay: float = Field(default=0.01, ge=0.0)
+    betas: tuple[float, float] = (0.9, 0.999)
+    eps: float = Field(default=1e-8, gt=0.0)
+
+
+class _SchedulerSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = "cosine"
+    warmup_steps: int = Field(default=0, ge=0)
+    min_learning_rate: float = Field(default=0.0, ge=0.0)
+    total_steps: int | None = None
+
+
+class _TrainSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    local_batch_size: int = Field(default=32, ge=1)
+    epochs: int = Field(default=1, ge=1)
+    steps_per_epoch: int = Field(default=100, ge=1)
+    max_steps: int | None = None
+    log_every_steps: int = Field(default=10, ge=1)
+    gradient_clip_norm: float = Field(default=5.0, ge=0.0)
+    resume_path: str | None = None
+    stop_after_steps: int | None = None
+    verify_frozen_parameters: bool = False
+
+
+class _DataLoaderSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    num_workers: int = Field(default=0, ge=0)
+    pin_memory: bool = False
+    multiprocessing_context: str | None = None
+    timeout_seconds: float = Field(default=180.0, gt=0.0)
+    prefetch_factor: int = Field(default=2, ge=1)
+    persistent_workers: bool = True
+    worker_num_threads: int = Field(default=1, ge=1)
+    train: dict[str, Any] = Field(default_factory=dict)
+    eval: dict[str, Any] = Field(default_factory=dict)
+
+
+class _CheckpointSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    save_last_every_steps: int = Field(default=0, ge=0)
+    save_best_selection: bool = True
+    periodic_state_mode: str = "full"
+    full_model_every_steps: int = Field(default=0, ge=0)
+
+
+class _EvaluationLegacySection(BaseModel):
+    """Legacy flat evaluation keys (threshold, amp, selection_metric, ...)."""
+    model_config = ConfigDict(extra="forbid")
+    threshold: float = Field(default=0.99, ge=0.0, le=1.0)
+    amp: bool = False
+    amp_dtype: str = "bfloat16"
+    full_auc_mode: str = "histogram"
+    auc_histogram_bins: int = Field(default=4096, ge=1)
+    quick_save_error_limit: int = Field(default=200, ge=0)
+    quick_test_pairs_per_video: int = Field(default=128, ge=1)
+    parquet_row_group_size: int = Field(default=4096, ge=1)
+    selection_metric: str = "global_f1_tau099"
+    minimum_worst_game_f1: float | None = None
+    selection_weights: dict[str, float] = Field(default_factory=dict)
+    quick_test_every_steps: int = Field(default=0, ge=0)
+    full_test_every_steps: int = Field(default=0, ge=0)
+    full_test_at_end: bool = True
+    html_max_errors_per_group: int = Field(default=200, ge=1)
+
+
 class ExperimentConfig(BaseModel):
     """V2 experiment configuration.
 
@@ -222,9 +353,9 @@ class ExperimentConfig(BaseModel):
     runtime, evaluation) are strict: an unknown key inside them is rejected so
     that a typo in an extensible component fails fast. Legacy top-level sections
     (experiment, device, model, loss, train, dataloader, checkpoint, ...) are
-    tolerated with ``extra="allow"`` during the migration period, because a
-    migrated V1 config retains its original flat keys alongside the new
-    selectors (USERPLAN §8.4, §14).
+    now also strict with ``extra="forbid"`` so that typos like
+    ``local_batch_szie`` or ``learning_ratae`` fail fast instead of being
+    silently ignored (USERPLAN §8.4, §14).
     """
 
     model_config = ConfigDict(extra="allow")
@@ -236,6 +367,15 @@ class ExperimentConfig(BaseModel):
     sampler: _SamplerConfig
     runtime: _RuntimeConfig
     evaluation: _EvaluationConfig
+    experiment: _ExperimentSection = Field(default_factory=_ExperimentSection)
+    device: _DeviceSection = Field(default_factory=_DeviceSection)
+    model: _ModelSection = Field(default_factory=_ModelSection)
+    loss: _LossSection = Field(default_factory=_LossSection)
+    optimizer: _OptimizerSection = Field(default_factory=_OptimizerSection)
+    scheduler: _SchedulerSection = Field(default_factory=_SchedulerSection)
+    train: _TrainSection = Field(default_factory=_TrainSection)
+    dataloader: _DataLoaderSection = Field(default_factory=_DataLoaderSection)
+    checkpoint: _CheckpointSection = Field(default_factory=_CheckpointSection)
 
 
 def validate_and_normalize_config(raw: dict[str, Any]) -> ExperimentConfig:

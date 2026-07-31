@@ -262,11 +262,28 @@ def restore_training_checkpoint(
     scheduler=None,
     scaler=None,
     expected_base_checkpoint: str | Path | None = None,
+    expected_trainable_selection: Any = None,
+    expected_policy_name: str | None = None,
+    expected_policy_version: int | None = None,
 ) -> dict:
+    """Restore a training checkpoint.
+
+    For V2 trainable_only checkpoints (``checkpoint_format_version == 2``), the
+    stored manifest is authoritative: the caller must supply the expected
+    ``TrainablePolicy`` name/version and the expected trainable selection so we
+    can verify that the checkpoint matches the current policy before loading.
+    This avoids the old parent-module-prefix inference that breaks LoRA and
+    BatchNorm scenarios.
+
+    For legacy checkpoints (no format version), the parent-module-prefix
+    inference is kept as a compatibility fallback.
+    """
     import torch
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_mode = checkpoint.get("model_state_mode", "full")
+    checkpoint_format_version = checkpoint.get("checkpoint_format_version")
+
     if state_mode == "trainable_only":
         stored_hash = checkpoint.get("base_checkpoint_sha256")
         if stored_hash and expected_base_checkpoint:
@@ -277,37 +294,89 @@ def restore_training_checkpoint(
                 raise RuntimeError(
                     "Resume base checkpoint hash does not match the checkpoint state."
                 )
+
         target = unwrap_model(model)
-        trainable_names = {
-            name
-            for name, parameter in target.named_parameters()
-            if parameter.requires_grad
-        }
-        current_expected = {
-            key
-            for key in target.state_dict()
-            if key in trainable_names
-            or any(
-                key.startswith(name.rsplit(".", 1)[0] + ".")
-                for name in trainable_names
-            )
-        }
-        stored_expected = set(
-            checkpoint.get(
-                "expected_trainable_state_keys", checkpoint["model"].keys()
-            )
-        )
         actual_keys = set(checkpoint["model"])
-        if stored_expected != current_expected or actual_keys != current_expected:
-            raise RuntimeError(
-                "Trainable checkpoint key set does not match the current model: "
-                f"missing={sorted(current_expected - actual_keys)}, "
-                f"unexpected={sorted(actual_keys - current_expected)}, "
-                f"manifest_mismatch={sorted(stored_expected ^ current_expected)}"
+
+        if checkpoint_format_version == 2 and expected_trainable_selection is not None:
+            # V2 path: use the stored manifest and the caller-supplied expected
+            # selection. No parent-module-prefix inference.
+            stored_manifest = checkpoint.get("trainable_state_manifest") or {}
+            stored_keys = set(
+                stored_manifest.get("parameter_keys", [])
+            ) | set(stored_manifest.get("buffer_keys", []))
+            current_keys = set(
+                expected_trainable_selection.trainable_state.parameter_keys
+            ) | set(expected_trainable_selection.trainable_state.buffer_keys)
+
+            # Verify policy name/version if provided.
+            if expected_policy_name is not None:
+                policy_meta = checkpoint.get("trainable_policy") or {}
+                stored_policy_name = policy_meta.get("name")
+                if stored_policy_name and stored_policy_name != expected_policy_name:
+                    raise RuntimeError(
+                        f"Checkpoint trainable_policy mismatch: "
+                        f"checkpoint={stored_policy_name!r}, "
+                        f"current={expected_policy_name!r}"
+                    )
+                if (
+                    expected_policy_version is not None
+                    and policy_meta.get("state_version") is not None
+                    and policy_meta["state_version"] != expected_policy_version
+                ):
+                    raise RuntimeError(
+                        f"Checkpoint trainable_policy state_version mismatch: "
+                        f"checkpoint={policy_meta['state_version']}, "
+                        f"current={expected_policy_version}"
+                    )
+
+            if stored_keys != current_keys:
+                raise RuntimeError(
+                    "Trainable checkpoint manifest does not match the current "
+                    "TrainableSelection: "
+                    f"missing={sorted(current_keys - stored_keys)}, "
+                    f"unexpected={sorted(stored_keys - current_keys)}"
+                )
+            if actual_keys != current_keys:
+                raise RuntimeError(
+                    "Trainable checkpoint keys do not match the manifest: "
+                    f"missing={sorted(current_keys - actual_keys)}, "
+                    f"unexpected={sorted(actual_keys - current_keys)}"
+                )
+        else:
+            # Legacy path (or no expected selection supplied): fall back to the
+            # old requires_grad + parent-module-prefix inference.
+            trainable_names = {
+                name
+                for name, parameter in target.named_parameters()
+                if parameter.requires_grad
+            }
+            current_expected = {
+                key
+                for key in target.state_dict()
+                if key in trainable_names
+                or any(
+                    key.startswith(name.rsplit(".", 1)[0] + ".")
+                    for name in trainable_names
+                )
+            }
+            stored_expected = set(
+                checkpoint.get(
+                    "expected_trainable_state_keys", checkpoint["model"].keys()
+                )
             )
+            if stored_expected != current_expected or actual_keys != current_expected:
+                raise RuntimeError(
+                    "Trainable checkpoint key set does not match the current "
+                    "model: "
+                    f"missing={sorted(current_expected - actual_keys)}, "
+                    f"unexpected={sorted(actual_keys - current_expected)}, "
+                    f"manifest_mismatch={sorted(stored_expected ^ current_expected)}"
+                )
+
         result = target.load_state_dict(checkpoint["model"], strict=False)
         unexpected = set(result.unexpected_keys)
-        relevant_missing = current_expected & set(result.missing_keys)
+        relevant_missing = actual_keys & set(result.missing_keys)
         if unexpected or relevant_missing:
             raise RuntimeError(
                 "Trainable checkpoint restore was incomplete: "

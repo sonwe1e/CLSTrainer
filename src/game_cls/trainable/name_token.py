@@ -47,18 +47,49 @@ class NameTokenTrainablePolicy(TrainablePolicyBase):
                 f"No trainable parameter contains the token {self.token!r} "
                 f"(case_sensitive={self.case_sensitive})."
             )
-        all_names = list(dict.fromkeys(name for name, _ in model.named_parameters()))
-        frozen_names = [name for name in all_names if name not in set(trainable_names)]
+        trainable_set = set(trainable_names)
+        all_param_names = list(dict.fromkeys(name for name, _ in model.named_parameters()))
+        frozen_names = [name for name in all_param_names if name not in trainable_set]
+
+        # Classify persistent buffers: these are state_dict keys that are NOT
+        # parameters but ARE persisted (e.g. BatchNorm running_mean, running_var,
+        # num_batches_tracked). Non-persistent buffers (e.g. _version counters)
+        # are excluded. Including persistent buffers in the frozen coverage
+        # validation ensures a frozen backbone's BN stats are fully protected.
+        parameter_name_set = set(all_param_names)
+        persistent_buffer_names = {
+            key
+            for key in model.state_dict()
+            if key not in parameter_name_set
+            and not key.startswith("_")
+        }
+        # ``persistent_buffers()`` is the authoritative source for which buffers
+        # are persisted in state_dict. Fall back to the state_dict-based heuristic
+        # only when it is unavailable.
+        try:
+            persistent_buffer_names = set(
+                name for name, _ in model.named_buffers(recurse=True)
+                if name in model.state_dict()
+            )
+        except Exception:
+            pass
+
+        trainable_buffer_names = {
+            name for name in persistent_buffer_names if self._match(name)
+        }
+        frozen_buffer_names = list(persistent_buffer_names - trainable_buffer_names)
 
         head = _group_spec("head", trainable_names, lr_multiplier=1.0)
         return TrainableSelection(
             groups=(head,),
             frozen_parameter_names=tuple(frozen_names),
             trainable_state=StateSelection(
-                parameter_keys=tuple(trainable_names), buffer_keys=()
+                parameter_keys=tuple(trainable_names),
+                buffer_keys=tuple(sorted(trainable_buffer_names)),
             ),
             frozen_state=StateSelection(
-                parameter_keys=tuple(frozen_names), buffer_keys=()
+                parameter_keys=tuple(frozen_names),
+                buffer_keys=tuple(frozen_buffer_names),
             ),
         )
 
@@ -91,17 +122,22 @@ class NameTokenTrainablePolicy(TrainablePolicyBase):
     def validate_loaded_state(
         self, model: Any, load_report: Any, selection: TrainableSelection
     ) -> float:
-        # Validate that the frozen backbone parameters are fully covered by
-        # the loaded checkpoint. The frozen set is explicit in the selection.
-        frozen_keys = set(selection.frozen_state.parameter_keys)
+        # Validate that the frozen backbone parameters AND persistent buffers
+        # (e.g. BatchNorm running_mean, running_var, num_batches_tracked) are
+        # fully covered by the loaded checkpoint. The frozen set is explicit in
+        # the selection.
+        frozen_keys = set(selection.frozen_state.parameter_keys) | set(
+            selection.frozen_state.buffer_keys
+        )
         if not frozen_keys:
             return 1.0
         loaded = set(getattr(load_report, "loaded", ()))
         missing = frozen_keys - loaded
         if missing:
             raise RuntimeError(
-                "Production checkpoint must load 100% of the frozen backbone. "
-                f"Missing {len(missing)} frozen parameter(s): "
+                "Production checkpoint must load 100% of the frozen backbone "
+                "(parameters + persistent buffers). "
+                f"Missing {len(missing)} frozen state(s): "
                 f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
             )
         return 1.0

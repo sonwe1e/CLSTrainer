@@ -33,6 +33,9 @@ class PackedUint8Backend(FrameBackend):
     def get_many(self, references: Any) -> Any:
         return self._backend.get_many(references)
 
+    def __call__(self, reference: Any) -> Any:
+        return self.get(reference)
+
     def preview(self, reference: Any, output_path: Any) -> None:
         import numpy as np
         from PIL import Image

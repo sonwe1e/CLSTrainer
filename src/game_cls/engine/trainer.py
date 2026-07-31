@@ -103,6 +103,14 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # NPU RNG (torch_npu). Only available when torch_npu is installed and
+    # an NPU device is present.
+    npu = getattr(torch, "npu", None)
+    if npu is not None and hasattr(npu, "manual_seed_all"):
+        try:
+            npu.manual_seed_all(seed)
+        except Exception:
+            pass
 
 
 def _synchronize_device_for_metrics(device) -> None:
@@ -343,12 +351,22 @@ def build_optimizer_groups_from_selection(
     """Build optimizer parameter groups from a TrainableSelection.
 
     This makes TrainablePolicy truly control the optimizer: each group can
-    have its own ``learning_rate_multiplier`` and ``weight_decay``. Parameters
-    not covered by any group fall back to a default group with
-    ``base_learning_rate`` and ``default_weight_decay``.
-    """
-    from ..contracts.trainable import TrainableSelection
+    have its own ``learning_rate_multiplier`` and ``weight_decay``.
 
+    When a group's ``weight_decay is None`` (the default), the group is split
+    into two sub-groups preserving the legacy no-decay semantics for bias,
+    1D, and normalization parameters:
+
+    * ``<group>/decay`` — ``weight_decay=default_weight_decay``
+    * ``<group>/no_decay`` — ``weight_decay=0.0``
+
+    When a group's ``weight_decay`` is explicitly set, all parameters in that
+    group use the given value (no splitting).
+
+    TrainablePolicy must cover every ``requires_grad`` parameter exactly once.
+    Any mismatch raises ``RuntimeError`` so that policy bugs fail fast instead
+    of being silently absorbed into a default group.
+    """
     parameters = dict(model.named_parameters())
     seen: set[str] = set()
     groups: list[dict] = []
@@ -365,51 +383,57 @@ def build_optimizer_groups_from_selection(
             raise RuntimeError(
                 f"Parameters appear in multiple optimizer groups: {overlap}"
             )
-        params = [parameters[name] for name in names]
-        groups.append({
-            "name": spec.name,
-            "params": params,
-            "lr": base_learning_rate * spec.learning_rate_multiplier,
-            "weight_decay": (
-                default_weight_decay
-                if spec.weight_decay is None
-                else spec.weight_decay
-            ),
-        })
+
+        if spec.weight_decay is not None:
+            # Explicit weight decay for the whole group — no splitting.
+            params = [parameters[name] for name in names]
+            groups.append({
+                "name": spec.name,
+                "params": params,
+                "lr": base_learning_rate * spec.learning_rate_multiplier,
+                "weight_decay": spec.weight_decay,
+            })
+        else:
+            # Split into decay / no_decay sub-groups so that bias, 1D, and
+            # normalization parameters do NOT receive weight decay (matches the
+            # legacy ``build_optimizer_parameter_groups`` behavior).
+            decay_names: list[str] = []
+            no_decay_names: list[str] = []
+            for name in names:
+                param = parameters[name]
+                if param.ndim <= 1 or name.endswith(".bias"):
+                    no_decay_names.append(name)
+                else:
+                    decay_names.append(name)
+            if decay_names:
+                groups.append({
+                    "name": f"{spec.name}/decay",
+                    "params": [parameters[n] for n in decay_names],
+                    "lr": base_learning_rate * spec.learning_rate_multiplier,
+                    "weight_decay": default_weight_decay,
+                })
+            if no_decay_names:
+                groups.append({
+                    "name": f"{spec.name}/no_decay",
+                    "params": [parameters[n] for n in no_decay_names],
+                    "lr": base_learning_rate * spec.learning_rate_multiplier,
+                    "weight_decay": 0.0,
+                })
         seen.update(names)
 
-    # Collect any trainable parameters not covered by a named group.
+    # Every trainable parameter must be covered exactly once. No silent
+    # default-group fallback — that would mask TrainablePolicy bugs.
     expected = {
         name
         for name, parameter in parameters.items()
         if parameter.requires_grad
     }
-    uncovered = expected - seen
-    if uncovered:
-        # Fall back to legacy behaviour for uncovered parameters: split by
-        # ndim/bias into decay vs no_decay.
-        decay = []
-        no_decay = []
-        for name in sorted(uncovered):
-            param = parameters[name]
-            if param.ndim <= 1 or name.endswith(".bias"):
-                no_decay.append(param)
-            else:
-                decay.append(param)
-        if decay:
-            groups.append({
-                "name": "default_decay",
-                "params": decay,
-                "lr": base_learning_rate,
-                "weight_decay": default_weight_decay,
-            })
-        if no_decay:
-            groups.append({
-                "name": "default_no_decay",
-                "params": no_decay,
-                "lr": base_learning_rate,
-                "weight_decay": 0.0,
-            })
+    if seen != expected:
+        raise RuntimeError(
+            f"TrainablePolicy optimizer coverage mismatch: "
+            f"missing={sorted(expected - seen)}, "
+            f"unexpected={sorted(seen - expected)}"
+        )
 
     return groups
 
@@ -498,231 +522,32 @@ def _loader_common(config: dict, role: str) -> dict:
 def _make_dataloaders(
     config: dict, rank: int, world_size: int
 ) -> LoaderBundle:
-    from torch.utils.data import DataLoader, Subset
+    """Build dataloaders via the shared legacy pipeline.
 
-    from game_cls.data.video_sampler import DeterministicIndexBatchSampler
+    This delegates to :func:`build_legacy_loader_bundle` in
+    ``data.legacy_pipeline`` — the single source of truth for the default
+    data loading behavior. Previously this function duplicated ~230 lines of
+    data-pipeline code that also lived inside the default ``DataModule``,
+    creating a maintenance burden and a circular-import risk.
+    """
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.legacy_pipeline import build_legacy_loader_bundle
 
-    data_cfg = config["data"]
-    image_spec = ImageSpec.from_config(data_cfg)
-    train_cfg = config["train"]
-    batch_size = int(train_cfg["local_batch_size"])
-    steps_per_epoch = int(train_cfg["steps_per_epoch"])
-    train_common = _loader_common(config, role="train")
-    eval_common = _loader_common(config, role="eval")
+    image_spec = ImageSpec.from_config(config["data"])
 
-    if data_cfg.get("synthetic", False):
-        train_length = max(batch_size * steps_per_epoch * world_size, 128)
-        train_dataset = SyntheticPairDataset(
-            train_length,
-            image_spec,
-            config["experiment"]["seed"],
-        )
-        test_dataset = SyntheticPairDataset(
-            64,
-            image_spec,
-            config["experiment"]["seed"] + 99,
-        )
-        sampler = DeterministicIndexBatchSampler(
-            train_length,
-            batch_size,
-            steps_per_epoch,
-            rank=rank,
-            world_size=world_size,
-            seed=config["experiment"]["seed"],
-        )
-        full_indices = list(range(rank, len(test_dataset), world_size))
-        quick_global = min(
-            len(test_dataset),
-            int(config["evaluation"].get("quick_test_pairs_per_video", 16)) * 2,
-        )
-        quick_indices = list(range(rank, quick_global, world_size))
-        return LoaderBundle(
-            train=DataLoader(
-                train_dataset, batch_sampler=sampler, **train_common
-            ),
-            quick_test=DataLoader(
-                Subset(test_dataset, quick_indices),
-                batch_size=batch_size,
-                **eval_common,
-            ),
-            full_test=DataLoader(
-                Subset(test_dataset, full_indices),
-                batch_size=batch_size,
-                **eval_common,
-            ),
-            sampler=sampler,
-            data_summary={
-                "storage": "synthetic",
-                "train_samples": train_length,
-                "quick_test_samples_global": quick_global,
-                "full_test_samples_global": len(test_dataset),
-            },
-        )
-
-    from game_cls.data.augment import ConsistentPairAugment
-    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
-    from game_cls.data.indexing import (
-        audit_warning_messages,
-        validate_audit_file,
-    )
-    from game_cls.data.lazy_pair_dataset import (
-        LazyTrainingPairDataset,
-        build_eval_dataset,
-    )
-    from game_cls.data.video_index import (
-        read_video_entries_parquet,
-        video_index_memory_bytes,
-    )
-    from game_cls.data.video_sampler import VideoBalancedPairBatchSampler
-
-    if data_cfg.get("strict_audit", True):
-        audit_path = data_cfg.get("audit_path")
-        if not audit_path:
-            audit_path = str(Path(data_cfg["train_index"]).parent / "audit.json")
-        audit = validate_audit_file(
-            audit_path,
-            image_spec=image_spec,
-            scan_policy=ScanPolicy.from_config(data_cfg),
-            duplicate_policy=DuplicatePolicy.from_config(data_cfg),
-            require_test_delta=int(config["pair"]["test_delta"]),
-            require_content_hash=bool(
-                data_cfg.get("require_content_hash_audit", False)
-            ),
-            require_unique_video_keys=bool(
-                data_cfg.get(
-                    "require_unique_video_keys_across_splits", False
-                )
-            ),
-            minimum_pairs_per_game_label_delta={
-                int(key): int(value)
-                for key, value in data_cfg.get(
-                    "minimum_pairs_per_game_label_delta", {}
-                ).items()
-            },
-        )
-        if rank == 0:
-            for warning in audit_warning_messages(audit):
-                print(f"[WARNING] {warning}", flush=True)
-    delta_probability = {
-        int(key): float(value)
-        for key, value in config["pair"]["train_delta_probability"].items()
-    }
-    backend_name = data_cfg.get("backend", "png")
-    if backend_name == "packed_uint8":
-        train_video_index = data_cfg.get(
-            "train_packed_video_index"
-        ) or str(
-            Path(data_cfg["train_packed_index"]).with_name(
-                "packed_video_entries.parquet"
-            )
-        )
-        test_video_index = data_cfg.get("test_packed_video_index") or str(
-            Path(data_cfg["test_packed_index"]).with_name(
-                "packed_video_entries.parquet"
-            )
-        )
-    else:
-        train_video_index = data_cfg.get("train_video_index")
-        test_video_index = data_cfg.get("test_video_index")
-    train_videos = read_video_entries_parquet(
-        train_video_index
-        if train_video_index and Path(train_video_index).is_file()
-        else data_cfg["train_index"],
-        delta_probability.keys(),
-    )
-    test_delta = int(config["pair"]["test_delta"])
-    test_videos = read_video_entries_parquet(
-        test_video_index
-        if test_video_index and Path(test_video_index).is_file()
-        else data_cfg["test_index"],
-        (test_delta,),
-    )
-    transform = None
-    if config.get("augmentation", {}).get("enabled", True):
-        transform = ConsistentPairAugment(config["augmentation"])
-    # Use BackendFactory to create the frame backend. This replaces the
-    # conditional branch with a factory-driven approach so that new backends
-    # can be added without modifying the training loop.
-    from game_cls.data.backends.registry import build_backend_from_legacy_data_config
-
-    backend_selector = config.get("data", {}).get("backend", {})
-    if isinstance(backend_selector, dict):
+    # Build a minimal namespace that looks like a RuntimeStrategy so the
+    # legacy pipeline can read rank/world_size without depending on the
+    # runtime machinery.
+    class _RuntimeView:
         pass
-    else:
-        backend_selector = {"type": str(backend_selector), "params": {}}
-    train_decoder = build_backend_from_legacy_data_config(
-        data_cfg, backend_selector, "train", image_spec
-    )
-    test_decoder = build_backend_from_legacy_data_config(
-        data_cfg, backend_selector, "test", image_spec
-    )
-    train_dataset = LazyTrainingPairDataset(
-        train_videos, transform=transform, decoder=train_decoder
-    )
-    sampler_cfg = config["sampler"]
-    sampler = VideoBalancedPairBatchSampler(
-        train_videos,
-        batch_size,
-        steps_per_epoch,
-        rank=rank,
-        world_size=world_size,
-        seed=config["experiment"]["seed"],
-        game_alpha=sampler_cfg.get("game_alpha", 0.25),
-        class_probability={
-            int(key): float(value)
-            for key, value in sampler_cfg["class_probability"].items()
-        },
-        delta_probability=delta_probability,
-        deduplicate_within_global_batch=sampler_cfg.get(
-            "deduplicate_within_global_batch", True
-        ),
-    )
-    quick_dataset = build_eval_dataset(
-        test_videos,
-        test_delta,
-        rank=rank,
-        world_size=world_size,
-        max_pairs_per_video=int(
-            config["evaluation"].get("quick_test_pairs_per_video", 128)
-        ),
-        decoder=test_decoder,
-    )
-    full_dataset = build_eval_dataset(
-        test_videos,
-        test_delta,
-        rank=rank,
-        world_size=world_size,
-        decoder=test_decoder,
-    )
-    global_quick = _distributed_sum_int(len(quick_dataset))
-    global_full = _distributed_sum_int(len(full_dataset))
-    if global_quick <= 0 or global_full <= 0:
-        raise RuntimeError("Test index does not contain legal delta=2 pairs")
-    return LoaderBundle(
-        train=DataLoader(
-            train_dataset, batch_sampler=sampler, **train_common
-        ),
-        quick_test=DataLoader(
-            quick_dataset, batch_size=batch_size, **eval_common
-        ),
-        full_test=DataLoader(
-            full_dataset, batch_size=batch_size, **eval_common
-        ),
-        sampler=sampler,
-        data_summary={
-            "storage": "video_index_lazy_pairs",
-            "image_backend": backend_name,
-            "train_videos": len(train_videos),
-            "test_videos": len(test_videos),
-            "video_index_payload_bytes_per_rank_estimate": (
-                video_index_memory_bytes(train_videos)
-                + video_index_memory_bytes(test_videos)
-            ),
-            "quick_test_samples_global": global_quick,
-            "full_test_samples_global": global_full,
-            "full_test_index_bytes_this_rank": full_dataset.index_nbytes,
-        },
-    )
+
+    runtime = _RuntimeView()
+    runtime.distributed = _RuntimeView()
+    runtime.distributed.rank = rank
+    runtime.distributed.world_size = world_size
+    runtime.distributed.local_rank = rank
+
+    return build_legacy_loader_bundle(config, image_spec, runtime)
 
 
 def _distributed_sum_int(value: int) -> int:
@@ -815,6 +640,18 @@ def _save_all_ranks(
     trainable_selection: Any = None,
     trainable_policy: Any = None,
 ) -> None:
+    # Synchronize the device before saving so that any async NPU/CUDA
+    # operations (e.g. the last optimizer step) complete before we serialize
+    # the state. Without this, the checkpoint boundary could overlap with
+    # still-pending device work.
+    if runtime is not None:
+        runtime.synchronize()
+        runtime.barrier()
+    else:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
     if runtime is None:
         states = _gather_random_states(rank, world_size)
     else:
@@ -1491,6 +1328,12 @@ def _run_training_loop(
         }
         resume_path = train_cfg.get("resume_path")
         if resume_path:
+            # When a TrainableSelection is available (runner path), pass it so
+            # that V2 trainable_only checkpoints are verified against the stored
+            # manifest instead of the old parent-module-prefix inference.
+            _resume_selection = trainable_selection if trainable_selection is not None else None
+            _resume_policy_name = trainable_policy.policy_name if trainable_policy is not None else None
+            _resume_policy_version = trainable_policy.state_version if trainable_policy is not None else None
             checkpoint = restore_training_checkpoint(
                 resume_path,
                 resolved_model,
@@ -1498,6 +1341,9 @@ def _run_training_loop(
                 scheduler,
                 scaler,
                 expected_base_checkpoint=config["model"].get("checkpoint_path"),
+                expected_trainable_selection=_resume_selection,
+                expected_policy_name=_resume_policy_name,
+                expected_policy_version=_resume_policy_version,
             )
             global_step = int(checkpoint.get("global_step", 0))
             sampler_state = checkpoint.get("sampler_state", {})
@@ -2059,6 +1905,12 @@ def _run_training_loop(
             "evaluation_state": evaluation_state,
         }
     finally:
+        # Close data module resources (backends, memmaps, file descriptors).
+        if data_module is not None:
+            try:
+                data_module.close()
+            except Exception:
+                pass
         if runtime is None:
             cleanup_distributed()
         else:

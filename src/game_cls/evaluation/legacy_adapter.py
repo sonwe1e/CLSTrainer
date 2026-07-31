@@ -4,6 +4,13 @@ from typing import Any
 
 from ..contracts.evaluation import EvaluatorSuite
 from ..engine.evaluator import EvaluationOutput, evaluate
+from ..registry import register
+
+
+@register("evaluation_suite", "legacy_binary")
+def build_legacy_evaluator_suite(**kwargs: Any) -> LegacyEvaluatorSuite:
+    """Factory registered as ``evaluation_suite/legacy_binary``."""
+    return LegacyEvaluatorSuite(**kwargs)
 
 
 class LegacyEvaluatorSuite(EvaluatorSuite):
@@ -16,6 +23,12 @@ class LegacyEvaluatorSuite(EvaluatorSuite):
     existing ``evaluate`` function that is known to work on CPU/CUDA/NPU and
     across process groups.
     """
+
+    #: Task names this evaluator suite supports. The builder checks this and
+    #: raises at startup if the configured task is incompatible (fail-fast).
+    supported_task_names: set[str] = {"dual_frame_binary"}
+
+    suite_name = "legacy_binary"
 
     def __init__(
         self,

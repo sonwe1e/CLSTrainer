@@ -19,6 +19,7 @@ class ComposedRuntimeStrategy:
     ) -> None:
         self._accelerator = accelerator
         self._distributed = distributed
+        self._is_setup = False
 
     @property
     def accelerator(self) -> AcceleratorAdapter:
@@ -29,11 +30,14 @@ class ComposedRuntimeStrategy:
         return self._distributed
 
     def setup(self) -> None:
+        if self._is_setup:
+            return
         self._accelerator.setup(self._distributed.local_rank)
         # The distributed adapter initializes its process group here (e.g.
         # ``dist.init_process_group`` for DDP). The adapter falls back to its
         # own configured backend when ``None`` is passed.
         self._distributed.setup(None)
+        self._is_setup = True
 
     def wrap_model(self, model: Any) -> Any:
         return self._distributed.wrap_model(model, self._accelerator.device)
@@ -69,4 +73,7 @@ class ComposedRuntimeStrategy:
         self._accelerator.synchronize()
 
     def cleanup(self) -> None:
+        if not self._is_setup:
+            return
         self._distributed.cleanup()
+        self._is_setup = False

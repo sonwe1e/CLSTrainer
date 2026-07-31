@@ -35,15 +35,27 @@ class ExperimentRunner:
         """Set up runtime, seed RNG, then build components.
 
         The order matters for exact training resume:
-        1. Set up the runtime (so we know the rank).
-        2. Seed the RNG (so model initialization is deterministic).
-        3. Build components (model, task, policy, evaluator).
+        1. Build the runtime (single instance).
+        2. Call runtime.setup() (initializes device + process group).
+        3. Seed the RNG (so model initialization is deterministic).
+        4. Build components (model, task, policy, evaluator) using the SAME runtime.
+
+        IMPORTANT: There must be exactly ONE runtime instance. It is created here,
+        passed to build_core_components, used by the adapter for training, and
+        cleaned up in close(). Previously two runtimes were created (one here, one
+        inside build_core_components) and setup() was never called — that silently
+        broke NPU device init and DDP/HCCL process group setup.
         """
         from game_cls.engine.trainer import _seed_everything
 
-        # Build runtime first so we know the rank for seeding.
+        # Build the single runtime instance.
         from .builders import build_runtime, _runtime_selector
         runtime = build_runtime(_runtime_selector(self._config))
+
+        # Initialize the runtime: sets up the device (e.g. torch.npu.set_device)
+        # and the distributed process group (e.g. dist.init_process_group).
+        runtime.setup()
+
         rank = int(runtime.distributed.rank)
 
         # Seed BEFORE building the model so initialization is deterministic.
@@ -51,7 +63,9 @@ class ExperimentRunner:
         _seed_everything(seed + rank)
 
         # Now build components (model init will use the seeded RNG).
-        self.components = build_core_components(self._config)
+        # Pass the SAME runtime instance — do not let build_core_components
+        # create a second one.
+        self.components = build_core_components(self._config, runtime=runtime)
         self._adapter = LegacyTrainingEngineAdapter(runtime)
 
     def run(self) -> dict:

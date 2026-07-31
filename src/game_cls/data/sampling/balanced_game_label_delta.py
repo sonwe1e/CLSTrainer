@@ -77,12 +77,11 @@ class BalancedGameLabelDeltaPolicy(SamplingPolicyBase):
             self._iter_key = context.epoch
             return next(self._iterator)
 
-    def state_dict(self) -> dict:
-        return {"epoch": self._sampler.epoch, "start_step": self._sampler.start_step}
+    def state_dict(self, step_in_epoch: int | None = None) -> dict:
+        return self._sampler.state_dict(step_in_epoch)
 
     def load_state_dict(self, state: dict) -> None:
-        self._sampler.epoch = int(state.get("epoch", 0))
-        self._sampler.start_step = int(state.get("start_step", 0))
+        self._sampler.load_state_dict(state)
 
     def update_feedback(self, feedback: list[SamplingFeedback]) -> None:
         del feedback
@@ -90,3 +89,29 @@ class BalancedGameLabelDeltaPolicy(SamplingPolicyBase):
     @property
     def inner_sampler(self) -> Any:
         return self._sampler
+
+    @property
+    def last_epoch_delta_counts(self) -> Any:
+        return self._sampler.last_epoch_delta_counts
+
+    @property
+    def last_epoch_game_label_delta_counts(self) -> Any:
+        return self._sampler.last_epoch_game_label_delta_counts
+
+    # -- BatchSampler interface ---------------------------------------------
+    # The policy can be used directly as a PyTorch ``BatchSampler`` so the
+    # ``DataLoader`` receives a single object that both owns the sampling
+    # algorithm and adapts it to the iterator protocol.
+    def __iter__(self):
+        for step in range(self._sampler.steps_per_epoch):
+            context = SamplingContext(
+                epoch=self._sampler.epoch,
+                step=step,
+                global_batch_size=0,
+                world_size=self._sampler.world_size,
+                seed=self._sampler.seed,
+            )
+            yield self.sample_rank_batch(None, context)
+
+    def __len__(self) -> int:
+        return self._sampler.steps_per_epoch
