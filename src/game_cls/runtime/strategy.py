@@ -30,6 +30,10 @@ class ComposedRuntimeStrategy:
 
     def setup(self) -> None:
         self._accelerator.setup(self._distributed.local_rank)
+        # The distributed adapter initializes its process group here (e.g.
+        # ``dist.init_process_group`` for DDP). The adapter falls back to its
+        # own configured backend when ``None`` is passed.
+        self._distributed.setup(None)
 
     def wrap_model(self, model: Any) -> Any:
         return self._distributed.wrap_model(model, self._accelerator.device)

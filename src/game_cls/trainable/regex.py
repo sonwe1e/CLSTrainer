@@ -86,12 +86,19 @@ class RegexTrainablePolicy(TrainablePolicyBase):
     def validate_loaded_state(
         self, model: Any, load_report: Any, selection: TrainableSelection
     ) -> float:
-        from ..model.checkpoint_loader import validate_production_load
-
-        del selection
-        # The production validator keys off a name token; for regex policies the
-        # frozen set is already explicit in the selection, so we rely on the
-        # checkpoint key-set check at restore time and just confirm coverage via
-        # the standard API using a permissive token that matches the includes.
-        token = self.include[0].replace("(", "").replace(")", "").replace(".*", "") or "cls"
-        return validate_production_load(model, load_report, trainable_name_contains=token)
+        # Validate that the frozen backbone parameters are fully covered by the
+        # loaded checkpoint. For regex policies the frozen set is explicit in
+        # the selection, so we check coverage directly against those keys rather
+        # than trying to reverse a regex into a token.
+        frozen_keys = set(selection.frozen_state.parameter_keys)
+        if not frozen_keys:
+            return 1.0
+        loaded = set(getattr(load_report, "loaded", ()))
+        missing = frozen_keys - loaded
+        if missing:
+            raise RuntimeError(
+                "Production checkpoint must load 100% of the frozen backbone. "
+                f"Missing {len(missing)} frozen parameter(s): "
+                f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+        return 1.0

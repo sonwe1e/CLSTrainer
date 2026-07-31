@@ -30,7 +30,7 @@ class LegacyGameBinaryIndexCodec(IndexCodecBase):
         for video in videos:
             for delta in temporal_requirements:
                 starts = video.valid_start_positions.get(delta)
-                if not starts:
+                if starts is None or len(starts) == 0:
                     continue
                 for start_position in starts:
                     frame0_id, frame1_id, ref0, ref1 = video.pair_paths(delta, int(start_position))

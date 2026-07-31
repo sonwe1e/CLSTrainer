@@ -24,13 +24,16 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
                 "trainable_parameter_groups()."
             )
         declared = model.trainable_parameter_groups()
-        trainable_names: list[str] = []
+        if not declared:
+            raise RuntimeError("ModelDeclaredTrainablePolicy: no groups declared.")
+        # First collect every trainable name across all groups, then set
+        # requires_grad once. The previous loop set it per-group, which meant
+        # each group froze the previous group's parameters (last-group-wins).
+        trainable_set: set[str] = set()
         groups = []
         for group in declared:
             names = list(group["parameter_names"])
-            for name, parameter in model.named_parameters():
-                parameter.requires_grad = name in set(names)
-            trainable_names.extend(names)
+            trainable_set.update(names)
             groups.append(
                 _group_spec(
                     group["name"],
@@ -38,15 +41,17 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
                     lr_multiplier=float(group.get("learning_rate_multiplier", 1.0)),
                 )
             )
-        if not trainable_names:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = name in trainable_set
+        if not trainable_set:
             raise RuntimeError("ModelDeclaredTrainablePolicy matched no parameters.")
         all_names = list(dict.fromkeys(name for name, _ in model.named_parameters()))
-        frozen_names = [name for name in all_names if name not in set(trainable_names)]
+        frozen_names = [name for name in all_names if name not in trainable_set]
         return TrainableSelection(
             groups=tuple(groups),
             frozen_parameter_names=tuple(frozen_names),
             trainable_state=StateSelection(
-                parameter_keys=tuple(trainable_names), buffer_keys=()
+                parameter_keys=tuple(sorted(trainable_set)), buffer_keys=()
             ),
             frozen_state=StateSelection(
                 parameter_keys=tuple(frozen_names), buffer_keys=()
@@ -65,5 +70,17 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
     def validate_loaded_state(
         self, model: Any, load_report: Any, selection: TrainableSelection
     ) -> float:
-        del model, load_report, selection
+        # Validate that the frozen backbone parameters are fully covered by the
+        # loaded checkpoint. The frozen set is explicit in the selection.
+        frozen_keys = set(selection.frozen_state.parameter_keys)
+        if not frozen_keys:
+            return 1.0
+        loaded = set(getattr(load_report, "loaded", ()))
+        missing = frozen_keys - loaded
+        if missing:
+            raise RuntimeError(
+                "Production checkpoint must load 100% of the frozen backbone. "
+                f"Missing {len(missing)} frozen parameter(s): "
+                f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
+            )
         return 1.0

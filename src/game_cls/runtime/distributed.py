@@ -27,8 +27,7 @@ class SingleProcessDistributed:
         del backend
 
     def wrap_model(self, model: Any, device: Any) -> Any:
-        del device
-        return model
+        return model.to(device)
 
     def barrier(self) -> None:
         pass
@@ -40,6 +39,11 @@ class SingleProcessDistributed:
     def gather_object(self, value: Any, dst: int = 0) -> list[Any]:
         del dst
         return [value]
+
+    def broadcast_object_list(self, object_list: list[Any], src: int = 0) -> None:
+        del src
+        # Single process: nothing to broadcast; object_list already holds the
+        # local value at index 0.
 
     def cleanup(self) -> None:
         pass

@@ -35,10 +35,18 @@ class NameTokenTrainablePolicy(TrainablePolicyBase):
         return self.token.casefold() in name.casefold()
 
     def select(self, model: Any) -> TrainableSelection:
-        from ..model.freeze_policy import configure_trainable_parameters
-
-        summary = configure_trainable_parameters(model, self.token)
-        trainable_names = list(summary.trainable_names)
+        trainable_names: list[str] = []
+        for name, parameter in model.named_parameters():
+            if self._match(name):
+                parameter.requires_grad = True
+                trainable_names.append(name)
+            else:
+                parameter.requires_grad = False
+        if not trainable_names:
+            raise RuntimeError(
+                f"No trainable parameter contains the token {self.token!r} "
+                f"(case_sensitive={self.case_sensitive})."
+            )
         all_names = list(dict.fromkeys(name for name, _ in model.named_parameters()))
         frozen_names = [name for name in all_names if name not in set(trainable_names)]
 

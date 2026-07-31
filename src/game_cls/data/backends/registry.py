@@ -30,5 +30,22 @@ def build_backend(name: str, config: Any, image_spec: Any, split: str) -> FrameB
     return resolve_backend_factory(name).create(config, image_spec, split)
 
 
+def build_backend_from_legacy_data_config(
+    data_config: Any, backend_selector: Any, split: str, image_spec: Any
+) -> FrameBackend:
+    """Build a backend from the legacy flat ``data`` config.
+
+    During migration the ``data.backend`` selector carries no ``index_path``,
+    so we route through each factory's ``create_from_legacy_data_config`` which
+    knows how to find the path from the legacy ``data.{split}_packed_index``.
+    """
+    name = str(backend_selector.get("type", "png"))
+    factory = resolve_backend_factory(name)
+    if hasattr(factory, "create_from_legacy_data_config"):
+        return factory.create_from_legacy_data_config(data_config, split, image_spec)
+    # Factories without a legacy adapter fall back to the standard create.
+    return factory.create(backend_selector.get("params", {}), image_spec, split)
+
+
 def registered_backends() -> list[str]:
     return sorted(_FACTORIES)

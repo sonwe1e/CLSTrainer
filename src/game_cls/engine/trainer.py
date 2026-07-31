@@ -694,6 +694,16 @@ def _gather_random_states(rank: int, world_size: int) -> list[dict] | None:
     return gathered
 
 
+def _gather_random_states_via_runtime(runtime: Any) -> list[dict] | None:
+    local = capture_random_state()
+    dist = runtime.distributed
+    if dist.world_size <= 1:
+        return [local]
+    gathered = [None for _ in range(dist.world_size)] if dist.rank == 0 else None
+    dist.gather_object(local, dst=0)
+    return gathered
+
+
 def _normalized_position(
     epoch: int, step_in_epoch: int, steps_per_epoch: int
 ) -> tuple[int, int]:
@@ -720,8 +730,12 @@ def _save_all_ranks(
     rank: int,
     world_size: int,
     force_full_model: bool = False,
+    runtime: Any = None,
 ) -> None:
-    states = _gather_random_states(rank, world_size)
+    if runtime is None:
+        states = _gather_random_states(rank, world_size)
+    else:
+        states = _gather_random_states_via_runtime(runtime)
     save_epoch, save_step = _normalized_position(
         epoch, step_in_epoch, int(config["train"]["steps_per_epoch"])
     )
@@ -950,6 +964,15 @@ def run_training(config: dict[str, Any]) -> dict:
         runner.close()
 
 
+def _run_training_loop_legacy(config: dict[str, Any]) -> dict:
+    """Standalone entry point that runs the loop without a component runtime.
+
+    Used by callers that go through ``_run_training_loop`` directly without
+    building the full component graph. Preserves the original behavior.
+    """
+    return _run_training_loop(config)
+
+
 def _build_components_for_runner(config: dict[str, Any]) -> Any:
     """Build the task and runtime components the runner needs."""
     from game_cls.data.image_spec import ImageSpec
@@ -1019,7 +1042,9 @@ def _build_trainable_policy(config: dict[str, Any]) -> Any:
     return build_trainable_policy(sel)
 
 
-def _run_training_loop(config: dict[str, Any]) -> dict:
+def _run_training_loop(
+    config: dict[str, Any], *, runtime: Any = None
+) -> dict:
     import torch
 
     validate_training_config(config)
@@ -1031,7 +1056,18 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
         loss_config=config["loss"],
         task_config=None,
     )
-    rank, world_size, local_rank, device = initialize_runtime(config)
+
+    # When a runtime is supplied (from the runner's component graph) we use it
+    # directly; otherwise we fall back to the legacy ``initialize_runtime``
+    # path so the loop still works as a standalone entry point.
+    if runtime is None:
+        rank, world_size, local_rank, device = initialize_runtime(config)
+    else:
+        rank = int(runtime.distributed.rank)
+        world_size = int(runtime.distributed.world_size)
+        local_rank = int(runtime.distributed.local_rank)
+        device = runtime.accelerator.device
+
     try:
         seed = int(config["experiment"]["seed"])
         _seed_everything(seed + rank)
@@ -1069,17 +1105,20 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
             model, config["model"].get("trainable_name_contains", "cls")
         )
         _set_train_mode(model, config["model"])
-        model.to(device)
-        if world_size > 1:
-            from torch.nn.parallel import DistributedDataParallel
+        if runtime is None:
+            model.to(device)
+            if world_size > 1:
+                from torch.nn.parallel import DistributedDataParallel
 
-            model = DistributedDataParallel(
-                model,
-                device_ids=[local_rank],
-                find_unused_parameters=False,
-                broadcast_buffers=False,
-                gradient_as_bucket_view=True,
-            )
+                model = DistributedDataParallel(
+                    model,
+                    device_ids=[local_rank],
+                    find_unused_parameters=False,
+                    broadcast_buffers=False,
+                    gradient_as_bucket_view=True,
+                )
+        else:
+            model = runtime.wrap_model(model)
         frozen_snapshot = None
         if rank == 0:
             print("Trainable parameters:")
@@ -1137,9 +1176,12 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
         )
         scheduler = _build_scheduler(optimizer, config["scheduler"], total_steps)
         use_amp = bool(config["device"].get("amp", False))
-        scaler = torch.amp.GradScaler(
-            device.type, enabled=use_amp and config["device"]["amp_dtype"] == "float16"
-        )
+        if runtime is None:
+            scaler = torch.amp.GradScaler(
+                device.type, enabled=use_amp and config["device"]["amp_dtype"] == "float16"
+            )
+        else:
+            scaler = runtime.accelerator.make_grad_scaler(use_amp, config["device"].get("amp_dtype", "float16"))
         global_step = 0
         epoch = 0
         step_in_epoch = 0
@@ -1265,9 +1307,14 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                 )
                 optimizer.zero_grad(set_to_none=True)
                 forward_started = time.perf_counter()
-                with autocast_context(
-                    device, use_amp, config["device"].get("amp_dtype", "float16")
-                ):
+                autocast_ctx = (
+                    runtime.autocast(use_amp, config["device"].get("amp_dtype", "float16"))
+                    if runtime is not None
+                    else autocast_context(
+                        device, use_amp, config["device"].get("amp_dtype", "float16")
+                    )
+                )
+                with autocast_ctx:
                     task_output = task.forward(model, device_batch, context)
                     loss_output = task.compute_loss(task_output, device_batch, context)
                 timing["host_forward_enqueue"] += (
@@ -1349,7 +1396,12 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                         world_size=world_size,
                     )
                     evaluation_state["full_test_count"] += 1
-                    metrics = _broadcast_object(result.metrics, rank)
+                    if runtime is None:
+                        metrics = _broadcast_object(result.metrics, rank)
+                    else:
+                        payload = [result.metrics if rank == 0 else None]
+                        runtime.distributed.broadcast_object_list(payload, src=0)
+                        metrics = payload[0]
                     evaluation_state["last_full_metrics"] = metrics
                     is_best = _is_better_model(
                         metrics, best_metrics, config["evaluation"]
@@ -1388,6 +1440,7 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                         rank=rank,
                         world_size=world_size,
                         force_full_model=True,
+                        runtime=runtime,
                     )
                     if rank == 0:
                         clone_checkpoint_pair(
@@ -1413,6 +1466,7 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                         evaluation_state=evaluation_state,
                         rank=rank,
                         world_size=world_size,
+                        runtime=runtime,
                     )
                 if checkpoint_started is not None:
                     checkpoint_seconds += (
@@ -1424,7 +1478,10 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                     or global_step >= run_until_step
                 )
                 if should_log:
-                    _synchronize_device_for_metrics(device)
+                    if runtime is None:
+                        _synchronize_device_for_metrics(device)
+                    else:
+                        runtime.synchronize()
                     if rank == 0:
                         now = time.perf_counter()
                         interval_seconds = now - log_interval_start
@@ -1588,9 +1645,12 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                     world_size=world_size,
                 )
                 evaluation_state["full_test_count"] += 1
-                final_metrics = _broadcast_object(
-                    result.metrics, rank
-                )
+                if runtime is None:
+                    final_metrics = _broadcast_object(result.metrics, rank)
+                else:
+                    payload = [result.metrics if rank == 0 else None]
+                    runtime.distributed.broadcast_object_list(payload, src=0)
+                    final_metrics = payload[0]
                 evaluation_state["last_full_metrics"] = final_metrics
                 if _is_better_model(
                     final_metrics, best_metrics, config["evaluation"]
@@ -1617,6 +1677,7 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
             rank=rank,
             world_size=world_size,
             force_full_model=True,
+            runtime=runtime,
         )
         if (
             final_is_best
@@ -1628,7 +1689,10 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                 "last",
                 "best_observed_dev_test_selection",
             )
-        distributed_barrier()
+        if runtime is None:
+            distributed_barrier()
+        else:
+            runtime.barrier()
         if rank == 0:
             if frozen_snapshot is not None:
                 assert_frozen_parameters_unchanged(frozen_snapshot, model)
@@ -1662,7 +1726,10 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
                 json.dumps(summary_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        distributed_barrier()
+        if runtime is None:
+            distributed_barrier()
+        else:
+            runtime.barrier()
         return {
             "global_step": global_step,
             "last_metrics": evaluation_state["last_full_metrics"],
@@ -1670,4 +1737,7 @@ def _run_training_loop(config: dict[str, Any]) -> dict:
             "evaluation_state": evaluation_state,
         }
     finally:
-        cleanup_distributed()
+        if runtime is None:
+            cleanup_distributed()
+        else:
+            runtime.cleanup()

@@ -59,18 +59,19 @@ class BalancedGameLabelDeltaPolicy(SamplingPolicyBase):
         self, catalog: SamplingCatalog, context: SamplingContext
     ) -> list[Any]:
         del catalog
-        key = (context.epoch, context.step)
-        if self._iter_key != key or self._iterator is None:
+        # Rebuild the iterator once per epoch, not once per step. Keying on
+        # (epoch, step) would rebuild on every batch and turn epoch work O(N²).
+        if context.step == 0 or self._iter_key != context.epoch or self._iterator is None:
             self._sampler.set_epoch(context.epoch, start_step=context.step)
             self._iterator = iter(self._sampler)
-            self._iter_key = key
+            self._iter_key = context.epoch
         try:
             return next(self._iterator)
         except StopIteration:
             # Exhausted the epoch's steps; restart from the current step.
             self._sampler.set_epoch(context.epoch, start_step=context.step)
             self._iterator = iter(self._sampler)
-            self._iter_key = key
+            self._iter_key = context.epoch
             return next(self._iterator)
 
     def state_dict(self) -> dict:

@@ -31,6 +31,7 @@ class BinaryConfusionAccumulator(MetricAccumulator):
         self._confidence_edges = torch.tensor(
             [0.980, 0.990, 0.995, 0.999], dtype=torch.float32
         )
+        self._device: torch.device | None = None
         self._margins: list[float] = []
         self._targets: list[int] = []
         self._exact = True
@@ -43,6 +44,17 @@ class BinaryConfusionAccumulator(MetricAccumulator):
         probabilities = decision.scores.float()
         predictions = decision.predictions
 
+        # On the first update, move accumulators to the input device so all
+        # subsequent arithmetic stays on one device (avoids CPU/GPU mismatch).
+        if self._device is None:
+            self._device = targets.device
+            self._to(self._device)
+        # Move inputs to the accumulator device for the duration of the update.
+        targets = targets.to(self._device)
+        margins = margins.to(self._device)
+        probabilities = probabilities.to(self._device)
+        predictions = predictions.to(self._device)
+
         self._sample_count += len(targets)
         self._counts.add_(
             torch.stack(
@@ -52,10 +64,11 @@ class BinaryConfusionAccumulator(MetricAccumulator):
                     ((~predictions) & (targets == 1)).sum(),
                     ((~predictions) & (targets == 0)).sum(),
                 )
-            ).to(torch.int64)
+            )
         )
         logits = prediction_batch.extras.get("logits")
         if logits is not None:
+            logits = logits.to(self._device)
             self._ce_sum.add_(
                 torch.nn.functional.cross_entropy(logits.float(), targets, reduction="sum")
             )
@@ -83,13 +96,28 @@ class BinaryConfusionAccumulator(MetricAccumulator):
         self._margins.extend(margins.cpu().tolist())
         self._targets.extend(targets.cpu().tolist())
 
-    def distributed_reduce(self, runtime: Any) -> None:
-        import torch
+    def _to(self, device: Any) -> None:
+        """Move all accumulator tensors to ``device``."""
+        self._counts = self._counts.to(device)
+        self._ce_sum = self._ce_sum.to(device)
+        self._brier_sum = self._brier_sum.to(device)
+        self._positive_hist = self._positive_hist.to(device)
+        self._negative_hist = self._negative_hist.to(device)
+        self._calibration_count = self._calibration_count.to(device)
+        self._calibration_probability = self._calibration_probability.to(device)
+        self._calibration_target = self._calibration_target.to(device)
+        self._confidence_counts = self._confidence_counts.to(device)
+        self._confidence_edges = self._confidence_edges.to(device)
 
+    def distributed_reduce(self, runtime: Any) -> None:
         dist = runtime.distributed
         if dist.world_size <= 1:
             return
-        counts = torch.cat((self._counts, torch.tensor([self._sample_count], dtype=torch.int64)))
+        import torch
+
+        # Accumulators live on the input device (moved there in update); the
+        # distributed adapter's all_reduce handles device placement.
+        counts = torch.cat((self._counts, torch.tensor([self._sample_count], dtype=torch.int64, device=self._device)))
         floating = torch.stack((self._ce_sum, self._brier_sum))
         dist.all_reduce(counts)
         dist.all_reduce(floating)

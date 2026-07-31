@@ -33,10 +33,9 @@ class PngBackend(FrameBackend):
 
     def preview(self, reference: Any, output_path: Any) -> None:
         from PIL import Image
-        from torchvision.transforms.v2 import functional as F
 
         with Image.open(str(reference)) as image:
-            F.to_image(image.convert("RGB")).save(str(output_path))
+            image.convert("RGB").save(str(output_path))
 
     def close(self) -> None:
         pass
@@ -48,6 +47,14 @@ class PngBackendFactory(FrameBackendFactory, PngDecoderMixin):
     def create(self, config: Any, image_spec: Any, split: str) -> FrameBackend:
         del config, split
         return PngBackend(image_spec=image_spec, decoder=self._decode)
+
+    @classmethod
+    def create_from_legacy_data_config(
+        cls, data_config: Any, split: str, image_spec: Any
+    ) -> FrameBackend:
+        """Build a PNG backend from the legacy flat ``data`` config section."""
+        del data_config, split
+        return PngBackend(image_spec=image_spec, decoder=cls()._decode)
 
 
 register_backend("png")(PngBackendFactory())

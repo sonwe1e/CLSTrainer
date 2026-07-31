@@ -51,14 +51,15 @@ class PackedUint8Backend(FrameBackend):
         self.close()
 
     def __getstate__(self) -> dict:
-        return self._backend.__getstate__()
+        return {"_backend_state": self._backend.__getstate__()}
 
     def __setstate__(self, state: dict) -> None:
         # Rebuild from the serializable spec on the worker side.
         from game_cls.data.packed_backend import PackedUint8Backend as _Legacy
 
+        backend_state = state["_backend_state"]
         self._backend = _Legacy.__new__(_Legacy)
-        self._backend.__setstate__(state)
+        self._backend.__setstate__(backend_state)
 
 
 class PackedUint8BackendFactory(FrameBackendFactory):
@@ -69,6 +70,28 @@ class PackedUint8BackendFactory(FrameBackendFactory):
 
         index_path = config["index_path"]
         max_open_shards = int(config.get("max_open_shards", 16))
+        legacy = _Legacy(index_path, image_spec=image_spec, max_open_shards=max_open_shards)
+        return PackedUint8Backend(legacy)
+
+    @classmethod
+    def create_from_legacy_data_config(
+        cls, data_config: Any, split: str, image_spec: Any
+    ) -> FrameBackend:
+        """Build a backend from the legacy flat ``data`` config section.
+
+        The V2 migration emits ``data.backend = {type: packed_uint8, params: {}}``
+        which lacks the ``index_path`` the factory needs. This method reads the
+        path from the legacy ``data.{split}_packed_index`` key so the registry
+        can be used during the migration period.
+        """
+        from game_cls.data.packed_backend import PackedUint8Backend as _Legacy
+
+        index_path = data_config.get(f"{split}_packed_index")
+        if not index_path:
+            raise ValueError(
+                f"PackedUint8Backend requires data.{split}_packed_index to be set."
+            )
+        max_open_shards = int(data_config.get("packed_max_open_shards", 16))
         legacy = _Legacy(index_path, image_spec=image_spec, max_open_shards=max_open_shards)
         return PackedUint8Backend(legacy)
 

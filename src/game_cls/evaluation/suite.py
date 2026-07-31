@@ -86,7 +86,9 @@ class BinaryThresholdEvaluatorSuite:
                     self._groups.update(prediction_batch, decision)
                     error_batch = self._errors.extract(prediction_batch, decision, checkpoint_step)
                     if evaluation_kind == "quick":
-                        local_errors.extend(error_batch.false_positives)
+                        local_errors.extend(
+                            error_batch.false_positives + error_batch.false_negatives
+                        )
                         local_near.extend(error_batch.near_threshold)
                         if quick_limit > 0:
                             local_errors = local_errors[:quick_limit]
