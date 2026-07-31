@@ -640,28 +640,22 @@ def _make_dataloaders(
     transform = None
     if config.get("augmentation", {}).get("enabled", True):
         transform = ConsistentPairAugment(config["augmentation"])
-    if backend_name == "png":
-        train_decoder = None
-        test_decoder = None
-    elif backend_name == "packed_uint8":
-        from game_cls.data.packed_backend import PackedUint8Backend
+    # Use BackendFactory to create the frame backend. This replaces the
+    # conditional branch with a factory-driven approach so that new backends
+    # can be added without modifying the training loop.
+    from game_cls.data.backends.registry import build_backend_from_legacy_data_config
 
-        train_decoder = PackedUint8Backend(
-            data_cfg["train_packed_index"],
-            image_spec=image_spec,
-            max_open_shards=int(
-                data_cfg.get("packed_max_open_shards", 16)
-            ),
-        )
-        test_decoder = PackedUint8Backend(
-            data_cfg["test_packed_index"],
-            image_spec=image_spec,
-            max_open_shards=int(
-                data_cfg.get("packed_max_open_shards", 16)
-            ),
-        )
+    backend_selector = config.get("data", {}).get("backend", {})
+    if isinstance(backend_selector, dict):
+        pass
     else:
-        raise ValueError(f"Unsupported data backend: {backend_name}")
+        backend_selector = {"type": str(backend_selector), "params": {}}
+    train_decoder = build_backend_from_legacy_data_config(
+        data_cfg, backend_selector, "train", image_spec
+    )
+    test_decoder = build_backend_from_legacy_data_config(
+        data_cfg, backend_selector, "test", image_spec
+    )
     train_dataset = LazyTrainingPairDataset(
         train_videos, transform=transform, decoder=train_decoder
     )

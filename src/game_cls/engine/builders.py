@@ -50,6 +50,9 @@ def _load_base_checkpoint(model: Any, config: dict[str, Any]) -> Any:
 
 def build_task(selector: Any, *, image_spec: Any, loss_config: Any) -> Any:
     """Build a TaskAdapter from a task selector using the registry."""
+    # Ensure all built-in tasks are registered.
+    import game_cls.tasks.dual_frame_binary  # noqa: F401
+
     from ..registry import resolve
 
     task_type = str(selector.type)
