@@ -39,9 +39,15 @@ class ComposedRuntimeStrategy:
         return self._distributed.wrap_model(model, self._accelerator.device)
 
     def backward(self, loss: Any, scaler: Any) -> None:
+        """Backward pass with AMP scaling."""
         scaler.scale(loss).backward()
 
+    def unscale_gradients(self, optimizer: Any, scaler: Any) -> None:
+        """Unscale gradients before clipping."""
+        scaler.unscale_(optimizer)
+
     def clip_gradients(self, parameters: Any, max_norm: float) -> Any:
+        """Clip gradients and return the grad norm."""
         import torch
 
         return torch.nn.utils.clip_grad_norm_(
@@ -49,6 +55,7 @@ class ComposedRuntimeStrategy:
         )
 
     def optimizer_step(self, optimizer: Any, scaler: Any) -> None:
+        """Step the optimizer and update the scaler."""
         scaler.step(optimizer)
         scaler.update()
 

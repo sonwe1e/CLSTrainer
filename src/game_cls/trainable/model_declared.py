@@ -26,14 +26,36 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
         declared = model.trainable_parameter_groups()
         if not declared:
             raise RuntimeError("ModelDeclaredTrainablePolicy: no groups declared.")
-        # First collect every trainable name across all groups, then set
-        # requires_grad once. The previous loop set it per-group, which meant
-        # each group froze the previous group's parameters (last-group-wins).
+
+        # Validate group names are unique.
+        group_names = [g.get("name", "") for g in declared]
+        duplicate_names = {n for n in group_names if group_names.count(n) > 1}
+        if duplicate_names:
+            raise RuntimeError(
+                f"ModelDeclaredTrainablePolicy: duplicate group names: {duplicate_names}"
+            )
+
+        # Validate parameters exist and don't appear in multiple groups.
+        parameters = dict(model.named_parameters())
+        seen: set[str] = set()
         trainable_set: set[str] = set()
         groups = []
         for group in declared:
             names = list(group["parameter_names"])
+            missing = set(names) - parameters.keys()
+            if missing:
+                raise RuntimeError(
+                    f"ModelDeclaredTrainablePolicy: group {group.get('name')!r} "
+                    f"contains missing parameters: {missing}"
+                )
+            overlap = seen.intersection(names)
+            if overlap:
+                raise RuntimeError(
+                    f"ModelDeclaredTrainablePolicy: parameters appear in multiple "
+                    f"groups: {overlap}"
+                )
             trainable_set.update(names)
+            seen.update(names)
             groups.append(
                 _group_spec(
                     group["name"],
@@ -41,6 +63,10 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
                     lr_multiplier=float(group.get("learning_rate_multiplier", 1.0)),
                 )
             )
+
+        # First collect every trainable name across all groups, then set
+        # requires_grad once. The previous loop set it per-group, which meant
+        # each group froze the previous group's parameters (last-group-wins).
         for name, parameter in model.named_parameters():
             parameter.requires_grad = name in trainable_set
         if not trainable_set:
@@ -59,13 +85,16 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
         )
 
     def configure_module_modes(self, model: Any, selection: TrainableSelection) -> None:
-        del selection
+        # Derive module names from selected parameters.
+        trainable_param_names = set(selection.trainable_state.parameter_keys)
+        trainable_module_names = {
+            name.rsplit(".", 1)[0] if "." in name else name
+            for name in trainable_param_names
+        }
         model.eval()
-        for name, parameter in model.named_parameters():
-            if parameter.requires_grad:
-                module = dict(model.named_modules()).get(name.rsplit(".", 1)[0] if "." in name else name)
-                if module is not None:
-                    module.train()
+        for module_name, module in model.named_modules():
+            if module_name in trainable_module_names:
+                module.train()
 
     def validate_loaded_state(
         self, model: Any, load_report: Any, selection: TrainableSelection

@@ -136,25 +136,40 @@ def save_checkpoint_pair(
     evaluation_state: dict | None = None,
     state_mode: str = "full",
     write_model_only: bool = True,
+    trainable_state_manifest: Any = None,
+    trainable_policy_name: str | None = None,
+    trainable_policy_version: int | None = None,
 ) -> None:
     output_dir = Path(output_dir)
     unwrapped = unwrap_model(model)
     full_state_dict = unwrapped.state_dict()
     if state_mode == "trainable_only":
-        trainable_names = {
-            name
-            for name, parameter in unwrapped.named_parameters()
-            if parameter.requires_grad
-        }
-        checkpoint_state_dict = {
-            key: value
-            for key, value in full_state_dict.items()
-            if key in trainable_names
-            or any(
-                key.startswith(name.rsplit(".", 1)[0] + ".")
-                for name in trainable_names
+        if trainable_state_manifest is not None:
+            # Use the explicit manifest from TrainablePolicy.
+            selected_keys = set(trainable_state_manifest.parameter_keys) | set(
+                trainable_state_manifest.buffer_keys
             )
-        }
+            checkpoint_state_dict = {
+                key: value
+                for key, value in full_state_dict.items()
+                if key in selected_keys
+            }
+        else:
+            # Fallback: infer from requires_grad (legacy behaviour).
+            trainable_names = {
+                name
+                for name, parameter in unwrapped.named_parameters()
+                if parameter.requires_grad
+            }
+            checkpoint_state_dict = {
+                key: value
+                for key, value in full_state_dict.items()
+                if key in trainable_names
+                or any(
+                    key.startswith(name.rsplit(".", 1)[0] + ".")
+                    for name in trainable_names
+                )
+            }
     elif state_mode == "full":
         checkpoint_state_dict = full_state_dict
     else:
@@ -181,10 +196,33 @@ def save_checkpoint_pair(
         and Path(base_checkpoint).is_file()
         else None
     )
+    # Build metadata for trainable-only checkpoints.
+    if state_mode == "trainable_only":
+        checkpoint_format_version = 2
+        trainable_policy_meta = None
+        if trainable_policy_name is not None:
+            trainable_policy_meta = {
+                "name": trainable_policy_name,
+                "state_version": trainable_policy_version,
+            }
+        trainable_state_manifest_meta = None
+        if trainable_state_manifest is not None:
+            trainable_state_manifest_meta = {
+                "parameter_keys": list(trainable_state_manifest.parameter_keys),
+                "buffer_keys": list(trainable_state_manifest.buffer_keys),
+            }
+    else:
+        checkpoint_format_version = None
+        trainable_policy_meta = None
+        trainable_state_manifest_meta = None
+
     _atomic_torch_save(
         {
             "model": checkpoint_state_dict,
             "model_state_mode": state_mode,
+            "checkpoint_format_version": checkpoint_format_version,
+            "trainable_policy": trainable_policy_meta,
+            "trainable_state_manifest": trainable_state_manifest_meta,
             "expected_trainable_state_keys": (
                 sorted(checkpoint_state_dict)
                 if state_mode == "trainable_only"

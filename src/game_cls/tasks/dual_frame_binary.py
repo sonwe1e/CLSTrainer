@@ -120,16 +120,25 @@ class DualFrameBinaryTask:
 
 
 @register("task", "dual_frame_binary")
-def build_task(config: Any, image_spec: Any) -> DualFrameBinaryTask:
+def build_task(
+    selector: Any,
+    *,
+    image_spec: Any,
+    loss_config: Any,
+) -> DualFrameBinaryTask:
     """Factory registered as ``game_cls.tasks.dual_frame_binary:build_task``.
 
-    ``config`` is the ``task`` selector (with ``.params``); ``image_spec`` is
-    the dataset image spec. The loss config is read from the top-level ``loss``
-    section by the runner before calling this factory.
+    ``selector`` is the ``task`` config section (with ``.type``, ``.factory``,
+    ``.params``); ``image_spec`` is the dataset image spec; ``loss_config`` is
+    the top-level ``loss`` config section.
     """
-    params = dict(config.params) if getattr(config, "params", None) else {}
+    params = dict(selector.params) if getattr(selector, "params", None) else {}
     task_config = DualFrameBinaryTaskConfig(
         positive_class_index=int(params.get("positive_class_index", 1)),
         num_classes=int(params.get("num_classes", 2)),
     )
-    return DualFrameBinaryTask(image_spec=image_spec, loss_config={}, task_config=task_config)
+    return DualFrameBinaryTask(
+        image_spec=image_spec,
+        loss_config=loss_config or {},
+        task_config=task_config,
+    )

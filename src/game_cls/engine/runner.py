@@ -15,18 +15,44 @@ class ExperimentRunner:
     the task, runtime and trainable policy only through their protocols. The
     default wiring reproduces the legacy ``run_training`` behavior exactly; a
     future task swaps components without touching this loop.
+
+    Lifecycle::
+
+        runner = ExperimentRunner(config)
+        runner.setup()   # runtime setup + seed + build components
+        runner.run()     # training loop
+        runner.close()   # cleanup
     """
 
-    def __init__(self, components: ExperimentComponents) -> None:
-        self.components = components
+    def __init__(self, config: dict[str, Any]) -> None:
+        self._config = config
+        self.components: ExperimentComponents | None = None
         self.state = ExperimentState()
-        self._runtime = components.runtime
-        self._task = components.task
-        self._adapter = LegacyTrainingEngineAdapter(self._runtime)
+        self._adapter: LegacyTrainingEngineAdapter | None = None
 
     # -- public API --------------------------------------------------------
     def setup(self) -> None:
-        self._runtime.setup()
+        """Set up runtime, seed RNG, then build components.
+
+        The order matters for exact training resume:
+        1. Set up the runtime (so we know the rank).
+        2. Seed the RNG (so model initialization is deterministic).
+        3. Build components (model, task, policy, evaluator).
+        """
+        from game_cls.engine.trainer import _seed_everything
+
+        # Build runtime first so we know the rank for seeding.
+        from .builders import build_runtime, _runtime_selector
+        runtime = build_runtime(_runtime_selector(self._config))
+        rank = int(runtime.distributed.rank)
+
+        # Seed BEFORE building the model so initialization is deterministic.
+        seed = int(self._config["experiment"]["seed"])
+        _seed_everything(seed + rank)
+
+        # Now build components (model init will use the seeded RNG).
+        self.components = build_core_components(self._config)
+        self._adapter = LegacyTrainingEngineAdapter(runtime)
 
     def run(self) -> dict:
         # Delegate to the legacy loop through the adapter, passing the
@@ -34,10 +60,13 @@ class ExperimentRunner:
         # must use these components instead of rebuilding them from scratch —
         # this is how the configured task, trainable policy, model and
         # evaluator actually drive training (USERPLAN §9 R1–R3).
+        if self.components is None or self._adapter is None:
+            raise RuntimeError("ExperimentRunner.setup() must be called before run().")
         return self._adapter.train(
             self.components.raw_config,
             task=self.components.task,
             trainable_policy=self.components.trainable_policy,
+            trainable_selection=self.components.trainable_selection,
             model=self.components.model,
             evaluator=self.components.evaluator,
             image_spec=self.components.image_spec,
@@ -53,13 +82,13 @@ class ExperimentRunner:
         raise NotImplementedError("Direct checkpoint API reserved for future use.")
 
     def close(self) -> None:
-        self._runtime.cleanup()
+        if self.components is not None:
+            self.components.runtime.cleanup()
 
 
 def build_and_run(config: dict[str, Any]) -> dict:
     """Convenience: build components and run (used by the compat wrapper)."""
-    components = build_core_components(config)
-    runner = ExperimentRunner(components)
+    runner = ExperimentRunner(config)
     try:
         runner.setup()
         return runner.run()

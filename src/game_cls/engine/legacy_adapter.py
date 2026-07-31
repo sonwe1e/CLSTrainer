@@ -28,16 +28,17 @@ class LegacyTrainingEngineAdapter:
         *,
         task: Any = None,
         trainable_policy: Any = None,
+        trainable_selection: Any = None,
         model: Any = None,
         evaluator: Any = None,
         image_spec: Any = None,
     ) -> dict:
         """Run the legacy training loop using the adapter's runtime.
 
-        The ``task``, ``trainable_policy``, ``model``, ``evaluator`` and
-        ``image_spec`` arguments are the components built by the runner. Passing
-        them here means the loop must not rebuild them from scratch — the
-        configured components are the single source of truth.
+        The ``task``, ``trainable_policy``, ``trainable_selection``, ``model``,
+        ``evaluator`` and ``image_spec`` arguments are the components built by
+        the runner. Passing them here means the loop must not rebuild them from
+        scratch — the configured components are the single source of truth.
         """
         from .trainer import _run_training_loop
 
@@ -46,6 +47,7 @@ class LegacyTrainingEngineAdapter:
             runtime=self._runtime,
             task=task,
             trainable_policy=trainable_policy,
+            trainable_selection=trainable_selection,
             model=model,
             evaluator=evaluator,
             image_spec=image_spec,

@@ -66,16 +66,24 @@ class RegexTrainablePolicy(TrainablePolicyBase):
         )
 
     def configure_module_modes(self, model: Any, selection: TrainableSelection) -> None:
-        del selection
+        # Derive module names from selected parameters rather than applying
+        # the parameter regex to module names. A regex like `\.lora_[AB]$`
+        # matches parameter names (e.g. ``encoder.block.attn.lora_A``) but not
+        # module names (e.g. ``encoder.block.attn``).
+        trainable_param_names = set(selection.trainable_state.parameter_keys)
+        trainable_module_names = {
+            name.rsplit(".", 1)[0] if "." in name else name
+            for name in trainable_param_names
+        }
         from torch import nn
 
         model.eval()
         for module_name, module in model.named_modules():
-            if self._match(module_name):
+            if module_name in trainable_module_names:
                 module.train()
         for module_name, module in model.named_modules():
             if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                is_trainable = self._match(module_name)
+                is_trainable = module_name in trainable_module_names
                 if (
                     is_trainable and self.freeze_trainable_batchnorm_stats
                 ) or (

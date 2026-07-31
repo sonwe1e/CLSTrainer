@@ -311,6 +311,11 @@ def _set_train_mode(model, model_config: dict) -> None:
 
 
 def build_optimizer_parameter_groups(model, weight_decay: float) -> list[dict]:
+    """Legacy optimizer group builder. Does not respect TrainablePolicy groups.
+
+    Kept for the standalone path. The runner path uses
+    :func:`build_optimizer_groups_from_selection` instead.
+    """
     decay = []
     no_decay = []
     for name, parameter in model.named_parameters():
@@ -325,6 +330,87 @@ def build_optimizer_parameter_groups(model, weight_decay: float) -> list[dict]:
         groups.append({"params": decay, "weight_decay": weight_decay})
     if no_decay:
         groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+
+def build_optimizer_groups_from_selection(
+    model: Any,
+    selection: Any,
+    *,
+    base_learning_rate: float,
+    default_weight_decay: float,
+) -> list[dict]:
+    """Build optimizer parameter groups from a TrainableSelection.
+
+    This makes TrainablePolicy truly control the optimizer: each group can
+    have its own ``learning_rate_multiplier`` and ``weight_decay``. Parameters
+    not covered by any group fall back to a default group with
+    ``base_learning_rate`` and ``default_weight_decay``.
+    """
+    from ..contracts.trainable import TrainableSelection
+
+    parameters = dict(model.named_parameters())
+    seen: set[str] = set()
+    groups: list[dict] = []
+
+    for spec in selection.groups:
+        names = list(spec.parameter_names)
+        missing = set(names) - parameters.keys()
+        if missing:
+            raise RuntimeError(
+                f"Trainable group {spec.name!r} contains missing parameters: {missing}"
+            )
+        overlap = seen.intersection(names)
+        if overlap:
+            raise RuntimeError(
+                f"Parameters appear in multiple optimizer groups: {overlap}"
+            )
+        params = [parameters[name] for name in names]
+        groups.append({
+            "name": spec.name,
+            "params": params,
+            "lr": base_learning_rate * spec.learning_rate_multiplier,
+            "weight_decay": (
+                default_weight_decay
+                if spec.weight_decay is None
+                else spec.weight_decay
+            ),
+        })
+        seen.update(names)
+
+    # Collect any trainable parameters not covered by a named group.
+    expected = {
+        name
+        for name, parameter in parameters.items()
+        if parameter.requires_grad
+    }
+    uncovered = expected - seen
+    if uncovered:
+        # Fall back to legacy behaviour for uncovered parameters: split by
+        # ndim/bias into decay vs no_decay.
+        decay = []
+        no_decay = []
+        for name in sorted(uncovered):
+            param = parameters[name]
+            if param.ndim <= 1 or name.endswith(".bias"):
+                no_decay.append(param)
+            else:
+                decay.append(param)
+        if decay:
+            groups.append({
+                "name": "default_decay",
+                "params": decay,
+                "lr": base_learning_rate,
+                "weight_decay": default_weight_decay,
+            })
+        if no_decay:
+            groups.append({
+                "name": "default_no_decay",
+                "params": no_decay,
+                "lr": base_learning_rate,
+                "weight_decay": 0.0,
+            })
+
     return groups
 
 
@@ -732,6 +818,8 @@ def _save_all_ranks(
     world_size: int,
     force_full_model: bool = False,
     runtime: Any = None,
+    trainable_selection: Any = None,
+    trainable_policy: Any = None,
 ) -> None:
     if runtime is None:
         states = _gather_random_states(rank, world_size)
@@ -753,6 +841,12 @@ def _save_all_ranks(
             or state_mode == "full"
             or (full_model_every > 0 and global_step % full_model_every == 0)
         )
+        # Pass the trainable state manifest so that trainable-only
+        # checkpoints use the explicit manifest instead of inferring from
+        # parent modules.
+        manifest = trainable_selection.trainable_state if trainable_selection is not None else None
+        policy_name = trainable_policy.policy_name if trainable_policy is not None else None
+        policy_version = trainable_policy.state_version if trainable_policy is not None else None
         save_checkpoint_pair(
             output_dir / "checkpoints",
             tag,
@@ -770,6 +864,9 @@ def _save_all_ranks(
             evaluation_state=evaluation_state,
             state_mode=state_mode,
             write_model_only=write_model_only,
+            trainable_state_manifest=manifest,
+            trainable_policy_name=policy_name,
+            trainable_policy_version=policy_version,
         )
 
 
@@ -1108,8 +1205,7 @@ def run_training(config: dict[str, Any]) -> dict:
     """
     from .runner import ExperimentRunner
 
-    components = _build_components_for_runner(config)
-    runner = ExperimentRunner(components)
+    runner = ExperimentRunner(config)
     try:
         runner.setup()
         return runner.run()
@@ -1124,19 +1220,6 @@ def _run_training_loop_legacy(config: dict[str, Any]) -> dict:
     building the full component graph. Preserves the original behavior.
     """
     return _run_training_loop(config)
-
-
-def _build_components_for_runner(config: dict[str, Any]) -> Any:
-    """Build the task and runtime components the runner needs.
-
-    This is the compatibility entry point used by ``run_training()``. It
-    delegates to :func:`build_core_components` so the same component graph
-    (task, trainable policy, model, evaluator, runtime) is built here as in
-    the runner path.
-    """
-    from .builders import build_core_components
-
-    return build_core_components(config)
 
 
 def _build_runtime(config: dict[str, Any]) -> Any:
@@ -1206,6 +1289,7 @@ def _run_training_loop(
     runtime: Any = None,
     task: Any = None,
     trainable_policy: Any = None,
+    trainable_selection: Any = None,
     model: Any = None,
     evaluator: Any = None,
     image_spec: Any = None,
@@ -1226,6 +1310,10 @@ def _run_training_loop(
         device = runtime.accelerator.device
 
     try:
+        # Seed the RNG. When called from the runner, the seed has already been
+        # set in setup() before model building. We set it again here for the
+        # standalone path (runtime is None). For the runner path, this is a
+        # no-op since the seed is already set.
         seed = int(config["experiment"]["seed"])
         _seed_everything(seed + rank)
         output_dir = Path(config["experiment"]["output_dir"])
@@ -1255,29 +1343,41 @@ def _run_training_loop(
 
             trainable_policy = build_trainable_policy(_trainable_selector_from_config(config))
 
-        resolved_model = model
-        if resolved_model is None:
+        # When a model is supplied by the runner, it has already been built
+        # (after seeding) and the base checkpoint has already been loaded.
+        # The loop must NOT rebuild it or reload the base checkpoint.
+        if model is not None:
+            resolved_model = model
+            selection = trainable_selection
+            if selection is None:
+                selection = trainable_policy.select(resolved_model)
+            trainable_policy.configure_module_modes(resolved_model, selection)
+        else:
+            # Standalone path: build model, load base checkpoint, select
+            # trainable parameters. This path is used by callers that go
+            # through ``_run_training_loop_legacy`` directly.
             resolved_model = build_model(config["model"])
-        checkpoint_path = config["model"].get("checkpoint_path")
-        if checkpoint_path:
-            report = load_model_checkpoint(resolved_model, checkpoint_path)
-            if not config["data"].get("synthetic", False) and config["model"].get(
-                "require_pretrained_backbone", True
-            ):
-                coverage = trainable_policy.validate_loaded_state(
-                    resolved_model, report, trainable_policy.select(resolved_model)
-                )
-            else:
-                coverage = None
-            if rank == 0:
-                print(f"Loaded {len(report.loaded)} model tensors")
-                if coverage is not None:
-                    print(f"Frozen backbone checkpoint coverage: {coverage:.2%}")
-                print(f"Missing: {report.missing}")
-                print(f"Unexpected: {report.unexpected}")
-                print(f"Shape mismatch: {report.shape_mismatch}")
-        selection = trainable_policy.select(resolved_model)
-        trainable_policy.configure_module_modes(resolved_model, selection)
+            checkpoint_path = config["model"].get("checkpoint_path")
+            if checkpoint_path:
+                report = load_model_checkpoint(resolved_model, checkpoint_path)
+                if not config["data"].get("synthetic", False) and config["model"].get(
+                    "require_pretrained_backbone", True
+                ):
+                    coverage = trainable_policy.validate_loaded_state(
+                        resolved_model, report, trainable_policy.select(resolved_model)
+                    )
+                else:
+                    coverage = None
+                if rank == 0:
+                    print(f"Loaded {len(report.loaded)} model tensors")
+                    if coverage is not None:
+                        print(f"Frozen backbone checkpoint coverage: {coverage:.2%}")
+                    print(f"Missing: {report.missing}")
+                    print(f"Unexpected: {report.unexpected}")
+                    print(f"Shape mismatch: {report.shape_mismatch}")
+            selection = trainable_policy.select(resolved_model)
+            trainable_policy.configure_module_modes(resolved_model, selection)
+
         if runtime is None:
             resolved_model.to(device)
             if world_size > 1:
@@ -1349,12 +1449,26 @@ def _run_training_loop(
             train_cfg.get("max_steps")
             or int(train_cfg["epochs"]) * int(train_cfg["steps_per_epoch"])
         )
-        optimizer = torch.optim.AdamW(
-            build_optimizer_parameter_groups(
-                resolved_model, float(config["optimizer"]["weight_decay"])
-            ),
-            lr=config["optimizer"]["learning_rate"],
-        )
+        # When a TrainableSelection is supplied (from the runner), use it to
+        # build optimizer groups so that learning_rate_multiplier and
+        # group-specific weight_decay are respected.
+        if trainable_selection is not None:
+            optimizer = torch.optim.AdamW(
+                build_optimizer_groups_from_selection(
+                    resolved_model,
+                    trainable_selection,
+                    base_learning_rate=float(config["optimizer"]["learning_rate"]),
+                    default_weight_decay=float(config["optimizer"]["weight_decay"]),
+                ),
+                lr=config["optimizer"]["learning_rate"],
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                build_optimizer_parameter_groups(
+                    resolved_model, float(config["optimizer"]["weight_decay"])
+                ),
+                lr=config["optimizer"]["learning_rate"],
+            )
         scheduler = _build_scheduler(optimizer, config["scheduler"], total_steps)
         use_amp = bool(config["device"].get("amp", False))
         if runtime is None:
@@ -1502,18 +1616,29 @@ def _run_training_loop(
                     time.perf_counter() - forward_started
                 )
                 backward_started = time.perf_counter()
-                scaler.scale(loss_output.total).backward()
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in resolved_model.parameters() if p.requires_grad],
-                    train_cfg.get("gradient_clip_norm", 5.0),
-                )
+                if runtime is not None:
+                    runtime.backward(loss_output.total, scaler)
+                    runtime.unscale_gradients(optimizer, scaler)
+                    grad_norm = runtime.clip_gradients(
+                        resolved_model.parameters(),
+                        train_cfg.get("gradient_clip_norm", 5.0),
+                    )
+                else:
+                    scaler.scale(loss_output.total).backward()
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [p for p in resolved_model.parameters() if p.requires_grad],
+                        train_cfg.get("gradient_clip_norm", 5.0),
+                    )
                 timing["host_backward_enqueue"] += (
                     time.perf_counter() - backward_started
                 )
                 optimizer_started = time.perf_counter()
-                scaler.step(optimizer)
-                scaler.update()
+                if runtime is not None:
+                    runtime.optimizer_step(optimizer, scaler)
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
                 scheduler.step()
                 timing["host_optimizer_enqueue"] += (
                     time.perf_counter() - optimizer_started
@@ -1628,6 +1753,8 @@ def _run_training_loop(
                         world_size=world_size,
                         force_full_model=True,
                         runtime=runtime,
+                        trainable_selection=selection,
+                        trainable_policy=trainable_policy,
                     )
                     if rank == 0:
                         clone_checkpoint_pair(
@@ -1654,6 +1781,8 @@ def _run_training_loop(
                         rank=rank,
                         world_size=world_size,
                         runtime=runtime,
+                        trainable_selection=selection,
+                        trainable_policy=trainable_policy,
                     )
                 if checkpoint_started is not None:
                     checkpoint_seconds += (
@@ -1868,6 +1997,8 @@ def _run_training_loop(
             world_size=world_size,
             force_full_model=True,
             runtime=runtime,
+            trainable_selection=selection,
+            trainable_policy=trainable_policy,
         )
         if (
             final_is_best

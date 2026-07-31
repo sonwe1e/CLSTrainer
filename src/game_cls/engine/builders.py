@@ -6,7 +6,7 @@ from typing import Any
 from ..contracts.evaluation import EvaluatorSuite
 from ..contracts.runtime import RuntimeStrategy
 from ..contracts.task import TaskAdapter
-from ..contracts.trainable import TrainablePolicy
+from ..contracts.trainable import TrainablePolicy, TrainableSelection
 from ..runtime.factories import build_runtime
 from ..trainable.build import build_trainable_policy
 
@@ -18,9 +18,11 @@ class ExperimentComponents:
     runtime: RuntimeStrategy
     task: TaskAdapter
     trainable_policy: TrainablePolicy
+    trainable_selection: TrainableSelection
     model: Any
     image_spec: Any
     evaluator: EvaluatorSuite | None = None
+    load_report: Any = None
     # The following are built lazily by the runner because they depend on
     # dataloaders / resume state that is only known at run time.
     optimizer: Any = None
@@ -35,7 +37,7 @@ def _build_model(config: dict[str, Any]) -> Any:
     return model
 
 
-def _load_checkpoint(model: Any, config: dict[str, Any]) -> Any:
+def _load_base_checkpoint(model: Any, config: dict[str, Any]) -> Any:
     from game_cls.model.checkpoint_loader import load_model_checkpoint
 
     checkpoint_path = config["model"].get("checkpoint_path")
@@ -45,24 +47,48 @@ def _load_checkpoint(model: Any, config: dict[str, Any]) -> Any:
     return report
 
 
+def build_task(selector: Any, *, image_spec: Any, loss_config: Any) -> Any:
+    """Build a TaskAdapter from a task selector using the registry."""
+    from ..registry import resolve
+
+    task_type = str(selector.type)
+    factory = resolve("task", task_type)
+    return factory(selector, image_spec=image_spec, loss_config=loss_config)
+
+
 def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
     """Build the components that don't depend on dataloaders or resume state.
 
     This is the single place that turns a raw config into the extensible
     component graph (USERPLAN §9.3). It reuses the existing model/runtime
     construction behind the new interfaces.
+
+    IMPORTANT: this function must be called AFTER the runtime is set up and
+    the seed has been set. Model initialization is sensitive to the RNG
+    state, and for exact training resume to work, every run must see the
+    same initial weights given the same seed.
     """
     from game_cls.data.image_spec import ImageSpec
 
     from ..evaluation.legacy_adapter import LegacyEvaluatorSuite
-    from ..tasks.dual_frame_binary import DualFrameBinaryTask
 
     image_spec = ImageSpec.from_config(config["data"])
     runtime = build_runtime(_runtime_selector(config))
-    task = DualFrameBinaryTask(image_spec=image_spec, loss_config=config["loss"])
+
+    # Build task via registry so that config task.type can select different
+    # task implementations.
+    task_selector = _task_selector(config)
+    task = build_task(task_selector, image_spec=image_spec, loss_config=config["loss"])
+
     trainable_policy = build_trainable_policy(_trainable_selector(config))
+
+    # Model is built AFTER seed is set (by the caller), so initialization
+    # is deterministic and reproducible across runs.
     model = _build_model(config)
-    load_report = _load_checkpoint(model, config)
+
+    # Load base checkpoint exactly once. The training loop must NOT load
+    # it again.
+    load_report = _load_base_checkpoint(model, config)
 
     selection = trainable_policy.select(model)
     trainable_policy.configure_module_modes(model, selection)
@@ -98,9 +124,11 @@ def build_core_components(config: dict[str, Any]) -> ExperimentComponents:
         runtime=runtime,
         task=task,
         trainable_policy=trainable_policy,
+        trainable_selection=selection,
         model=model,
         image_spec=image_spec,
         evaluator=evaluator,
+        load_report=load_report,
     )
 
 
@@ -124,6 +152,19 @@ def _runtime_selector(config: dict[str, Any]) -> Any:
     runtime_sel.accelerator = acc_sel
     runtime_sel.distributed = dist_sel
     return runtime_sel
+
+
+def _task_selector(config: dict[str, Any]) -> Any:
+    task_cfg = config.get("task", {})
+
+    class _Sel:
+        pass
+
+    sel = _Sel()
+    sel.type = task_cfg.get("type", "dual_frame_binary")
+    sel.factory = task_cfg.get("factory", "")
+    sel.params = dict(task_cfg.get("params", {}) or {})
+    return sel
 
 
 def _trainable_selector(config: dict[str, Any]) -> Any:

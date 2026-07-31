@@ -14,6 +14,7 @@ class TrainablePolicyBase:
     """Convenience base exposing the protocol's required attributes."""
 
     policy_name = "base"
+    state_version = 1
 
     def select(self, model: Any) -> TrainableSelection:
         raise NotImplementedError
