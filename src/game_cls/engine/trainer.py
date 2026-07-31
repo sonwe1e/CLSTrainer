@@ -85,13 +85,10 @@ class SyntheticPairDataset:
         }
 
 
-@dataclass
-class LoaderBundle:
-    train: Any
-    quick_test: Any
-    full_test: Any
-    sampler: Any
-    data_summary: dict
+# Re-export the canonical LoaderBundle from the contracts module.
+# This avoids a duplicate definition and the reverse-dependency risk
+# (legacy_pipeline → trainer) that the duplicate used to create.
+from game_cls.contracts.data import LoaderBundle  # noqa: F401
 
 
 def _seed_everything(seed: int) -> None:

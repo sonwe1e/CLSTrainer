@@ -102,12 +102,28 @@ class BalancedGameLabelDeltaPolicy(SamplingPolicyBase):
     # The policy can be used directly as a PyTorch ``BatchSampler`` so the
     # ``DataLoader`` receives a single object that both owns the sampling
     # algorithm and adapts it to the iterator protocol.
+    def set_epoch(self, epoch: int, start_step: int = 0) -> None:
+        """Set the epoch (and optionally the starting step for resume).
+
+        The Trainer calls ``sampler.set_epoch(epoch, start_step=step_in_epoch)``
+        at the start of each epoch. Without this, resuming from the middle of
+        an epoch would restart sampling from step 0, producing different data.
+        """
+        self._sampler.set_epoch(epoch, start_step=start_step)
+        self._iterator = None
+        self._iter_key = None
+
     def __iter__(self):
-        for step in range(self._sampler.steps_per_epoch):
+        # Start from the sampler's start_step (may be mid-epoch on resume),
+        # not from 0, so that resumed training sees the same data sequence.
+        start_step = self._sampler.start_step
+        for step in range(start_step, self._sampler.steps_per_epoch):
             context = SamplingContext(
                 epoch=self._sampler.epoch,
                 step=step,
-                global_batch_size=0,
+                global_batch_size=(
+                    self._sampler.local_batch_size * self._sampler.world_size
+                ),
                 world_size=self._sampler.world_size,
                 seed=self._sampler.seed,
             )

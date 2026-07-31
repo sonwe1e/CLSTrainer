@@ -26,6 +26,7 @@ class ExperimentRunner:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
+        self._runtime: Any = None
         self.components: ExperimentComponents | None = None
         self.state = ExperimentState()
         self._adapter: LegacyTrainingEngineAdapter | None = None
@@ -45,28 +46,41 @@ class ExperimentRunner:
         cleaned up in close(). Previously two runtimes were created (one here, one
         inside build_core_components) and setup() was never called — that silently
         broke NPU device init and DDP/HCCL process group setup.
+
+        The runtime is stored as ``self._runtime`` so that ``close()`` can clean
+        it up even if ``setup()`` fails partway through (e.g. model factory
+        import error after ``runtime.setup()`` succeeded).
         """
         from game_cls.engine.trainer import _seed_everything
 
         # Build the single runtime instance.
         from .builders import build_runtime, _runtime_selector
-        runtime = build_runtime(_runtime_selector(self._config))
+        self._runtime = build_runtime(_runtime_selector(self._config))
 
-        # Initialize the runtime: sets up the device (e.g. torch.npu.set_device)
-        # and the distributed process group (e.g. dist.init_process_group).
-        runtime.setup()
+        try:
+            # Initialize the runtime: sets up the device (e.g. torch.npu.set_device)
+            # and the distributed process group (e.g. dist.init_process_group).
+            self._runtime.setup()
 
-        rank = int(runtime.distributed.rank)
+            rank = int(self._runtime.distributed.rank)
 
-        # Seed BEFORE building the model so initialization is deterministic.
-        seed = int(self._config["experiment"]["seed"])
-        _seed_everything(seed + rank)
+            # Seed BEFORE building the model so initialization is deterministic.
+            seed = int(self._config["experiment"]["seed"])
+            _seed_everything(seed + rank)
 
-        # Now build components (model init will use the seeded RNG).
-        # Pass the SAME runtime instance — do not let build_core_components
-        # create a second one.
-        self.components = build_core_components(self._config, runtime=runtime)
-        self._adapter = LegacyTrainingEngineAdapter(runtime)
+            # Now build components (model init will use the seeded RNG).
+            # Pass the SAME runtime instance — do not let build_core_components
+            # create a second one.
+            self.components = build_core_components(
+                self._config, runtime=self._runtime
+            )
+            self._adapter = LegacyTrainingEngineAdapter(self._runtime)
+        except Exception:
+            # setup() failed after runtime.setup() — clean up the process group
+            # to avoid leaking the DDP/HCCL initialization.
+            self._runtime.cleanup()
+            self._runtime = None
+            raise
 
     def run(self) -> dict:
         # Delegate to the legacy loop through the adapter, passing the
@@ -97,8 +111,11 @@ class ExperimentRunner:
         raise NotImplementedError("Direct checkpoint API reserved for future use.")
 
     def close(self) -> None:
-        if self.components is not None:
-            self.components.runtime.cleanup()
+        # Clean up the runtime if it was set up. Use self._runtime (not
+        # components.runtime) so we also clean up when setup() failed partway.
+        if self._runtime is not None:
+            self._runtime.cleanup()
+            self._runtime = None
 
 
 def build_and_run(config: dict[str, Any]) -> dict:

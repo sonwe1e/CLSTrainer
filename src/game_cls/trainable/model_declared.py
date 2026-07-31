@@ -16,6 +16,7 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
     """
 
     policy_name = "model_declared"
+    state_version = 1
 
     def select(self, model: Any) -> TrainableSelection:
         if not hasattr(model, "trainable_parameter_groups"):
@@ -56,11 +57,17 @@ class ModelDeclaredTrainablePolicy(TrainablePolicyBase):
                 )
             trainable_set.update(names)
             seen.update(names)
+            # Support optional per-group weight_decay. ``None`` means "use the
+            # framework default decay rule" (split into decay/no_decay
+            # sub-groups in the optimizer builder).
+            wd_raw = group.get("weight_decay", None)
+            weight_decay = None if wd_raw is None else float(wd_raw)
             groups.append(
                 _group_spec(
                     group["name"],
                     names,
                     lr_multiplier=float(group.get("learning_rate_multiplier", 1.0)),
+                    weight_decay=weight_decay,
                 )
             )
 

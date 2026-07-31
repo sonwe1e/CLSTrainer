@@ -192,7 +192,7 @@ def build_legacy_loader_bundle(
     """
     from torch.utils.data import DataLoader, Subset
 
-    from game_cls.engine.trainer import LoaderBundle
+    from game_cls.contracts.data import LoaderBundle
     from game_cls.data.video_sampler import DeterministicIndexBatchSampler
 
     rank = int(runtime.distributed.rank)
@@ -354,7 +354,17 @@ def build_legacy_loader_bundle(
     train_dataset = LazyTrainingPairDataset(
         train_videos, transform=transform, decoder=train_decoder
     )
+    # Resolve sampler params from either V2 selector (sampler.policy.params)
+    # or legacy flat fields (sampler.game_alpha, ...). This lets both native
+    # V2 configs and migrated V1 configs drive the same pipeline.
     sampler_cfg = config["sampler"]
+    policy_cfg = sampler_cfg.get("policy", {}) if isinstance(sampler_cfg, dict) else {}
+    policy_params = dict(policy_cfg.get("params", {}) or {})
+    # V2 selector takes precedence; legacy flat fields are the fallback.
+    resolved_params = {
+        key: policy_params[key] if key in policy_params else sampler_cfg.get(key)
+        for key in ("game_alpha", "class_probability", "deduplicate_within_global_batch")
+    }
     # Use the SamplingPolicy interface instead of directly constructing
     # VideoBalancedPairBatchSampler. The policy wraps the algorithm and
     # exposes the BatchSampler protocol (__iter__, __len__, set_epoch,
@@ -370,13 +380,15 @@ def build_legacy_loader_bundle(
         rank=rank,
         world_size=world_size,
         seed=config["experiment"]["seed"],
-        game_alpha=sampler_cfg.get("game_alpha", 0.25),
+        game_alpha=resolved_params.get("game_alpha", 0.25),
         class_probability={
             int(key): float(value)
-            for key, value in sampler_cfg["class_probability"].items()
-        },
+            for key, value in resolved_params["class_probability"].items()
+        }
+        if resolved_params.get("class_probability")
+        else None,
         delta_probability=delta_probability,
-        deduplicate_within_global_batch=sampler_cfg.get(
+        deduplicate_within_global_batch=resolved_params.get(
             "deduplicate_within_global_batch", True
         ),
     )

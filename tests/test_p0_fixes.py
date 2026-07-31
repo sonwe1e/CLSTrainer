@@ -937,7 +937,171 @@ class TestSamplingPolicyInProduction:
 
 
 # --------------------------------------------------------------------------- #
-# 12. DataModule eval backend tracking (Subset unwrapping)
+# 12. Sampler set_epoch (P0 fix)
+# --------------------------------------------------------------------------- #
+class TestSamplerSetEpoch:
+    def test_policy_has_set_epoch(self):
+        """BalancedGameLabelDeltaPolicy must implement set_epoch."""
+        from game_cls.data.sampling.balanced_game_label_delta import (
+            BalancedGameLabelDeltaPolicy,
+        )
+        from game_cls.data.video_index import VideoEntry
+
+        videos = [
+            VideoEntry(
+                game="g1",
+                label=0,
+                video_id="v1",
+                frame_ids=[0, 1, 2],
+                frame_paths=["a", "b", "c"],
+                valid_start_positions={2: [0]},
+            ),
+        ]
+        policy = BalancedGameLabelDeltaPolicy.from_config(
+            videos, local_batch_size=1, steps_per_epoch=3, rank=0, world_size=1, seed=42
+        )
+        # Must not raise AttributeError.
+        policy.set_epoch(1, start_step=2)
+        assert policy._sampler.epoch == 1
+        assert policy._sampler.start_step == 2
+
+    def test_policy_iter_respects_start_step(self):
+        """After set_epoch(epoch, start_step=2), iteration starts from step 2."""
+        from game_cls.data.sampling.balanced_game_label_delta import (
+            BalancedGameLabelDeltaPolicy,
+        )
+        from game_cls.data.video_index import VideoEntry
+
+        videos = [
+            VideoEntry(
+                game="g1",
+                label=0,
+                video_id="v1",
+                frame_ids=[0, 1, 2],
+                frame_paths=["a", "b", "c"],
+                valid_start_positions={2: [0]},
+            ),
+        ]
+        policy = BalancedGameLabelDeltaPolicy.from_config(
+            videos, local_batch_size=1, steps_per_epoch=5, rank=0, world_size=1, seed=42
+        )
+        policy.set_epoch(0, start_step=3)
+        batches = list(policy)
+        # Should yield steps 3 and 4 (2 batches), not all 5.
+        assert len(batches) == 2
+
+
+# --------------------------------------------------------------------------- #
+# 13. Runner exception cleanup
+# --------------------------------------------------------------------------- #
+class TestRunnerExceptionCleanup:
+    def test_runner_cleans_runtime_on_setup_failure(self):
+        """If setup() fails after runtime.setup(), the runtime must be cleaned up."""
+        from game_cls.engine.runner import ExperimentRunner
+
+        config = _minimal_v2_config()
+        cleanup_called = []
+
+        class _MockRuntime:
+            def __init__(self):
+                self._is_setup = False
+
+            @property
+            def distributed(self):
+                class _D:
+                    rank = 0
+                    world_size = 1
+                    local_rank = 0
+
+                return _D()
+
+            def setup(self):
+                self._is_setup = True
+
+            def cleanup(self):
+                cleanup_called.append(True)
+                self._is_setup = False
+
+        def mock_build_runtime(selector):
+            return _MockRuntime()
+
+        def mock_build_core_components(cfg, *, runtime=None):
+            raise RuntimeError("Simulated failure")
+
+        with patch("game_cls.engine.builders.build_runtime", side_effect=mock_build_runtime), \
+             patch("game_cls.engine.runner.build_core_components", side_effect=mock_build_core_components):
+            runner = ExperimentRunner(config)
+            with pytest.raises(RuntimeError, match="Simulated failure"):
+                runner.setup()
+
+        # Runtime cleanup must have been called despite the failure.
+        assert len(cleanup_called) == 1
+
+
+# --------------------------------------------------------------------------- #
+# 14. TrainablePolicy factory + BN params + weight_decay
+# --------------------------------------------------------------------------- #
+class TestTrainablePolicyFactory:
+    def test_regex_policy_receives_bn_params(self):
+        """build_trainable_policy must pass BN freeze params to RegexPolicy."""
+        from game_cls.trainable.build import build_trainable_policy
+
+        class _Sel:
+            type = "regex"
+            factory = ""
+            params = {
+                "include": [r"^cls\."],
+                "freeze_trainable_batchnorm_stats": False,
+                "freeze_frozen_batchnorm_stats": False,
+            }
+
+        policy = build_trainable_policy(_Sel())
+        assert policy.freeze_trainable_batchnorm_stats is False
+        assert policy.freeze_frozen_batchnorm_stats is False
+
+    def test_model_declared_policy_supports_weight_decay(self):
+        """ModelDeclaredPolicy must read weight_decay from declared groups."""
+        from game_cls.trainable.model_declared import ModelDeclaredTrainablePolicy
+
+        class _Model:
+            def named_parameters(self):
+                return iter([
+                    ("cls.weight", torch.randn(2, 4, requires_grad=False)),
+                    ("cls.bias", torch.randn(2, requires_grad=False)),
+                ])
+
+            def named_buffers(self, recurse=True):
+                return iter([])
+
+            def state_dict(self):
+                return {}
+
+        model = _Model()
+        model.trainable_parameter_groups = lambda: [
+            {
+                "name": "head",
+                "parameter_names": ["cls.weight", "cls.bias"],
+                "weight_decay": 0.05,
+            }
+        ]
+        policy = ModelDeclaredTrainablePolicy()
+        selection = policy.select(model)
+        # The group should have the specified weight_decay.
+        assert selection.groups[0].weight_decay == 0.05
+
+    def test_all_policies_have_state_version(self):
+        """All TrainablePolicy implementations must declare state_version."""
+        from game_cls.trainable.name_token import NameTokenTrainablePolicy
+        from game_cls.trainable.regex import RegexTrainablePolicy
+        from game_cls.trainable.model_declared import ModelDeclaredTrainablePolicy
+
+        assert hasattr(NameTokenTrainablePolicy, "state_version")
+        assert hasattr(RegexTrainablePolicy, "state_version")
+        assert hasattr(ModelDeclaredTrainablePolicy, "state_version")
+
+
+# --------------------------------------------------------------------------- #
+# 15. DataModule eval backend tracking (Subset unwrapping)
 # --------------------------------------------------------------------------- #
 class TestDataModuleEvalBackendTracking:
     def test_eval_backends_tracked_through_subset(self):

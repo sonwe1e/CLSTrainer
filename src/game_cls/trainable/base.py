@@ -38,9 +38,15 @@ def _empty_selection() -> TrainableSelection:
     )
 
 
-def _group_spec(name: str, parameter_names: list[str], lr_multiplier: float = 1.0) -> ParameterGroupSpec:
+def _group_spec(
+    name: str,
+    parameter_names: list[str],
+    lr_multiplier: float = 1.0,
+    weight_decay: float | None = None,
+) -> ParameterGroupSpec:
     return ParameterGroupSpec(
         name=name,
         parameter_names=tuple(parameter_names),
         learning_rate_multiplier=lr_multiplier,
+        weight_decay=weight_decay,
     )

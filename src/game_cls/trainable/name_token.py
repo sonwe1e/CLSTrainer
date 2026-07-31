@@ -15,6 +15,7 @@ class NameTokenTrainablePolicy(TrainablePolicyBase):
     """
 
     policy_name = "name_token"
+    state_version = 1
 
     def __init__(
         self,
