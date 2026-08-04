@@ -643,6 +643,15 @@ def resolve_decision_threshold(config: dict[str, Any]) -> float:
     return threshold
 
 
+def _apply_defaults(config: dict[str, Any]) -> None:
+    """Fill documented defaults for required keys a recipe may omit."""
+    experiment = config.setdefault("experiment", {})
+    if "seed" not in experiment:
+        experiment["seed"] = 20260728
+    if "name" not in experiment:
+        experiment["name"] = "run"
+
+
 def finalize_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize a merged configuration.
 
@@ -650,6 +659,7 @@ def finalize_config(config: dict[str, Any]) -> dict[str, Any]:
     Idempotent: finalizing an already-finalized config is a no-op.
     """
     finalized = copy.deepcopy(config)
+    _apply_defaults(finalized)
     check_removed_keys(finalized)
     validate_config(finalized)
     resolve_decision_threshold(finalized)

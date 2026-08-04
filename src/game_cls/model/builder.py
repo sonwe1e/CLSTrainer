@@ -25,6 +25,8 @@ def build_demo_model(config: dict[str, Any] | None = None):
     import torch
     from torch import nn
 
+    num_classes = int((config or {}).get("num_classes", 2))
+
     class DemoDualFrameModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -34,7 +36,7 @@ def build_demo_model(config: dict[str, Any] | None = None):
             )
             with torch.no_grad():
                 self.backbone[0].weight.fill_(1.0)
-            self.cls = nn.Linear(6, 2)
+            self.cls = nn.Linear(6, num_classes)
 
         def forward(self, image0, image1):
             features = self.backbone(torch.cat([image0, image1], dim=1)).flatten(1)

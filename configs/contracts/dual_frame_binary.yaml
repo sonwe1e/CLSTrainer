@@ -1,0 +1,32 @@
+# Contract: dual-frame binary classification.
+#
+# Fixed business facts. These values are the canonical defaults for every
+# recipe; hard invariants are additionally enforced by code (input shape
+# check, delta=2 evaluation pairs, strict non-cls checkpoint loading), so
+# overriding them here does not silently change the deployment contract.
+decision:
+  threshold: 0.99
+
+pair:
+  test_delta: 2
+
+model:
+  num_classes: 2
+  trainable_name_contains: cls
+  freeze_backbone_batchnorm_stats: true
+  freeze_cls_batchnorm_stats: true
+  require_pretrained_backbone: true
+
+data:
+  width: 448
+  height: 208
+  channels: 3
+  strict_audit: true
+
+loss:
+  cross_entropy_weight: 1.0
+  threshold_loss_weight: 0.20
+  threshold_safety_margin: 0.20
+  threshold_temperature: 0.50
+  threshold_warmup_ratio: 0.10
+  threshold_ramp_ratio: 0.20

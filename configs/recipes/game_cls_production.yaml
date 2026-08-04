@@ -1,0 +1,80 @@
+# Production recipe template. Fill the REPLACE_ME fields, then:
+#
+#   cls-trainer doctor --config configs/recipes/game_cls_production.yaml
+#   cls-trainer train  --config configs/recipes/game_cls_production.yaml --dry-run
+#   cls-trainer train  --config configs/recipes/game_cls_production.yaml
+#
+# Business facts (threshold 0.99, delta=2 test pairs, cls-only training,
+# 448x208 frames) come from the contract and are intentionally absent here.
+# NPU spawn/timeout/worker rules come from the profile.
+profile: npu_8p
+
+presets:
+  augmentation: standard
+  dataloader: stable
+  evaluation: production
+
+experiment:
+  name: game_cls_v1
+  seed: 20260728
+  output_dir: runs/game_cls
+
+model:
+  factory: REPLACE_ME_PACKAGE.module:build_model
+  checkpoint_path: REPLACE_ME/path/to/base_model.pt
+
+data:
+  synthetic: false
+  require_content_hash_audit: true
+  require_unique_video_keys_across_splits: false
+  minimum_pairs_per_game_label_delta: {2: 1}
+  audit_path: indexes/audit.json
+  train_video_index: indexes/train_video_entries.parquet
+  test_video_index: indexes/test_video_entries.parquet
+  train_index: indexes/train_frames.parquet
+  test_index: indexes/test_frames.parquet
+  backend: png
+  frame_extensions: [".png"]
+  ignore_directory_prefixes: ["_", "."]
+  ignore_directory_names: ["__pycache__", "cache", "caches", "tmp", "temp"]
+  ignore_file_globs: ["*.tmp", "*.part", "*.log"]
+  unexpected_nested_directory_severity: warning
+  ignored_example_limit: 20
+  duplicate_policy:
+    same_label_cross_split: warning
+    same_label_within_split: warning
+    cross_label_same_content: error
+    same_basename: info
+
+pair:
+  train_delta_probability: {1: 0.15, 2: 0.70, 3: 0.15}
+
+sampler:
+  game_alpha: 0.25
+  class_probability: {0: 0.5, 1: 0.5}
+  deduplicate_within_global_batch: true
+
+optimizer:
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+scheduler:
+  warmup_steps: 500
+  min_learning_rate: 0.00001
+
+train:
+  epochs: 10
+  steps_per_epoch: 1000
+  max_steps: null
+  stop_after_steps: null
+  resume_path: null
+  verify_frozen_parameters: false
+  local_batch_size: 64
+  gradient_clip_norm: 5.0
+  log_every_steps: 50
+
+checkpoint:
+  save_last_every_steps: 1000
+  save_best_selection: true
+  periodic_state_mode: trainable_only
+  full_model_every_steps: 5000

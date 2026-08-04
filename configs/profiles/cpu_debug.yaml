@@ -1,0 +1,18 @@
+# Profile: CPU smoke/debug environment.
+device:
+  accelerator: cpu
+  amp: false
+  amp_dtype: float16
+
+dataloader:
+  num_workers: 0
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: false
+
+evaluation:
+  amp: false
+  amp_dtype: bfloat16
+
+experiment:
+  output_dir: runs/cpu_debug

@@ -1,0 +1,8 @@
+# Smoke evaluation policy: frequent cheap checks for short acceptance runs.
+evaluation:
+  quick_test_every_steps: 10
+  quick_test_pairs_per_video: 2
+  full_test_every_steps: 0
+  full_test_at_end: false
+  quick_save_error_limit: 50
+  html_max_errors_per_group: 50

@@ -59,10 +59,66 @@ cls-trainer train --config configs/npu_1p.yaml --dry-run
 # 正式训练
 cls-trainer train --config configs/npu_1p.yaml [key=value ...]
 
+# 从模板创建最小 Recipe
+cls-trainer init --profile npu_8p --name my_run
+
 # 查询实验
 cls-trainer run list
 cls-trainer run show latest
+cls-trainer run compare RUN_A RUN_B
+cls-trainer run export-tensorboard RUN_ID
 ```
+
+## 配置分层:Contract / Profile / Recipe / Presets
+
+普通用户只维护 Recipe,机器环境由 Profile 决定,稳定性参数用命名 Preset 选择,
+业务事实由 Contract 保证。合并顺序为
+`contract → profile → presets → recipe 自身 → 命令行覆写`:
+
+```text
+configs/
+├── contracts/dual_frame_binary.yaml   # 阈值 0.99、test delta=2、cls-only 等固定事实
+├── profiles/                          # cpu_debug / cuda_1p / npu_1p / npu_8p
+├── presets/
+│   ├── augmentation/  none | light | standard
+│   ├── dataloader/    stable | throughput
+│   └── evaluation/    smoke | production
+└── recipes/
+    ├── example_debug.yaml             # 合成数据,开箱即跑
+    └── game_cls_production.yaml       # 生产模板,填 REPLACE_ME 即用
+```
+
+Recipe 示例(只列需要决策的十几个字段):
+
+```yaml
+profile: npu_8p
+presets:
+  augmentation: standard
+  dataloader: stable
+  evaluation: production
+experiment:
+  name: game_cls_v1
+model:
+  factory: my_project.models:build_model
+  checkpoint_path: /models/base_model.pt
+data:
+  train_index: indexes/train_frames.parquet
+  test_index: indexes/test_frames.parquet
+train:
+  max_steps: 10000
+  local_batch_size: 64
+optimizer:
+  learning_rate: 0.001
+```
+
+`profile`、`contract`、`presets.<组>` 也可以作为命令行覆写,便于 A/B:
+
+```bash
+cls-trainer train --config configs/recipes/game_cls_production.yaml \
+  presets.dataloader=throughput
+```
+
+旧的扁平配置(`base:` 继承,如 `configs/npu_production.yaml`)继续可用。
 
 ## 严格配置校验
 
@@ -90,6 +146,7 @@ runs/dual_frame_game_cls_npu/
         ├── console.log           # rank-0 的 stdout/stderr
         ├── resolved_config.json
         ├── summary.md            # 一页式人类摘要
+        ├── overview.html         # 自包含曲线/指标报告,浏览器直接打开
         ├── train_metrics.jsonl
         ├── reports/
         ├── checkpoints/
@@ -97,9 +154,19 @@ runs/dual_frame_game_cls_npu/
 ```
 
 重复执行同一条命令永远不会覆盖上一次实验;`<runs 根>/index.jsonl` 为每个 run
-记录一行,`cls-trainer run list/show` 据此查询。训练异常退出时 `status.json`
+记录一行,`cls-trainer run list/show` 据此查询;`cls-trainer run compare A B`
+输出两个 run 的配置差异与最佳指标对比;`cls-trainer run export-tensorboard`
+把曲线导出为 TensorBoard 事件文件。训练异常退出时 `status.json`
 记录 `FAILED`、错误类型和 `failure.log`,不会只剩一堆无法判断状态的中间文件。
 训练结束不再把整个嵌套结果打印到终端,而是输出简洁摘要和各关键文件路径。
+
+实验谱系与恢复安全性:
+
+* `cls-trainer train --resume <run 目录>` 在原目录内继续。恢复前会对比当前
+  配置与该 run 的 `resolved_config.json`:改变 `decision.threshold`、图像规格、
+  seed、模型工厂等关键字段会被直接拒绝(退出码 3),其余差异打印 warning;
+* `cls-trainer train --fork <run>` 以某个 run 的配置为起点创建新 run,
+  manifest 与索引中记录 `parent_run_id` 父子关系。
 
 ## 数据索引和严格审计
 

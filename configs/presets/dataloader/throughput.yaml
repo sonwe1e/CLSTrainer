@@ -1,0 +1,17 @@
+# Throughput dataloader policy: more workers and prefetch.
+# Only use after an A/B test against the stable preset confirms higher
+# interval_samples/s without DataLoader timeouts on YOUR hardware.
+dataloader:
+  multiprocessing_context: spawn
+  timeout_seconds: 180
+  worker_num_threads: 1
+  train:
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 4
+    pin_memory: true
+  eval:
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false

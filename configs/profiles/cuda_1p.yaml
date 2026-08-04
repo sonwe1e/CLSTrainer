@@ -1,0 +1,18 @@
+# Profile: single-process CUDA development environment.
+device:
+  accelerator: cuda
+  amp: true
+  amp_dtype: float16
+
+dataloader:
+  num_workers: 0
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: false
+
+evaluation:
+  amp: false
+  amp_dtype: bfloat16
+
+experiment:
+  output_dir: runs/cuda_1p

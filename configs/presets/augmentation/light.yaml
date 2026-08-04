@@ -1,0 +1,25 @@
+# Light augmentation: gentle color jitter only, no geometric transforms.
+augmentation:
+  enabled: true
+  random_affine:
+    enabled: false
+    probability: 0.0
+    degrees: 0.0
+    translate: [0.0, 0.0]
+    scale: [1.0, 1.0]
+    shear: [0.0, 0.0]
+    interpolation: bilinear
+    fill: 0
+  color_jitter:
+    enabled: true
+    probability: 0.50
+    brightness: 0.10
+    contrast: 0.10
+    saturation: 0.05
+    hue: 0.01
+  random_erasing:
+    enabled: false
+    probability: 0.0
+    scale: [0.005, 0.03]
+    ratio: [0.3, 3.3]
+    value: 0

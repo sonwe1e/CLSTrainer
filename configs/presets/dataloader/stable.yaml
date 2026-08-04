@@ -1,0 +1,16 @@
+# Stable dataloader policy: conservative defaults proven on NPU.
+# Use this for first runs on any new environment.
+dataloader:
+  multiprocessing_context: spawn
+  timeout_seconds: 180
+  worker_num_threads: 1
+  train:
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: false
+  eval:
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false

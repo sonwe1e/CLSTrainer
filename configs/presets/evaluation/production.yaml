@@ -1,0 +1,18 @@
+# Production evaluation policy: observed dev-test cadence, histogram AUC,
+# composite best-checkpoint selection.
+evaluation:
+  quick_test_every_steps: 1000
+  quick_test_pairs_per_video: 128
+  full_test_every_steps: 5000
+  full_test_at_end: true
+  full_auc_mode: histogram
+  auc_histogram_bins: 4096
+  quick_save_error_limit: 200
+  html_max_errors_per_group: 200
+  parquet_row_group_size: 4096
+  selection_metric: composite
+  selection_weights:
+    global_f1: 0.40
+    macro_game_f1: 0.40
+    worst_game_f1: 0.20
+  minimum_worst_game_f1: null

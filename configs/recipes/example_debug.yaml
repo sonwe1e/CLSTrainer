@@ -1,0 +1,55 @@
+# Runnable example recipe: synthetic data on CPU, tiny budget.
+#
+#   cls-trainer train --config configs/recipes/example_debug.yaml
+#
+# A recipe only lists the fields YOU decide. Machine behavior comes from
+# the profile, stability defaults from presets, business facts from the
+# contract.
+profile: cpu_debug
+
+presets:
+  augmentation: none
+  evaluation: smoke
+
+experiment:
+  name: example_debug
+  seed: 20260728
+
+model:
+  factory: game_cls.model.builder:build_demo_model
+  checkpoint_path: null
+
+data:
+  synthetic: true
+  backend: png
+
+pair:
+  train_delta_probability: {1: 0.15, 2: 0.70, 3: 0.15}
+
+sampler:
+  game_alpha: 0.25
+  class_probability: {0: 0.5, 1: 0.5}
+  deduplicate_within_global_batch: true
+
+optimizer:
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+scheduler:
+  warmup_steps: 10
+  min_learning_rate: 0.00001
+
+train:
+  epochs: 1
+  steps_per_epoch: 100
+  max_steps: 100
+  stop_after_steps: null
+  resume_path: null
+  verify_frozen_parameters: true
+  local_batch_size: 4
+  gradient_clip_norm: 5.0
+  log_every_steps: 10
+
+checkpoint:
+  save_last_every_steps: 50
+  save_best_selection: true

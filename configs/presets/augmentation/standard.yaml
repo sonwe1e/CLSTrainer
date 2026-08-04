@@ -1,0 +1,25 @@
+# Standard augmentation: the production mix used for the baseline runs.
+augmentation:
+  enabled: true
+  random_affine:
+    enabled: true
+    probability: 0.50
+    degrees: 2.0
+    translate: [0.02, 0.02]
+    scale: [0.98, 1.02]
+    shear: [-1.0, 1.0]
+    interpolation: bilinear
+    fill: 0
+  color_jitter:
+    enabled: true
+    probability: 0.80
+    brightness: 0.15
+    contrast: 0.15
+    saturation: 0.10
+    hue: 0.02
+  random_erasing:
+    enabled: true
+    probability: 0.10
+    scale: [0.005, 0.03]
+    ratio: [0.3, 3.3]
+    value: 0

@@ -50,6 +50,7 @@ from game_cls.runs import (
     STATE_SUCCEEDED,
     allocate_run_dir,
     append_run_index,
+    render_overview_html,
     render_summary_md,
     update_status,
     write_manifest,
@@ -85,6 +86,8 @@ def _write_run_manifest(
         "decision_threshold": config.get("decision", {}).get("threshold"),
         "resume_checkpoint": config["train"].get("resume_path"),
         "resumed_from": meta.get("resumed_from"),
+        "forked_from": meta.get("forked_from"),
+        "parent_run_id": meta.get("parent_run_id"),
         "base_checkpoint": config["model"].get("checkpoint_path"),
         "base_checkpoint_sha256": meta.get("base_checkpoint_sha256"),
         "environment": meta.get("environment"),
@@ -150,6 +153,7 @@ def _finalize_run_success(
     total_steps: int,
     best_metrics: dict,
     started_wall: float,
+    parent_run_id: str | None = None,
 ) -> None:
     from datetime import datetime
 
@@ -178,6 +182,22 @@ def _finalize_run_success(
         (output_dir / "summary.md").write_text(summary_md, encoding="utf-8")
     except OSError:
         pass
+    try:
+        overview_html = render_overview_html(
+            run_dir=output_dir,
+            run_id=run_id,
+            state=STATE_SUCCEEDED,
+            started=started_iso,
+            finished=finished,
+            duration_seconds=duration,
+            config=config,
+            summary_payload=summary_payload,
+        )
+        (output_dir / "overview.html").write_text(
+            overview_html, encoding="utf-8"
+        )
+    except OSError:
+        pass
     if run_mode == "unique":
         selection_score = (
             best_metrics.get("selection_score")
@@ -188,6 +208,7 @@ def _finalize_run_success(
             runs_root,
             {
                 "run_id": run_id,
+                "parent_run_id": parent_run_id,
                 "name": config["experiment"].get("name"),
                 "output_dir": str(output_dir),
                 "state": STATE_SUCCEEDED,
@@ -1804,6 +1825,7 @@ def run_training(
                 total_steps=total_steps,
                 best_metrics=best_metrics,
                 started_wall=started_wall,
+                parent_run_id=(run_meta or {}).get("parent_run_id"),
             )
         distributed_barrier()
         return {

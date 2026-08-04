@@ -1,0 +1,32 @@
+# Profile: eight Ascend NPUs via torchrun + HCCL.
+# Same NPU stability rules as npu_1p, plus distributed process groups.
+device:
+  accelerator: npu
+  amp: true
+  amp_dtype: bfloat16
+
+distributed:
+  enabled: true
+  backend: hccl
+
+dataloader:
+  multiprocessing_context: spawn
+  timeout_seconds: 180
+  worker_num_threads: 1
+  train:
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: false
+  eval:
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false
+
+evaluation:
+  amp: true
+  amp_dtype: bfloat16
+
+experiment:
+  output_dir: runs/npu_8p

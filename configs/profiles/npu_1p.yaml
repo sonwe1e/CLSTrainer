@@ -1,0 +1,29 @@
+# Profile: single-process Ascend NPU (910B class).
+# NPU-specific stability rules live here, not in recipes:
+# spawn multiprocessing, per-batch timeout, independent train/eval workers.
+device:
+  accelerator: npu
+  amp: true
+  amp_dtype: bfloat16
+
+dataloader:
+  multiprocessing_context: spawn
+  timeout_seconds: 180
+  worker_num_threads: 1
+  train:
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: false
+  eval:
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false
+
+evaluation:
+  amp: true
+  amp_dtype: bfloat16
+
+experiment:
+  output_dir: runs/npu_1p
