@@ -7,7 +7,7 @@ export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 unset ASCEND_LAUNCH_BLOCKING || true
 
 # Establish that the model and NPU operators work without worker processes.
-python -u tools/train.py \
+python -u tools/train.py --run-mode fixed \
   --config configs/npu_1p.yaml \
   train.max_steps=5 \
   train.steps_per_epoch=5 \
@@ -25,7 +25,7 @@ python -u tools/train.py \
   experiment.output_dir=runs/npu_single_process_baseline
 
 # Start with one spawned worker before increasing worker concurrency.
-python -u tools/train.py \
+python -u tools/train.py --run-mode fixed \
   --config configs/npu_1p.yaml \
   train.max_steps=10 \
   train.steps_per_epoch=10 \
@@ -41,7 +41,7 @@ python -u tools/train.py \
   experiment.output_dir=runs/npu_spawn_1worker
 
 # Validate spawn worker startup and the augmented training path.
-python -u tools/train.py \
+python -u tools/train.py --run-mode fixed \
   --config configs/npu_1p.yaml \
   train.max_steps=50 \
   train.steps_per_epoch=50 \
@@ -57,7 +57,7 @@ python -u tools/train.py \
   experiment.output_dir=runs/npu_spawn_2workers
 
 # Add quick evaluation with non-persistent eval workers.
-python -u tools/train.py \
+python -u tools/train.py --run-mode fixed \
   --config configs/npu_1p.yaml \
   train.max_steps=20 \
   train.steps_per_epoch=20 \
@@ -73,7 +73,7 @@ python -u tools/train.py \
   experiment.output_dir=runs/npu_spawn_quick_eval
 
 # Run full evaluation only after the preceding stages have passed.
-python -u tools/train.py \
+python -u tools/train.py --run-mode fixed \
   --config configs/npu_1p.yaml \
   train.max_steps=20 \
   train.steps_per_epoch=20 \

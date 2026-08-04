@@ -31,9 +31,75 @@ python -m pytest
 
 Ascend 环境应先按服务器 CANN 版本安装匹配的 PyTorch 和 TorchNPU，再执行基础安装。
 
-正式 NPU 配置位于 `configs/npu_production.yaml`，不再继承 CUDA demo 配置。
-其中的 `model.factory` 和 `model.checkpoint_path` 必须替换为真实模型；未替换、
-checkpoint 不存在或非 `cls` 主干权重未完整加载时，训练会立即终止。
+正式 NPU 配置位于 `configs/npu_production.yaml`,不再继承 CUDA demo 配置。
+其中的 `model.factory` 和 `model.checkpoint_path` 必须替换为真实模型;未替换、
+checkpoint 不存在或非 `cls` 主干权重未完整加载时,训练会立即终止。
+
+## 命令行接口(CLI)
+
+安装后注册 `cls-trainer` 命令(等价于 `python -m game_cls.cli`;`python tools/train.py`
+继续作为 train 入口保留):
+
+```bash
+# 预检环境、数据、模型和配置
+cls-trainer doctor --config configs/npu_1p.yaml
+
+# 只校验配置,不初始化任何设备
+cls-trainer config validate --config configs/npu_1p.yaml
+
+# 查看最终合并配置;--with-source 标注每个字段来自哪个文件或覆写
+cls-trainer config show --config configs/npu_1p.yaml --with-source
+
+# 列出全部配置键及含义(生成件见 docs/config_reference.md)
+cls-trainer config reference
+
+# 预览运行计划(设备、全局 batch、总步数、评估频率、输出位置),不写任何文件
+cls-trainer train --config configs/npu_1p.yaml --dry-run
+
+# 正式训练
+cls-trainer train --config configs/npu_1p.yaml [key=value ...]
+
+# 查询实验
+cls-trainer run list
+cls-trainer run show latest
+```
+
+## 严格配置校验
+
+配置对照严格 Schema 校验:
+
+* 未知键立即报错并给出候选建议。`optimzier.learning_rate=...` 不再静默创建
+  一个无人读取的字段;
+* 从未被消费的已移除字段(`optimizer.name`、`scheduler.name`、
+  `evaluation.save_all_errors`)在配置时报出明确迁移说明,而不是假装生效;
+* 业务判定阈值只有一个来源 `decision.threshold`,训练阈值损失与评估器共同读取;
+  分别配置不一致的 `loss.threshold` / `evaluation.threshold` 会被拒绝;
+* 全部配置键的类型、枚举和含义见 `cls-trainer config reference`。
+
+## Run 管理
+
+默认每次 `train` 启动都创建一个**不可覆盖的 Run**:`experiment.output_dir` 被视为
+runs 根目录,每次启动在其下分配一个新的带时间戳目录:
+
+```text
+runs/dual_frame_game_cls_npu/
+└── 20260804/
+    └── 230712_dual_frame_game_cls_npu_a13f/
+        ├── manifest.json         # 命令、git commit、主机、环境版本、seed、基座 ckpt SHA-256
+        ├── status.json           # RUNNING/SUCCEEDED/FAILED 原子更新,含 step 与错误信息
+        ├── console.log           # rank-0 的 stdout/stderr
+        ├── resolved_config.json
+        ├── summary.md            # 一页式人类摘要
+        ├── train_metrics.jsonl
+        ├── reports/
+        ├── checkpoints/
+        └── training_summary.json
+```
+
+重复执行同一条命令永远不会覆盖上一次实验;`<runs 根>/index.jsonl` 为每个 run
+记录一行,`cls-trainer run list/show` 据此查询。训练异常退出时 `status.json`
+记录 `FAILED`、错误类型和 `failure.log`,不会只剩一堆无法判断状态的中间文件。
+训练结束不再把整个嵌套结果打印到终端,而是输出简洁摘要和各关键文件路径。
 
 ## 数据索引和严格审计
 
@@ -99,7 +165,7 @@ SHA-256 会完整读取每张图片，是一次性但明显的 I/O 成本。百�
 
 ## 训练
 
-CPU/CUDA 合成数据 smoke test：
+CPU/CUDA 合成数据 smoke test:
 
 ```bash
 python tools/train.py \
@@ -108,6 +174,10 @@ python tools/train.py \
   evaluation.quick_test_every_steps=1 \
   evaluation.full_test_every_steps=2
 ```
+
+产物位于 `runs/dual_frame_game_cls_debug/<日期>/<时间戳>_<名称>_<id>/` 下的新
+run 目录;结束后的终端输出会给出 `summary.md`、`status.json` 等关键文件路径。
+需要就地写入固定目录时(例如分阶段验收脚本)显式加 `--run-mode fixed`。
 
 Ascend 单卡和八卡：
 
@@ -263,6 +333,10 @@ checkpoint 指标、best observed dev-test 指标，以及 quick/full test 的�
 版本解释为概率，还应在自然分布 calibration 集上拟合 temperature 和 bias。
 
 ## 精确恢复
+
+推荐入口是 `cls-trainer train --resume <run 目录>`:自动读取该 run 的
+`resolved_config.json` 与 `checkpoints/checkpoint_last.pth`,并在原 run 目录内
+继续,不新建目录。
 
 完整 checkpoint 保存 epoch、`step_in_epoch`、global step、sampler 状态、优化器、
 scheduler、scaler、CPU/CUDA/NPU RNG 和各 rank 独立 RNG。训练 pair 自带确定性增强

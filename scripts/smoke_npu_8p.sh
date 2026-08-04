@@ -3,7 +3,7 @@ set -euo pipefail
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
-  tools/train.py \
+  tools/train.py --run-mode fixed \
   --config configs/npu_8p.yaml \
   train.max_steps=100 \
   train.steps_per_epoch=100 \

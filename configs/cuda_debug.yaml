@@ -22,6 +22,12 @@ pair:
   train_delta_probability: {1: 0.15, 2: 0.70, 3: 0.15}
   test_delta: 2
 
+# Single source of truth for the deployment decision: softmax probability
+# strictly greater than this value means positive. The training threshold
+# loss and the evaluator both read this key.
+decision:
+  threshold: 0.99
+
 sampler:
   game_alpha: 0.25
   class_probability: {0: 0.5, 1: 0.5}
@@ -62,7 +68,6 @@ model:
 
 loss:
   cross_entropy_weight: 1.0
-  threshold: 0.99
   threshold_loss_weight: 0.20
   threshold_safety_margin: 0.20
   threshold_temperature: 0.50
@@ -70,12 +75,10 @@ loss:
   threshold_ramp_ratio: 0.20
 
 optimizer:
-  name: AdamW
   learning_rate: 0.001
   weight_decay: 0.0001
 
 scheduler:
-  name: cosine
   warmup_steps: 10
   min_learning_rate: 0.00001
 
@@ -97,14 +100,12 @@ dataloader:
   pin_memory: false
 
 evaluation:
-  threshold: 0.99
   amp: false
   amp_dtype: bfloat16
   quick_test_every_steps: 50
   quick_test_pairs_per_video: 16
   full_test_every_steps: 100
   full_test_at_end: true
-  save_all_errors: true
   html_max_errors_per_group: 200
 
 checkpoint:

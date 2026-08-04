@@ -7,7 +7,10 @@ Requires-Dist: numpy>=1.26
 Requires-Dist: Pillow>=10.0
 Requires-Dist: PyYAML>=6.0
 Requires-Dist: pyarrow>=15.0
-Requires-Dist: torch>=2.2
-Requires-Dist: torchvision>=0.17
+Provides-Extra: cuda
+Requires-Dist: torch>=2.2; extra == "cuda"
+Requires-Dist: torchvision>=0.17; extra == "cuda"
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: torch>=2.2; extra == "dev"
+Requires-Dist: torchvision>=0.17; extra == "dev"

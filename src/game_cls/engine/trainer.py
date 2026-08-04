@@ -7,8 +7,9 @@ import math
 from pathlib import Path
 import random
 import time
-from typing import Any
+from typing import Any, Callable
 
+from game_cls.config_schema import finalize_config
 from game_cls.data.collate import pair_collate
 from game_cls.data.image_spec import ImageSpec
 from game_cls.engine.checkpoint import (
@@ -43,6 +44,161 @@ from game_cls.reports.error_writer import (
     prepare_evaluation_directory,
     write_evaluation_report,
 )
+from game_cls.runs import (
+    STATE_FAILED,
+    STATE_RUNNING,
+    STATE_SUCCEEDED,
+    allocate_run_dir,
+    append_run_index,
+    render_summary_md,
+    update_status,
+    write_manifest,
+)
+
+
+def _iso_now() -> str:
+    from datetime import datetime
+
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _write_run_manifest(
+    output_dir: Path,
+    *,
+    config: dict,
+    run_meta: dict | None,
+    run_id: str | None,
+    run_mode: str,
+    world_size: int,
+) -> None:
+    meta = run_meta or {}
+    manifest = {
+        "run_id": run_id,
+        "run_mode": run_mode,
+        "run_name": config["experiment"].get("name"),
+        "created": _iso_now(),
+        "command": meta.get("command"),
+        "config_file": meta.get("config_file"),
+        "seed": config["experiment"].get("seed"),
+        "world_size": world_size,
+        "accelerator": config["device"].get("accelerator"),
+        "decision_threshold": config.get("decision", {}).get("threshold"),
+        "resume_checkpoint": config["train"].get("resume_path"),
+        "resumed_from": meta.get("resumed_from"),
+        "base_checkpoint": config["model"].get("checkpoint_path"),
+        "base_checkpoint_sha256": meta.get("base_checkpoint_sha256"),
+        "environment": meta.get("environment"),
+    }
+    write_manifest(output_dir, manifest)
+
+
+def _record_run_failure(
+    output_dir: Path,
+    exc: BaseException,
+    *,
+    global_step: int,
+    run_id: str | None,
+    run_mode: str,
+    runs_root: Path,
+    config: dict,
+    started_wall: float,
+) -> None:
+    import traceback
+
+    failure_text = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    try:
+        (output_dir / "failure.log").write_text(
+            failure_text, encoding="utf-8"
+        )
+        update_status(
+            output_dir,
+            state=STATE_FAILED,
+            step=global_step,
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:500],
+            traceback_file="failure.log",
+            finished=_iso_now(),
+        )
+        if run_mode == "unique":
+            append_run_index(
+                runs_root,
+                {
+                    "run_id": run_id,
+                    "name": config["experiment"].get("name"),
+                    "output_dir": str(output_dir),
+                    "state": STATE_FAILED,
+                    "error_type": type(exc).__name__,
+                    "finished": _iso_now(),
+                    "duration_seconds": round(time.time() - started_wall, 3),
+                },
+            )
+    except OSError:
+        pass
+
+
+def _finalize_run_success(
+    *,
+    output_dir: Path,
+    config: dict,
+    run_id: str | None,
+    run_mode: str,
+    runs_root: Path,
+    summary_payload: dict,
+    global_step: int,
+    total_steps: int,
+    best_metrics: dict,
+    started_wall: float,
+) -> None:
+    from datetime import datetime
+
+    finished = _iso_now()
+    started_iso = datetime.fromtimestamp(started_wall).astimezone().isoformat(
+        timespec="seconds"
+    )
+    duration = time.time() - started_wall
+    update_status(
+        output_dir,
+        state=STATE_SUCCEEDED,
+        step=global_step,
+        finished=finished,
+    )
+    try:
+        summary_md = render_summary_md(
+            run_id=run_id,
+            run_dir=output_dir,
+            state=STATE_SUCCEEDED,
+            started=started_iso,
+            finished=finished,
+            duration_seconds=duration,
+            config=config,
+            summary_payload=summary_payload,
+        )
+        (output_dir / "summary.md").write_text(summary_md, encoding="utf-8")
+    except OSError:
+        pass
+    if run_mode == "unique":
+        selection_score = (
+            best_metrics.get("selection_score")
+            if isinstance(best_metrics, dict)
+            else None
+        )
+        append_run_index(
+            runs_root,
+            {
+                "run_id": run_id,
+                "name": config["experiment"].get("name"),
+                "output_dir": str(output_dir),
+                "state": STATE_SUCCEEDED,
+                "started": started_iso,
+                "finished": finished,
+                "duration_seconds": round(duration, 3),
+                "global_step": global_step,
+                "total_steps": total_steps,
+                "selection_score": selection_score,
+            },
+        )
 
 
 class SyntheticPairDataset:
@@ -932,21 +1088,74 @@ def _run_evaluation(
     return result
 
 
-def run_training(config: dict[str, Any]) -> dict:
+def run_training(
+    config: dict[str, Any],
+    run_meta: dict[str, Any] | None = None,
+    on_run_dir: Callable[[Path], None] | None = None,
+) -> dict:
+    """Train the dual-frame classifier.
+
+    ``experiment.run_mode`` controls output placement:
+
+    * ``fixed`` (default): write directly into ``experiment.output_dir``
+      (legacy behavior, exact resume and tests rely on it).
+    * ``unique``: treat ``experiment.output_dir`` as a runs ROOT and
+      allocate a fresh, never-overwritten timestamped run directory under
+      it. Rank 0 allocates the directory and broadcasts it, so distributed
+      launches agree on a single run.
+
+    ``run_meta`` carries launch facts (command, environment, checkpoint
+    hash) for the manifest; ``on_run_dir`` is a rank-0 callback fired as
+    soon as the run directory exists (used to attach console capture).
+    """
     import torch
 
+    config = finalize_config(config)
     validate_training_config(config)
     image_spec = ImageSpec.from_config(config["data"])
     rank, world_size, local_rank, device = initialize_runtime(config)
+    run_mode = str(config["experiment"].get("run_mode", "fixed"))
+    runs_root = Path(config["experiment"]["output_dir"])
+    started_wall = time.time()
+    run_id: str | None = None
+    output_dir: Path | None = None
+    global_step = 0
     try:
         seed = int(config["experiment"]["seed"])
         _seed_everything(seed + rank)
-        output_dir = Path(config["experiment"]["output_dir"])
-        if rank == 0:
+        output_dir = runs_root
+        if run_mode == "unique":
+            allocation: tuple[str, str] | None = None
+            if rank == 0:
+                allocated, allocated_id = allocate_run_dir(
+                    runs_root, config["experiment"].get("name", "run")
+                )
+                allocation = (str(allocated), allocated_id)
+            allocation = _broadcast_object(allocation, rank)
+            output_dir = Path(allocation[0])
+            run_id = allocation[1]
+        elif rank == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
+        if rank == 0:
             (output_dir / "resolved_config.json").write_text(
                 json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            _write_run_manifest(
+                output_dir,
+                config=config,
+                run_meta=run_meta,
+                run_id=run_id,
+                run_mode=run_mode,
+                world_size=world_size,
+            )
+            update_status(
+                output_dir,
+                state=STATE_RUNNING,
+                run_id=run_id,
+                started=_iso_now(),
+            )
+            if on_run_dir is not None:
+                on_run_dir(output_dir)
 
         model = build_model(config["model"])
         checkpoint_path = config["model"].get("checkpoint_path")
@@ -1406,6 +1615,13 @@ def run_training(config: dict[str, Any]) -> dict:
                         _append_training_metrics(
                             metrics_path, metrics_payload
                         )
+                        update_status(
+                            output_dir,
+                            state=STATE_RUNNING,
+                            step=global_step,
+                            loss=loss_value,
+                            learning_rate=learning_rate,
+                        )
                         print(
                             f"step={global_step}/{total_steps} "
                             f"loss={loss_value:.6f} "
@@ -1577,12 +1793,40 @@ def run_training(config: dict[str, Any]) -> dict:
                 json.dumps(summary_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            _finalize_run_success(
+                output_dir=output_dir,
+                config=config,
+                run_id=run_id,
+                run_mode=run_mode,
+                runs_root=runs_root,
+                summary_payload=summary_payload,
+                global_step=global_step,
+                total_steps=total_steps,
+                best_metrics=best_metrics,
+                started_wall=started_wall,
+            )
         distributed_barrier()
         return {
             "global_step": global_step,
             "last_metrics": evaluation_state["last_full_metrics"],
             "best_metrics": best_metrics,
             "evaluation_state": evaluation_state,
+            "output_dir": str(output_dir),
+            "run_id": run_id,
+            "state": STATE_SUCCEEDED,
         }
+    except BaseException as exc:
+        if rank == 0 and output_dir is not None:
+            _record_run_failure(
+                output_dir,
+                exc,
+                global_step=global_step,
+                run_id=run_id,
+                run_mode=run_mode,
+                runs_root=runs_root,
+                config=config,
+                started_wall=started_wall,
+            )
+        raise
     finally:
         cleanup_distributed()
