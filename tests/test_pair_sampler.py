@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
 import unittest
+from collections import Counter
 
 from game_cls.data.pair_sampler import BalancedDistributedPairBatchSampler
 from game_cls.data.records import PairSample
@@ -45,7 +45,7 @@ class PairSamplerTests(unittest.TestCase):
         self.assertEqual(
             rank0, list(BalancedDistributedPairBatchSampler(rank=0, **kwargs))
         )
-        for left, right in zip(rank0, rank1):
+        for left, right in zip(rank0, rank1, strict=False):
             self.assertTrue(set(left).isdisjoint(right))
 
     def test_delta_and_class_distribution(self) -> None:

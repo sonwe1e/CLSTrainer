@@ -90,7 +90,7 @@ class _TeeContext:
         self.stdout.attach(run_dir)
         self.stderr.attach(run_dir)
 
-    def __enter__(self) -> "_TeeContext":
+    def __enter__(self) -> _TeeContext:
         self._old_stdout, self._old_stderr = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = self.stdout, self.stderr
         return self
@@ -110,26 +110,49 @@ RESUME_EXPECTED_DIFFS = {
     "experiment.output_dir",
     "experiment.run_mode",
     "train.resume_path",
-    "train.max_steps",
-    "train.stop_after_steps",
 }
 
+# Changing max_steps/stop_after does not corrupt the restored optimizer/
+# sampler state; it only re-plans the scheduler, which is why it is
+# classified as ``resume-extend`` rather than exact.
+RESUME_EXTEND_KEYS = {"train.max_steps", "train.stop_after_steps"}
+
 # Facts that must never change across a resume; they would silently
-# invalidate the restored optimizer/sampler/model state.
+# invalidate the restored optimizer/sampler/model state or change what the
+# run measures. Changing any of these is ``fork`` territory.
 RESUME_CRITICAL_DIFFS = {
     "decision.threshold",
     "data.width",
     "data.height",
     "data.channels",
     "pair.test_delta",
+    "data.backend",
+    "data.train_index",
+    "data.val_index",
+    "data.test_index",
+    "data.train_video_index",
+    "data.val_video_index",
+    "data.test_video_index",
+    "data.train_packed_index",
+    "data.val_packed_index",
+    "data.test_packed_index",
+    "data.train_packed_video_index",
+    "data.val_packed_video_index",
+    "data.test_packed_video_index",
+    "data.class_probability",
+    "data.delta_probability",
+    "data.game_alpha",
     "model.factory",
     "model.trainable_name_contains",
     "model.num_classes",
     "model.checkpoint_path",
+    "model.require_pretrained_backbone",
     "experiment.seed",
-    "data.backend",
-    "data.train_index",
-    "data.test_index",
+    "train.local_batch_size",
+    "optimizer.learning_rate",
+    "optimizer.weight_decay",
+    "distributed.enabled",
+    "distributed.backend",
 }
 
 
@@ -151,23 +174,44 @@ def check_resume_drift(
 ) -> tuple[list[str], list[str]]:
     """Compare a resume config against the run's resolved config.
 
-    Returns (critical, warnings) lists of human readable problems.
+    Returns (critical, warnings) lists of human readable problems. The
+    comparison is symmetric: added and removed keys are detected, not just
+    changed values, so newly introduced critical fields cannot silently
+    slip past.
     """
     base_flat = _flatten_dict(baseline)
     new_flat = _flatten_dict(config)
     critical: list[str] = []
     warnings: list[str] = []
-    for key in sorted(set(base_flat) & set(new_flat)):
-        if base_flat[key] == new_flat[key]:
+    for key in sorted(set(base_flat) | set(new_flat)):
+        in_base = key in base_flat
+        in_new = key in new_flat
+        if in_base and in_new:
+            if base_flat[key] == new_flat[key]:
+                continue
+            text = f"{key}: {base_flat[key]!r} -> {new_flat[key]!r}"
+        elif in_base:
+            text = f"{key}: removed ({base_flat[key]!r})"
+        else:
+            text = f"{key}: added ({new_flat[key]!r})"
+        if key in RESUME_EXPECTED_DIFFS and in_base and in_new:
             continue
-        if key in RESUME_EXPECTED_DIFFS:
-            continue
-        text = f"{key}: {base_flat[key]!r} -> {new_flat[key]!r}"
         if key in RESUME_CRITICAL_DIFFS:
             critical.append(text)
         else:
             warnings.append(text)
     return critical, warnings
+
+
+def classify_resume(baseline: dict, config: dict, warnings: list[str]) -> str:
+    """exact | extend | fork for a resume with non-critical drift."""
+    if not warnings:
+        return "exact"
+    flexible_only = all(
+        warning.split(":", 1)[0].strip() in RESUME_EXTEND_KEYS
+        for warning in warnings
+    )
+    return "extend" if flexible_only else "fork"
 
 
 def _resolve_run_dir(target: str, root: Path) -> Path:
@@ -250,8 +294,19 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
         warnings.append("model.factory is still the placeholder.")
     if checkpoint_path and checkpoint_status == "MISSING":
         warnings.append(f"model.checkpoint_path does not exist: {checkpoint_path}")
-    quick_every = int(evaluation_cfg.get("quick_test_every_steps", 0))
-    full_every = int(evaluation_cfg.get("full_test_every_steps", 0))
+    quick_every = int(
+        evaluation_cfg.get(
+            "val_quick_every_steps",
+            evaluation_cfg.get("quick_test_every_steps", 0),
+        )
+    )
+    full_every = int(
+        evaluation_cfg.get(
+            "val_full_every_steps",
+            evaluation_cfg.get("full_test_every_steps", 0),
+        )
+    )
+    probe_every = int(evaluation_cfg.get("train_probe_every_steps", 0))
 
     print("=== DRY RUN — nothing will be initialized or written ===")
     print(f"config file        : {config_file}")
@@ -274,14 +329,40 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
     if stop_after is not None:
         print(f"stop after         : {stop_after} steps")
     print(
-        f"quick test         : "
+        f"train probe        : "
+        f"{'every ' + str(probe_every) + ' steps' if probe_every else 'disabled'}"
+    )
+    print(
+        f"quick validation   : "
         f"{'every ' + str(quick_every) + ' steps' if quick_every else 'disabled'}"
     )
     print(
-        f"full test          : "
+        f"full validation    : "
         f"{'every ' + str(full_every) + ' steps' if full_every else 'disabled'}"
-        f" (at end: {bool(evaluation_cfg.get('full_test_at_end', True))})"
+        f" (at end: {bool(evaluation_cfg.get('val_full_at_end', evaluation_cfg.get('full_test_at_end', True)))})"
     )
+    data_cfg = config["data"]
+    if data_cfg.get("synthetic"):
+        print("split roles        : synthetic (train/val/test)")
+    elif (data_cfg.get("split_migration") or {}).get(
+        "test_used_as_validation"
+    ):
+        print(
+            "split roles        : test aliased as validation — NO "
+            "independent test set"
+        )
+    else:
+        print("split roles        : train / validation / test")
+    early_cfg = config.get("early_stopping") or {}
+    if early_cfg.get("enabled"):
+        print(
+            f"early stopping     : monitor={early_cfg.get('monitor')} "
+            f"patience={early_cfg.get('patience_evaluations')} "
+            f"min_delta={early_cfg.get('min_delta')} "
+            f"burn_in={early_cfg.get('burn_in_steps')}"
+        )
+    else:
+        print("early stopping     : disabled")
     run_mode = str(config["experiment"].get("run_mode", "fixed"))
     print(f"run mode           : {run_mode}")
     print(f"runs root          : {config['experiment']['output_dir']}")
@@ -348,6 +429,10 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     parent_run_id: str | None = None
     forked_from: str | None = None
+    resume_run_id: str | None = None
+    inferred_runs_root: str | None = None
+    resume_type = "exact"
+    resume_config_diffs: list[str] = []
     if args.resume:
         baseline = _read_run_json(resume_dir, "resolved_config.json")
         if baseline:
@@ -367,6 +452,31 @@ def cmd_train(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 3
+            resume_config_diffs = drift_warnings
+            resume_type = classify_resume(baseline, config, drift_warnings)
+            if resume_type == "fork":
+                print(
+                    "Resume refused: this would change the training "
+                    "strategy, which invalidates the restored state. "
+                    "Use --fork RUN_ID to start a new run derived from "
+                    "this one instead.",
+                    file=sys.stderr,
+                )
+                return 3
+            if resume_type == "extend":
+                print(
+                    "[WARNING] resume-extend: max_steps/stop_after changed; "
+                    "the scheduler is re-planned for the new budget."
+                )
+        resume_manifest = _read_run_json(resume_dir, "manifest.json") or {}
+        resume_run_id = resume_manifest.get("run_id")
+        # Unique-mode runs live at <runs_root>/<YYYYMMDD>/<run_id>; recover
+        # the original runs root so index/status updates land next to the
+        # run's siblings instead of inside the run directory.
+        if resume_run_id:
+            candidate = resume_dir.parent.parent
+            if candidate.is_dir():
+                inferred_runs_root = str(candidate)
         config["experiment"]["output_dir"] = str(resume_dir)
         config["experiment"]["run_mode"] = "fixed"
         config["train"]["resume_path"] = _resolve_resume_checkpoint(
@@ -404,6 +514,11 @@ def cmd_train(args: argparse.Namespace) -> int:
         "resumed_from": args.resume,
         "forked_from": forked_from,
         "parent_run_id": parent_run_id,
+        "run_id": resume_run_id,
+        "resume_type": resume_type,
+        "resume_config_diffs": resume_config_diffs,
+        "runs_root": inferred_runs_root
+        or str(Path(args.runs_root).resolve()),
         "base_checkpoint_sha256": checkpoint_hash,
         "environment": collect_environment(config),
     }
@@ -444,7 +559,7 @@ RECIPE_TEMPLATE = """\
 #   cls-trainer train  --config {output} --dry-run
 #
 # Business facts (threshold 0.99, delta=2 test pairs, cls-only training,
-# 448x208 frames) come from the contract and are intentionally absent here.
+# 448x208 frames) come from the task profile and are intentionally absent here.
 # Device/DataLoader stability rules come from the profile.
 profile: {profile}
 
@@ -465,14 +580,18 @@ model:
 data:
   synthetic: false
   require_content_hash_audit: true
+  require_unique_video_keys_across_splits: true
+  require_independent_test: true
   audit_path: indexes/audit.json
   train_video_index: indexes/train_video_entries.parquet
+  val_video_index: indexes/val_video_entries.parquet
   test_video_index: indexes/test_video_entries.parquet
   train_index: indexes/train_frames.parquet
+  val_index: indexes/val_frames.parquet
   test_index: indexes/test_frames.parquet
   backend: png
   duplicate_policy:
-    same_label_cross_split: warning
+    same_label_cross_split: error
     same_label_within_split: warning
     cross_label_same_content: error
     same_basename: info
@@ -507,6 +626,19 @@ train:
 checkpoint:
   save_last_every_steps: 1000
   save_best_selection: true
+  save_best_val_loss: true
+  save_best_worst_game: true
+
+# Early stopping watches full validation only; max_steps is a safety cap.
+early_stopping:
+  enabled: true
+  monitor: selection_score
+  mode: max
+  full_validation_only: true
+  burn_in_steps: 6000
+  patience_evaluations: 3
+  min_delta: 0.001
+  restore_best: true
 """
 
 
@@ -637,13 +769,30 @@ def cmd_config_reference(args: argparse.Namespace) -> int:
 
 
 def _find_index_records(root: Path) -> list[dict[str, Any]]:
+    """All index records under ``root``, aggregated by run identity.
+
+    The index is append-only (every start/resume/finish appends a line);
+    readers must collapse per-``run_id`` to the latest record so a resumed
+    run shows its current state, not the pre-resume one.
+    """
     from game_cls.runs import read_run_index
 
     records: list[dict[str, Any]] = []
     records.extend(read_run_index(root))
     for nested in sorted(root.glob("*/index.jsonl")):
         records.extend(read_run_index(nested.parent))
-    return records
+    latest_index: dict[str, int] = {}
+    for index, record in enumerate(records):
+        key = record.get("run_id") or record.get("output_dir")
+        if key:
+            latest_index[key] = index
+    aggregated: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        key = record.get("run_id") or record.get("output_dir")
+        if key and latest_index.get(key) != index:
+            continue  # superseded by a later record for the same run
+        aggregated.append(record)
+    return aggregated
 
 
 def cmd_run_list(args: argparse.Namespace) -> int:
@@ -704,6 +853,19 @@ def cmd_run_show(args: argparse.Namespace) -> int:
         best = summary.get("best_observed_dev_test_metrics") or {}
         if isinstance(best.get("selection_score"), (int, float)):
             print(f"best score   : {best['selection_score']:.4f}")
+        topk = summary.get("topk_checkpoints") or []
+        if topk:
+            print("topk         :")
+            for entry in topk:
+                value = entry.get("value")
+                value_text = (
+                    f"{value:.4f}" if isinstance(value, (int, float)) else "n/a"
+                )
+                print(
+                    f"  step={entry.get('step', '?')} "
+                    f"{entry.get('monitor', 'selection_score')}={value_text} "
+                    f"model_{entry.get('tag', '')}.pth"
+                )
     for artifact in ("summary.md", "overview.html", "train_metrics.jsonl", "console.log"):
         if (run_dir / artifact).is_file():
             print(f"artifact     : {run_dir / artifact}")
@@ -767,11 +929,16 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
         metrics = summary.get("best_observed_dev_test_metrics") or {}
         values = []
         for metric in (
-            "global_f1_tau099",
-            "macro_game_f1_tau099",
-            "worst_game_f1_tau099",
+            "global_f1_at_decision_threshold",
+            "macro_game_f1_at_decision_threshold",
+            "worst_game_f1_at_decision_threshold",
         ):
-            value = metrics.get(metric)
+            value = metrics.get(
+                metric,
+                metrics.get(
+                    metric.replace("_at_decision_threshold", "_tau099")
+                ),
+            )
             values.append(
                 f"{metric}={value:.4f}"
                 if isinstance(value, (int, float))
@@ -806,6 +973,13 @@ def cmd_run_export_tensorboard(args: argparse.Namespace) -> int:
         "loss",
         "ce",
         "threshold_loss",
+        "interval_loss",
+        "interval_ce",
+        "interval_threshold_loss",
+        "interval_threshold_weight",
+        "interval_accuracy",
+        "interval_positive_recall_tau099",
+        "interval_negative_specificity_tau099",
         "interval_samples_per_second",
         "interval_step_time",
         "data_wait_ratio",
@@ -817,8 +991,23 @@ def cmd_run_export_tensorboard(args: argparse.Namespace) -> int:
         step = int(row.get("step", 0))
         for field in train_fields:
             value = row.get(field)
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) and not isinstance(
+                value, bool
+            ):
                 writer.add_scalar(f"train/{field}", float(value), step)
+    # Unified evaluation history (train probe / validation / test).
+    from game_cls.runs import read_evaluation_history
+
+    evaluation_scalars = 0
+    for record in read_evaluation_history(run_dir):
+        step = int(record.get("step", 0))
+        split = record.get("split", "validation")
+        for key, value in record.items():
+            if isinstance(value, (int, float)) and not isinstance(
+                value, bool
+            ):
+                writer.add_scalar(f"eval_{split}/{key}", float(value), step)
+                evaluation_scalars += 1
     reports_dir = run_dir / "reports"
     evaluation_scalars = 0
     if reports_dir.is_dir():
@@ -841,6 +1030,267 @@ def cmd_run_export_tensorboard(args: argparse.Namespace) -> int:
     )
     print(f"View with: tensorboard --logdir {out_dir}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# evaluate (standalone final test / validation evaluation)
+# ---------------------------------------------------------------------------
+
+
+_CHECKPOINT_ALIASES = (
+    "last",
+    "best_selection",
+    "best_val_loss",
+    "best_worst_game",
+    "best_observed_dev_test_selection",
+)
+
+
+def _resolve_checkpoint_state(run_dir: Path, name: str):
+    """Load a model state dict from a run's checkpoints directory.
+
+    Evaluation only needs tensors, so all loads use ``weights_only=True``;
+    internal training checkpoints are recognized by their marker and their
+    model sub-dict is extracted.
+    """
+    import torch
+
+    direct = Path(name)
+    if direct.is_file():
+        payload = torch.load(direct, map_location="cpu", weights_only=True)
+        if isinstance(payload, dict) and "model" in payload:
+            return payload["model"], str(direct)
+        return payload, str(direct)
+    checkpoints = run_dir / "checkpoints"
+    model_only = checkpoints / f"model_{name}.pth"
+    if model_only.is_file():
+        return (
+            torch.load(model_only, map_location="cpu", weights_only=True),
+            str(model_only),
+        )
+    full_state = checkpoints / f"checkpoint_{name}.pth"
+    if full_state.is_file():
+        payload = torch.load(
+            full_state, map_location="cpu", weights_only=True
+        )
+        return payload["model"], str(full_state)
+    available = sorted(
+        path.name
+        for path in checkpoints.glob("model_*.pth")
+    ) if checkpoints.is_dir() else []
+    raise SystemExit(
+        f"Checkpoint '{name}' not found under {checkpoints}. "
+        f"Available: {', '.join(available) or '(none)'}"
+    )
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """Evaluate one checkpoint on the held-out test (or validation) split.
+
+    The test split is evaluated exactly once, after training, and never
+    participates in model selection: that is the whole point of the
+    train/validation/test protocol.
+    """
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError, split_role_warnings
+    from game_cls.engine.checkpoint import unwrap_model
+    from game_cls.engine.distributed import (
+        cleanup_distributed,
+        distributed_barrier,
+        initialize_runtime,
+        is_distributed,
+    )
+    from game_cls.engine.evaluator import evaluate
+    from game_cls.engine.trainer import (
+        _annotate_selection,
+        _append_evaluation_history,
+        _evaluation_history_record,
+        build_eval_loader_for_split,
+        has_independent_test,
+    )
+    from game_cls.model.builder import build_model
+    from game_cls.reports.error_writer import (
+        prepare_evaluation_directory,
+        write_evaluation_report,
+    )
+
+    run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
+    config_source = args.config or str(run_dir / "resolved_config.json")
+    if not Path(config_source).is_file():
+        print(
+            f"No config found for run {run_dir}: pass --config or ensure "
+            f"{run_dir / 'resolved_config.json'} exists.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        config = load_config(config_source)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    if config["data"].get("synthetic"):
+        print(
+            "evaluate requires real indexes; the run config uses "
+            "synthetic data.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.split == "test" and not has_independent_test(config):
+        print(
+            "This run has no independent test set: data.test_index was "
+            "aliased as validation during training. Use --split "
+            "validation, or retrain with a dedicated data.val_index.",
+            file=sys.stderr,
+        )
+        return 3
+    for warning in split_role_warnings(config):
+        print(f"[WARNING] {warning}", file=sys.stderr)
+
+    try:
+        rank, world_size, local_rank, device = initialize_runtime(config)
+    except RuntimeError as exc:
+        print(f"Runtime initialization failed: {exc}", file=sys.stderr)
+        return 1
+    del local_rank
+    try:
+        state_dict, checkpoint_path = _resolve_checkpoint_state(
+            run_dir, args.checkpoint
+        )
+        model = build_model(config["model"])
+        unwrap_model(model).load_state_dict(state_dict, strict=True)
+        model.to(device)
+        if rank == 0:
+            print(f"Loaded checkpoint: {checkpoint_path}")
+        try:
+            loader, components = build_eval_loader_for_split(
+                config, args.split, rank, world_size
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+        kind = "test_full" if args.split == "test" else "val_full"
+        report_dir = (
+            run_dir / "reports" / f"{kind}_{args.checkpoint}"
+        )
+        prepare_evaluation_directory(report_dir, rank)
+        distributed_barrier()
+        evaluation_cfg = config["evaluation"]
+        loss_cfg = config["loss"]
+        result = evaluate(
+            unwrap_model(model),
+            loader,
+            device,
+            config["decision"]["threshold"],
+            checkpoint_step=0,
+            distributed=is_distributed(),
+            rank=rank,
+            world_size=world_size,
+            evaluation_kind=kind,
+            report_dir=report_dir,
+            full_auc_mode=evaluation_cfg.get("full_auc_mode", "histogram"),
+            auc_histogram_bins=int(
+                evaluation_cfg.get("auc_histogram_bins", 4096)
+            ),
+            amp=bool(
+                evaluation_cfg.get(
+                    "amp", config["device"].get("amp", False)
+                )
+            ),
+            amp_dtype=str(
+                evaluation_cfg.get(
+                    "amp_dtype",
+                    config["device"].get("amp_dtype", "bfloat16"),
+                )
+            ),
+            parquet_row_group_size=int(
+                evaluation_cfg.get("parquet_row_group_size", 4096)
+            ),
+            group_catalogs=getattr(
+                getattr(loader, "dataset", None), "group_catalogs", None
+            ),
+            cross_entropy_weight=float(
+                loss_cfg.get("cross_entropy_weight", 1.0)
+            ),
+            threshold_safety_margin=float(
+                loss_cfg.get("threshold_safety_margin", 0.20)
+            ),
+            threshold_temperature=float(
+                loss_cfg.get("threshold_temperature", 0.50)
+            ),
+        )
+        distributed_barrier()
+        if rank == 0:
+            metrics = dict(result.metrics or {})
+            metrics.update(
+                {
+                    "evaluation_kind": kind,
+                    "evaluation_role": (
+                        "test" if args.split == "test" else "validation"
+                    ),
+                    "evaluation_scope": "full",
+                    "checkpoint": args.checkpoint,
+                    "checkpoint_path": checkpoint_path,
+                    "split": args.split,
+                }
+            )
+            _annotate_selection(metrics, evaluation_cfg)
+            write_evaluation_report(
+                report_dir,
+                metrics,
+                result.grouped_metrics,
+                merge_shards=True,
+                lightweight=False,
+                html_max_errors=int(
+                    evaluation_cfg.get("html_max_errors_per_group", 200)
+                ),
+                preview_decoder=getattr(
+                    getattr(loader, "dataset", None), "decoder", None
+                ),
+            )
+            _append_evaluation_history(
+                run_dir,
+                _evaluation_history_record(
+                    metrics,
+                    kind=kind,
+                    global_step=int(metrics.get("checkpoint_step", 0)),
+                ),
+            )
+            summary_path = run_dir / (
+                "test_evaluation.json"
+                if args.split == "test"
+                else "validation_evaluation.json"
+            )
+            summary_path.write_text(
+                json.dumps(metrics, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print("")
+            print(f"=== {args.split} evaluation finished ===")
+            print(f"checkpoint      : {checkpoint_path}")
+            print(f"samples         : {metrics.get('sample_count')}")
+            for key in (
+                "selection_score",
+                "global_f1_at_decision_threshold",
+                "macro_game_f1_at_decision_threshold",
+                "worst_game_f1_at_decision_threshold",
+                "cross_entropy",
+                "brier_score",
+                "ece_20_bins",
+            ):
+                value = metrics.get(
+                    key,
+                    metrics.get(
+                        key.replace("_at_decision_threshold", "_tau099")
+                    ),
+                )
+                if isinstance(value, (int, float)):
+                    print(f"{key:<22}: {value:.4f}")
+            print(f"report          : {report_dir}")
+        distributed_barrier()
+        return 0
+    finally:
+        cleanup_distributed()
 
 
 # ---------------------------------------------------------------------------
@@ -896,26 +1346,71 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if data_cfg.get("synthetic"):
         check(None, "data", "synthetic=true, index checks skipped")
     else:
-        for key in ("train_index", "test_index"):
+        for key in ("train_index", "val_index", "test_index"):
             path = data_cfg.get(key)
             check(
                 bool(path) and Path(path).is_file(),
                 f"data.{key}",
                 str(path),
             )
+        for key in ("train_video_index", "val_video_index", "test_video_index"):
+            path = data_cfg.get(key)
+            check(
+                bool(path) and Path(path).is_file(),
+                f"data.{key}",
+                str(path),
+            )
+        migration = data_cfg.get("split_migration") or {}
+        if migration.get("test_used_as_validation"):
+            check(
+                None,
+                "split roles",
+                "test_index is aliased as validation; no independent "
+                "test set (add data.val_index)",
+            )
+        else:
+            check(True, "split roles", "train / validation / test")
         audit_path = data_cfg.get("audit_path")
-        check(
-            bool(audit_path) and Path(audit_path).is_file() or None,
-            "data.audit_path",
-            str(audit_path) + (" (run tools/audit_dataset.py)" if not (audit_path and Path(audit_path).is_file()) else ""),
-        )
+        audit_exists = bool(audit_path) and Path(audit_path).is_file()
+        audit_ok: bool | None = None
+        if audit_exists:
+            try:
+                payload = json.loads(
+                    Path(audit_path).read_text(encoding="utf-8")
+                )
+                audit_ok = bool(payload)
+            except (json.JSONDecodeError, OSError):
+                audit_ok = False
+            check(
+                audit_ok,
+                "data.audit_path parses",
+                str(audit_path),
+            )
+        else:
+            check(
+                False,
+                "data.audit_path",
+                str(audit_path) + " (run tools/audit_dataset.py)",
+            )
         if data_cfg.get("backend") == "packed_uint8":
-            for key in ("train_packed_index", "test_packed_index"):
+            for key in (
+                "train_packed_index",
+                "test_packed_index",
+                "train_packed_video_index",
+                "test_packed_video_index",
+            ):
                 path = data_cfg.get(key)
                 check(
                     bool(path) and Path(path).is_file(),
                     f"data.{key}",
                     str(path),
+                )
+            val_packed_index = data_cfg.get("val_packed_index")
+            if val_packed_index:
+                check(
+                    Path(val_packed_index).is_file(),
+                    "data.val_packed_index",
+                    str(val_packed_index),
                 )
 
     model_cfg = config["model"]
@@ -937,20 +1432,68 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         check(False, "model.factory", f"placeholder or malformed: {factory!r}")
     checkpoint_path = model_cfg.get("checkpoint_path")
     if checkpoint_path:
-        check(True, "model.checkpoint_path exists", checkpoint_path)
+        check(
+            Path(checkpoint_path).is_file(),
+            "model.checkpoint_path exists",
+            checkpoint_path,
+        )
+        checkpoint_file = Path(checkpoint_path)
+        if checkpoint_file.is_file():
+            try:
+                payload = torch.load(
+                    checkpoint_file, map_location="cpu", weights_only=True
+                )
+                check(
+                    isinstance(payload, dict) and len(payload) > 0,
+                    "model.checkpoint parses (weights_only)",
+                    f"{len(payload) if isinstance(payload, dict) else '?'} keys",
+                )
+            except Exception as exc:
+                check(False, "model.checkpoint parses (weights_only)", str(exc))
     elif not data_cfg.get("synthetic"):
         check(False, "model.checkpoint_path", "not set (required for real data)")
 
+    # Dummy forward: the model must build and return exactly [B, 2] logits.
+    try:
+        from game_cls.engine.device import autocast_context
+        from game_cls.model.builder import build_model
+
+        probe_model = build_model(dict(model_cfg))
+        probe_model.eval()
+        width = int(data_cfg.get("width", 448))
+        height = int(data_cfg.get("height", 208))
+        with torch.no_grad(), autocast_context(
+            torch.device("cpu"), False, "bfloat16"
+        ):
+            # Same conversion the training loop applies: uint8 [B,2,3,H,W]
+            # frames are scaled to float before the forward pass.
+            dummy = torch.zeros(1, 2, 3, height, width, dtype=torch.uint8)
+            dummy = dummy.to(torch.float32).div_(255.0)
+            logits = probe_model(dummy[:, 0], dummy[:, 1])
+        shape = tuple(logits.shape)
+        check(
+            shape == (1, 2),
+            "model dummy forward returns [B, 2]",
+            f"got {shape}",
+        )
+    except Exception as exc:
+        check(False, "model dummy forward returns [B, 2]", str(exc)[:300])
+
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     distributed = bool(config.get("distributed", {}).get("enabled", False))
-    if distributed and world_size <= 1:
-        check(
-            False,
-            "distributed",
-            f"distributed.enabled=true but WORLD_SIZE={world_size}; launch via torchrun",
+    try:
+        from game_cls.runtime.distributed_runtime import (
+            validate_launch_environment,
         )
-    else:
-        check(True, "distributed", f"enabled={distributed} world_size={world_size}")
+
+        validate_launch_environment(config)
+        check(
+            True,
+            "distributed",
+            f"enabled={distributed} world_size={world_size}",
+        )
+    except Exception as exc:
+        check(False, "distributed", str(exc))
 
     print("")
     print("FAIL" if failures else "PASS", f"({failures} failing checks)")
@@ -1010,6 +1553,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("overrides", nargs="*", metavar="key=value")
     train.set_defaults(func=cmd_train)
+
+    evaluate = subparsers.add_parser(
+        "evaluate",
+        help="Evaluate a checkpoint on the held-out test (or validation) "
+        "split; the test split never participates in model selection.",
+    )
+    evaluate.add_argument(
+        "--run",
+        required=True,
+        help="Run directory, run id or 'latest'.",
+    )
+    evaluate.add_argument(
+        "--runs-root",
+        default=DEFAULT_RUNS_ROOT,
+        help="Runs root used to resolve --run by run id.",
+    )
+    evaluate.add_argument(
+        "--checkpoint",
+        default="best_selection",
+        help=(
+            "Checkpoint alias (last, best_selection, best_val_loss, "
+            "best_worst_game) or a direct .pth path."
+        ),
+    )
+    evaluate.add_argument(
+        "--split",
+        choices=("test", "validation"),
+        default="test",
+        help="Split to evaluate; 'test' requires an independent test set.",
+    )
+    evaluate.add_argument(
+        "--config",
+        help="Optional config override (defaults to the run's "
+        "resolved_config.json).",
+    )
+    evaluate.set_defaults(func=cmd_evaluate)
 
     config = subparsers.add_parser("config", help="Config utilities.")
     config_sub = config.add_subparsers(dest="config_command", required=True)

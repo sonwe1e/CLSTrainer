@@ -24,7 +24,7 @@ class RecipeLayerTests(unittest.TestCase):
         self.assertEqual(config["device"]["accelerator"], "cpu")
         # preset layers
         self.assertFalse(config["augmentation"]["enabled"])
-        self.assertEqual(config["evaluation"]["quick_test_every_steps"], 10)
+        self.assertEqual(config["evaluation"]["val_quick_every_steps"], 10)
         # recipe's own fields win
         self.assertEqual(config["train"]["local_batch_size"], 4)
 
@@ -190,7 +190,7 @@ class InitCommandTests(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
         self.assertIn("npu_8p", layers["profiles"])
-        self.assertIn("dual_frame_binary", layers["contracts"])
+        self.assertIn("dual_frame_binary", layers["task_profiles"])
         self.assertIn("augmentation/standard", layers["presets"])
         self.assertIn("evaluation/production", layers["presets"])
 

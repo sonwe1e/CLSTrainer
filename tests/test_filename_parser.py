@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import struct
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from game_cls.data.records import parse_filename, read_png_metadata
 
@@ -15,9 +15,8 @@ class FilenameParserTests(unittest.TestCase):
 
     def test_invalid_filename(self) -> None:
         for filename in ("100001.png", "0100001.jpg", "AA00001.png", "01000001.png"):
-            with self.subTest(filename=filename):
-                with self.assertRaises(ValueError):
-                    parse_filename(filename)
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                parse_filename(filename)
 
     def test_reads_png_ihdr_without_pillow(self) -> None:
         header = (

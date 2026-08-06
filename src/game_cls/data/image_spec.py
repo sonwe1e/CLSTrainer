@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -13,7 +14,7 @@ class ImageSpec:
     channels: int
 
     @classmethod
-    def from_config(cls, data_config: dict[str, Any]) -> "ImageSpec":
+    def from_config(cls, data_config: dict[str, Any]) -> ImageSpec:
         spec = cls(
             width=int(data_config["width"]),
             height=int(data_config["height"]),

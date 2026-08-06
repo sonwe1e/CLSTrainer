@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
 import hashlib
 import json
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
 
 from .image_spec import ImageSpec
 from .index_policy import DuplicatePolicy, ScanFindings, ScanPolicy
@@ -18,8 +18,21 @@ from .records import (
     summarize_videos,
 )
 
+AUDIT_FORMAT_VERSION = 3
 
-AUDIT_FORMAT_VERSION = 2
+# Ordered split roles of the train/validation/test protocol.
+SPLIT_ORDER = ("train", "val", "test")
+
+
+def source_video_uid(game: str, video_id: str) -> str:
+    """Stable, label-independent identity of a source video.
+
+    Two-digit ``video_id`` values alone are not globally unique; the
+    game prefix makes them safe for cross-split leakage checks. Adjacent
+    frames and every delta pair of one source video must live in a single
+    split, so this identity is the unit of leakage detection.
+    """
+    return f"{game}::{video_id}"
 
 
 @dataclass(frozen=True)
@@ -356,16 +369,32 @@ def make_audit(
     image_spec: ImageSpec,
     duplicate_policy: DuplicatePolicy,
 ) -> dict:
-    train_frames = frames_by_split.get("train", [])
-    test_frames = frames_by_split.get("test", [])
-    train_videos = {
-        (frame.game, frame.label, frame.video_id)
-        for frame in train_frames
-    }
-    test_videos = {
-        (frame.game, frame.label, frame.video_id)
-        for frame in test_frames
-    }
+    video_keys_by_split: dict[str, set[tuple[str, int, str]]] = {}
+    source_uids_by_split: dict[str, set[str]] = {}
+    for split, frames in frames_by_split.items():
+        video_keys_by_split[split] = {
+            (frame.game, frame.label, frame.video_id) for frame in frames
+        }
+        source_uids_by_split[split] = {
+            source_video_uid(frame.game, frame.video_id)
+            for frame in frames
+        }
+    split_names = [name for name in SPLIT_ORDER if name in frames_by_split]
+    video_key_overlap: dict[str, list[dict]] = {}
+    source_uid_overlap: dict[str, list[str]] = {}
+    for index, left in enumerate(split_names):
+        for right in split_names[index + 1 :]:
+            pair_key = f"{left}__{right}"
+            video_key_overlap[pair_key] = [
+                {"game": game, "label": label, "video_id": video_id}
+                for game, label, video_id in sorted(
+                    video_keys_by_split[left]
+                    & video_keys_by_split[right]
+                )
+            ]
+            source_uid_overlap[pair_key] = sorted(
+                source_uids_by_split[left] & source_uids_by_split[right]
+            )
     return {
         "audit_format_version": AUDIT_FORMAT_VERSION,
         "expected": {
@@ -386,14 +415,15 @@ def make_audit(
             frames_by_split, duplicate_policy
         ),
         "leakage": {
-            "video_keys_across_splits": [
-                {"game": game, "label": label, "video_id": video_id}
-                for game, label, video_id in sorted(
-                    train_videos & test_videos
-                )
-            ],
+            # Backwards-compatible train/test view.
+            "video_keys_across_splits": video_key_overlap.get(
+                "train__test", []
+            ),
+            "split_pair_video_key_overlap": video_key_overlap,
+            "source_video_uid_overlap": source_uid_overlap,
             "video_key_check_note": (
-                "Informational unless video IDs are declared globally unique"
+                "source_video_uid is game::video_id; a source video must "
+                "not span train/val/test"
             ),
         },
     }
@@ -439,7 +469,7 @@ def validate_audit(
     minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
 ) -> None:
     problems: list[str] = []
-    if audit.get("audit_format_version") != AUDIT_FORMAT_VERSION:
+    if audit.get("audit_format_version") not in (2, AUDIT_FORMAT_VERSION):
         problems.append(
             "audit format is obsolete; rebuild indexes with tools/build_index.py"
         )
@@ -479,10 +509,11 @@ def validate_audit(
                 "rebuild indexes"
             )
 
-    for split in ("train", "test"):
+    for split in SPLIT_ORDER:
         report = audit.get("splits", {}).get(split)
         if report is None:
-            problems.append(f"missing {split} audit")
+            if split == "train":
+                problems.append(f"missing {split} audit")
             continue
         for finding in report.get("findings", {}).get("errors", []):
             problems.append(
@@ -531,6 +562,16 @@ def validate_audit(
         )
     ) <= 0:
         problems.append(f"test has no legal delta={require_test_delta} pairs")
+    if "val" in audit.get("splits", {}):
+        val_report = audit["splits"]["val"]
+        if int(
+            val_report.get("valid_pairs", {}).get(
+                str(require_test_delta), 0
+            )
+        ) <= 0:
+            problems.append(
+                f"val has no legal delta={require_test_delta} pairs"
+            )
 
     duplicates = audit.get("duplicates", {})
     if require_content_hash and not duplicates.get(
@@ -542,6 +583,19 @@ def validate_audit(
             f"duplicate conflict: {conflict.get('kind', 'error')} "
             f"sha256={conflict.get('sha256', '')}"
         )
+    # Identical content crossing split boundaries is always leakage, no
+    # matter which severity the duplicate policy recorded at index time.
+    for warning in duplicates.get("warnings", []) + duplicates.get(
+        "info", []
+    ):
+        if warning.get(
+            "kind"
+        ) == "same_label_content_overlap_across_splits":
+            problems.append(
+                "identical content crosses split boundaries: "
+                f"sha256={warning.get('sha256', '')} "
+                f"splits={warning.get('splits', [])}"
+            )
     leakage = audit.get("leakage", {})
     if (
         require_unique_video_keys
@@ -549,6 +603,21 @@ def validate_audit(
     ):
         problems.append(
             "train/test share video keys: "
+            f"{leakage['video_keys_across_splits'][:20]}"
+        )
+    # Source videos must never span train/val/test. Label-independent
+    # source_video_uid overlap is leakage regardless of the policy flags.
+    source_overlap = leakage.get("source_video_uid_overlap")
+    if isinstance(source_overlap, dict):
+        for pair_key, uids in sorted(source_overlap.items()):
+            if uids:
+                problems.append(
+                    f"source videos span the {pair_key.replace('__', '/')} "
+                    f"splits: {list(uids)[:20]}"
+                )
+    elif leakage.get("video_keys_across_splits"):
+        problems.append(
+            "train/test share source video keys: "
             f"{leakage['video_keys_across_splits'][:20]}"
         )
     if problems:
@@ -595,13 +664,18 @@ def write_index_bundle(
     scan_policy: ScanPolicy,
     duplicate_policy: DuplicatePolicy,
     *,
+    val_root: str | Path | None = None,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
     compute_content_hash: bool = True,
 ) -> dict:
     output_dir = Path(output_dir)
     frames_by_split: dict[str, list[FrameRecord]] = {}
     findings_by_split: dict[str, ScanFindings] = {}
-    for split, root in (("train", train_root), ("test", test_root)):
+    roots: list[tuple[str, str | Path]] = [("train", train_root)]
+    if val_root is not None:
+        roots.append(("val", val_root))
+    roots.append(("test", test_root))
+    for split, root in roots:
         result = scan_split(
             root,
             split,

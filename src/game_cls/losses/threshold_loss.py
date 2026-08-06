@@ -26,6 +26,30 @@ def threshold_weight_at_step(
     return max_weight * (progress - warmup_ratio) / ramp_ratio
 
 
+def threshold_weight_from_steps(
+    step: int,
+    warmup_steps: int,
+    ramp_steps: int,
+    max_weight: float,
+) -> float:
+    """Explicit-step schedule, independent of the total step budget.
+
+    Unlike the ratio schedule, extending ``max_steps`` does not move the
+    absolute step at which the margin loss activates.
+    """
+    if step < 0:
+        raise ValueError("step must be non-negative")
+    warmup_steps = max(0, int(warmup_steps))
+    if step <= warmup_steps:
+        return 0.0
+    if ramp_steps <= 0:
+        return max_weight
+    progressed = step - warmup_steps
+    if progressed >= ramp_steps:
+        return max_weight
+    return max_weight * progressed / ramp_steps
+
+
 def threshold_margin_loss(
     logits,
     target,
@@ -53,7 +77,13 @@ def threshold_margin_loss(
 def combined_loss(logits, target, config: dict, step: int, total_steps: int):
     from torch.nn import functional as F
 
-    ce = F.cross_entropy(logits.float(), target)
+    label_smoothing = float(config.get("label_smoothing", 0.0))
+    if label_smoothing:
+        ce = F.cross_entropy(
+            logits.float(), target, label_smoothing=label_smoothing
+        )
+    else:
+        ce = F.cross_entropy(logits.float(), target)
     threshold_component = threshold_margin_loss(
         logits,
         target,
@@ -61,13 +91,24 @@ def combined_loss(logits, target, config: dict, step: int, total_steps: int):
         safety_margin=config.get("threshold_safety_margin", 0.20),
         temperature=config.get("threshold_temperature", 0.50),
     )
-    threshold_weight = threshold_weight_at_step(
-        step,
-        total_steps,
-        config.get("threshold_loss_weight", 0.20),
-        config.get("threshold_warmup_ratio", 0.10),
-        config.get("threshold_ramp_ratio", 0.20),
-    )
+    max_weight = config.get("threshold_loss_weight", 0.20)
+    warmup_steps = config.get("threshold_warmup_steps")
+    ramp_steps = config.get("threshold_ramp_steps")
+    if warmup_steps is not None or ramp_steps is not None:
+        threshold_weight = threshold_weight_from_steps(
+            step,
+            int(warmup_steps or 0),
+            int(ramp_steps or 0),
+            max_weight,
+        )
+    else:
+        threshold_weight = threshold_weight_at_step(
+            step,
+            total_steps,
+            max_weight,
+            config.get("threshold_warmup_ratio", 0.10),
+            config.get("threshold_ramp_ratio", 0.20),
+        )
     total = config.get("cross_entropy_weight", 1.0) * ce
     total = total + threshold_weight * threshold_component
     return total, {

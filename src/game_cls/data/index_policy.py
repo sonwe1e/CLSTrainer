@@ -5,7 +5,6 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
-
 SEVERITIES = frozenset({"error", "warning", "info"})
 
 
@@ -28,7 +27,7 @@ class ScanPolicy:
     ignored_example_limit: int = 20
 
     @classmethod
-    def from_config(cls, data_config: dict[str, Any]) -> "ScanPolicy":
+    def from_config(cls, data_config: dict[str, Any]) -> ScanPolicy:
         extensions = []
         for item in data_config.get("frame_extensions", [".png"]):
             extension = str(item).lower()
@@ -117,7 +116,7 @@ class DuplicatePolicy:
     same_basename: str = "info"
 
     @classmethod
-    def from_config(cls, data_config: dict[str, Any]) -> "DuplicatePolicy":
+    def from_config(cls, data_config: dict[str, Any]) -> DuplicatePolicy:
         raw = data_config.get("duplicate_policy", {})
         return cls(
             same_label_cross_split=_severity(

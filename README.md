@@ -69,15 +69,17 @@ cls-trainer run compare RUN_A RUN_B
 cls-trainer run export-tensorboard RUN_ID
 ```
 
-## 配置分层:Contract / Profile / Recipe / Presets
+## 配置分层:Task Profile / Profile / Recipe / Presets
 
 普通用户只维护 Recipe,机器环境由 Profile 决定,稳定性参数用命名 Preset 选择,
-业务事实由 Contract 保证。合并顺序为
-`contract → profile → presets → recipe 自身 → 命令行覆写`:
+任务事实由 Task Profile 提供默认值。Task Profile 不是不可变 Contract——
+其中每个字段都只是默认值,recipe、preset 和命令行都可以覆写,框架始终以
+解析后的配置为准。合并顺序为
+`task_profile → profile → presets → recipe 自身 → 命令行覆写`:
 
 ```text
 configs/
-├── contracts/dual_frame_binary.yaml   # 阈值 0.99、test delta=2、cls-only 等固定事实
+├── task_profiles/dual_frame_binary.yaml   # 阈值 0.99、test delta=2、cls-only 等任务默认值(可覆写)
 ├── profiles/                          # cpu_debug / cuda_1p / npu_1p / npu_8p
 ├── presets/
 │   ├── augmentation/  none | light | standard
@@ -103,7 +105,11 @@ model:
   checkpoint_path: /models/base_model.pt
 data:
   train_index: indexes/train_frames.parquet
+  val_index: indexes/val_frames.parquet
   test_index: indexes/test_frames.parquet
+  train_video_index: indexes/train_video_entries.parquet
+  val_video_index: indexes/val_video_entries.parquet
+  test_video_index: indexes/test_video_entries.parquet
 train:
   max_steps: 10000
   local_batch_size: 64
@@ -111,7 +117,7 @@ optimizer:
   learning_rate: 0.001
 ```
 
-`profile`、`contract`、`presets.<组>` 也可以作为命令行覆写,便于 A/B:
+`profile`、`task_profile`、`presets.<组>` 也可以作为命令行覆写,便于 A/B:
 
 ```bash
 cls-trainer train --config configs/recipes/game_cls_production.yaml \
@@ -215,16 +221,18 @@ python tools/audit_dataset.py \
 `test_video_entries.parquet`，训练直接按视频行读取，不再让每个 rank 将百万帧
 转换成 Python dict 和 `FrameRecord`。默认同时计算 SHA-256：相同内容但标签
 不同属于 fatal error；同标签的跨 split 或 split 内重复属于 warning；仅文件名
-相同只做 info 汇总。两位 `video_id` 默认按 split 内编号处理，跨 split 重名只
-作为信息记录；只有确认它在整个项目中全局唯一后，才应启用
-`require_unique_video_keys_across_splits` 强制检查。
+相同只做 info 汇总。两位 `video_id` 不是全局身份；索引阶段生成跨 label 的
+`source_video_uid`（`game::video_id`）作为泄漏检查单位。同一个源视频横跨
+train/val/test（video key 重叠或 source uid 重叠）以及相同 SHA-256 内容跨
+split，在严格审计中一律是 error；`require_unique_video_keys_across_splits`
+不再需要显式开启，旧的“跨 split 重名仅警告”语义已移除。
 
 SHA-256 会完整读取每张图片，是一次性但明显的 I/O 成本。百万帧数据推荐按以下
 顺序准备，避免在远程小文件链路上反复扫描：
 
 ```text
-复制 train/test 到本地 NVMe
-→ 建索引并计算 SHA-256
+复制 train/val/test 到本地 NVMe
+→ 建索引并计算 SHA-256（build_index.py --val-root 生成三份 split 索引）
 → 生成 packed 数据
 → 执行审计
 → 开始 smoke/正式训练
@@ -238,8 +246,8 @@ CPU/CUDA 合成数据 smoke test:
 python tools/train.py \
   --config configs/cuda_debug.yaml \
   train.max_steps=2 \
-  evaluation.quick_test_every_steps=1 \
-  evaluation.full_test_every_steps=2
+  evaluation.val_quick_every_steps=1 \
+  evaluation.val_full_every_steps=2
 ```
 
 产物位于 `runs/dual_frame_game_cls_debug/<日期>/<时间戳>_<名称>_<id>/` 下的新
@@ -386,18 +394,91 @@ Parquet 仍保存紧凑的 packed frame index，不会为全部错例重复导�
 50/50 平衡采样并加入阈值损失，`0.99` 应解释为固定业务分数阈值，而不是天然
 校准后的真实发生概率。
 
-周期性 full test 的角色明确标记为 `observed_dev_test`。训练摘要同时记录 last
-checkpoint 指标、best observed dev-test 指标，以及 quick/full test 的执行次数。
-最佳模型由 `evaluation.selection_metric` 决定；生产配置使用 global、macro-game
-和 worst-game F1 的组合分数，并可通过 `minimum_worst_game_f1` 阻止单个游戏
-灾难性退化。单类 `by_game_label` 行不再展示无意义的 F1/AUC：正类报告 recall
-和 FN rate，负类报告 specificity 和 FP rate。
+周期性 full validation 的角色明确标记为 `validation`。训练摘要同时记录 last
+checkpoint 指标、best validation 指标，以及 train probe/quick/full validation
+的执行次数。最佳模型由 `evaluation.selection_metric` 决定；生产配置使用 global、
+macro-game 和 worst-game F1 的组合分数，并可通过 `minimum_worst_game_f1` 阻止
+单个游戏灾难性退化。单类 `by_game_label` 行不再展示无意义的 F1/AUC：正类报告
+recall 和 FN rate，负类报告 specificity 和 FP rate。
 
 生产模板将 `minimum_worst_game_f1` 留为 `null`，因为没有可靠基线时不应猜测
 门限。首轮稳定基线完成后，应根据各游戏结果设为非零值（例如基线明确支持时再
-设为 `0.75`）。周期 full test 参与选模，因此其角色是 observed dev-test；对外
-报告无偏结果时，还需要一个从未参与选模的独立 final test。若分数需要跨游戏和
-版本解释为概率，还应在自然分布 calibration 集上拟合 temperature 和 bias。
+设为 `0.75`）。
+
+### 训练/验证/测试三分协议
+
+数据角色严格三分：`train` 只用于梯度更新；`validation` 用于曲线、模型选择和
+early stopping；`test` 在训练结束后只评估一次，绝不参与选模。旧配置的
+`quick_test_*`/`full_test_*` 键会在 `finalize_config` 中自动迁移为
+`val_quick_*`/`val_full_*`；若未配置 `data.val_index`，`test_index` 会被临时
+用作 validation 并打印明确警告——该 run 没有独立测试集。
+
+训练循环新增四个评估角色：
+
+| DataLoader | 数据 | 增强 | 用途 |
+| --- | --- | :-: | --- |
+| `train_probe` | 固定 train 子集 | 关 | 与 validation 同口径比较泛化差距 |
+| `val_quick` | 固定 validation 子集 | 关 | 高频趋势观察 |
+| `val_full` | 全部 validation | 关 | best 模型选择与 early stopping |
+| `test_full` | 全部 test | 关 | 仅由 `cls-trainer evaluate` 执行 |
+
+```bash
+# 训练结束后，对从未参与选模的 test split 执行一次最终评估：
+cls-trainer evaluate --run <RUN_ID> --checkpoint best_selection --split test
+```
+
+每次评估追加一行到 `<run>/metrics/evaluation.jsonl`，与训练指标一起驱动
+`overview.html` 的六类曲线（训练损失、probe vs validation CE/selection、
+validation F1 三分、Brier/ECE、学习率/梯度/吞吐）和关键 step 标记（best
+selection、best val loss、泛化退化起点、early-stop）。训练指标改为区间内按样本
+加权平均（`interval_loss` 等），多卡下在 rank 间 all-reduce；原始 last-batch 值
+仍保留在 `loss`/`ce`/`threshold_loss` 字段中。
+
+多卡评估的分组统计（按 game/video 的混淆矩阵、概率 min/max/count）在共享
+catalog 下直接对 per-catalog 数组做 tensor `all_reduce`（min/max 用 MIN/MAX
+归约），不再把大型 Python 字典 gather 到 rank 0；只有无共享 catalog 的小字典
+路径保留 `gather_object`。精确 AUC 模式（`full_auc_mode: exact`）在分布式下
+超过 200 万样本会报错，建议大测试集改用默认的 histogram 模式。
+
+```yaml
+early_stopping:
+  enabled: true
+  monitor: selection_score
+  mode: max
+  full_validation_only: true
+  burn_in_steps: 6000
+  patience_evaluations: 3
+  min_delta: 0.001
+  restore_best: true
+```
+
+early stopping 只在 full validation 上判断（quick 子集波动太大），burn-in 前
+不停止，连续 `patience` 次未改善则停止并恢复最佳权重。状态（best_value、
+best_step、bad_evaluation_count、stop_reason）写入 checkpoint，恢复训练不会
+重算 patience。四种稳定 checkpoint：`model_last.pth`、`model_best_selection.pth`、
+`model_best_val_loss.pth`、`model_best_worst_game.pth`（旧别名
+`best_observed_dev_test_selection` 继续生成以兼容旧脚本）。
+
+还可以用 `checkpoint.save_topk` 保留按 `checkpoint.topk_monitor`（默认
+`selection_score`）排序的 Top-K 全量验证 checkpoint
+（`model_topk_<step>.pth` 加 `checkpoints/topk_registry.json`），
+避免“best 或 last 恰好都不是最优”的情况；registry 随训练状态持久化，
+恢复后继续维护。
+
+全局 batch 内采样去重用 `data.deduplication` 配置：
+
+```yaml
+data:
+  deduplication:
+    level: pair            # none | pair(默认) | video
+    on_exhaustion: warn_and_relax   # error | warn_and_relax(默认)
+```
+
+`pair` 避免完全相同的 (video, delta, start) 三元组，`video` 禁止同一视频在
+一个全局 batch 内出现两次；`on_exhaustion: error` 在无法填满 batch 时直接
+失败，默认 `warn_and_relax` 会记录并放宽。每 epoch 的去重失败次数写入
+训练指标与 `evaluation_state`。全零采样权重（如 `class_probability`）现在
+直接报配置错误，不再静默回退到均匀采样。
 
 ## 精确恢复
 
@@ -405,9 +486,31 @@ checkpoint 指标、best observed dev-test 指标，以及 quick/full test 的�
 `resolved_config.json` 与 `checkpoints/checkpoint_last.pth`,并在原 run 目录内
 继续,不新建目录。
 
+恢复是**按身份语义**进行的,与 Run 的不可变 manifest 保持一致:
+
+- `manifest.json` 创建后不可修改;恢复保留原始 `run_id`、创建时间和谱系信息;
+- 首次配置快照保存在 `resolved_config.initial.json`,每次恢复只更新
+  `resolved_config.json`;
+- 每次恢复追加一行 `resume_events.jsonl`(时间、checkpoint、命令、配置差异、
+  resume 类型);
+- `status.json` 保留首次 `started`,新增 `resumed_at`;
+- Run 索引是 append-only 事件日志,读取时按 `run_id` 聚合到最新状态,恢复
+  后 `run list` 不再显示旧的失败/中间状态。
+
+恢复前会做**对称的配置漂移检查**(新增/删除/修改都检测):
+
+- `resume-exact`:无任何轨迹差异,精确继续;
+- `resume-extend`:仅 `max_steps`/`stop_after_steps` 变化,允许继续但明确
+  重新规划 scheduler;
+- 其余任何影响轨迹的变更(优化器、数据、模型、采样概率、分布式配置、
+  augmentation 等)属于 **critical / fork**,恢复被拒绝,改用
+  `--fork` 创建新 Run。
+
 完整 checkpoint 保存 epoch、`step_in_epoch`、global step、sampler 状态、优化器、
 scheduler、scaler、CPU/CUDA/NPU RNG 和各 rank 独立 RNG。训练 pair 自带确定性增强
 seed，因此恢复时可以直接从 epoch 内下一 batch 继续，不重新解码已经消费的 batch。
+内部恢复 checkpoint 带有 `cls_training_checkpoint` 可信标记,无标记的文件会被拒绝;
+基础模型 checkpoint 与所有导出路径一律使用 `weights_only=True` 加载。
 
 生产配置的周期性恢复 checkpoint 只保存可训练状态、优化器和基础权重哈希；
 同时记录并严格核对预期 trainable state keys。产物契约为：

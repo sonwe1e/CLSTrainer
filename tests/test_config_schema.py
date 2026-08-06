@@ -99,6 +99,59 @@ class OverrideStrictnessTests(unittest.TestCase):
         self.assertEqual(config["dataloader"]["train"]["num_workers"], 0)
 
 
+class SemanticValidationTests(unittest.TestCase):
+    """Third layer: ranges, probabilities and cross-field checks (step3 高优-1)."""
+
+    def _load(self, **overrides: str) -> dict:
+        items = [f"{key}={value}" for key, value in overrides.items()]
+        return load_config("configs/cuda_debug.yaml", items)
+
+    def test_non_positive_batch_size_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "local_batch_size"):
+            self._load(**{"train.local_batch_size": "0"})
+
+    def test_negative_learning_rate_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "learning_rate"):
+            self._load(**{"optimizer.learning_rate": "-0.001"})
+
+    def test_threshold_outside_unit_interval_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "threshold"):
+            self._load(**{"decision.threshold": "1.5"})
+        with self.assertRaisesRegex(ConfigSchemaError, "threshold"):
+            self._load(**{"decision.threshold": "0"})
+
+    def test_zero_log_every_steps_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "log_every_steps"):
+            self._load(**{"train.log_every_steps": "0"})
+
+    def test_probabilities_must_sum_to_one(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "class_probability"):
+            self._load(**{"sampler.class_probability": "{0: 1.0, 1: 1.0}"})
+
+    def test_all_zero_probabilities_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "all zero"):
+            self._load(
+                **{"sampler.class_probability": "{0: 0.0, 1: 0.0}"}
+            )
+
+    def test_warmup_exceeding_budget_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "warmup_steps"):
+            self._load(**{"train.warmup_steps": "200", "train.max_steps": "100"})
+
+    def test_negative_selection_weight_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "selection_weights"):
+            self._load(
+                **{
+                    "evaluation.selection_metric": "composite",
+                    "evaluation.selection_weights": "{global_f1: -0.5, macro_game_f1: 1.0}",
+                }
+            )
+
+    def test_valid_config_still_finalizes(self) -> None:
+        config = self._load()
+        self.assertAlmostEqual(config["decision"]["threshold"], 0.99)
+
+
 class DecisionThresholdTests(unittest.TestCase):
     def test_decision_threshold_is_the_single_source(self) -> None:
         config = {

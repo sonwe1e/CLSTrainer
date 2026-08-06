@@ -60,7 +60,20 @@ def extract_state_dict(checkpoint) -> dict:
 def load_model_checkpoint(model, path: str | Path) -> LoadReport:
     import torch
 
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    # Base-model checkpoints must be plain tensor state dicts (or a dict
+    # containing one). weights_only=True refuses pickled code execution,
+    # so untrusted .pth files cannot run arbitrary code at load time.
+    try:
+        checkpoint = torch.load(
+            path, map_location="cpu", weights_only=True
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Base checkpoint {path} could not be loaded with "
+            "weights_only=True; it must contain only tensors and plain "
+            "dicts (a pickle with embedded code is refused). "
+            f"Original error: {exc}"
+        ) from exc
     incoming = extract_state_dict(checkpoint)
     current = model.state_dict()
     compatible = {}

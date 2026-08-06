@@ -173,18 +173,31 @@ class RunToolsTests(unittest.TestCase):
             self.assertIn("critical config drift", output)
             self.assertIn("decision.threshold", output)
 
-            # Non-critical drift warns but proceeds.
+            # Strategy-changing drift (optimizer, data, model) is critical:
+            # resume is refused and the user is pointed at --fork.
             code, output = _cli(
                 "train",
                 "--resume",
                 str(run_a),
                 "optimizer.learning_rate=0.02",
+                expect_code=None,
+            )
+            self.assertEqual(code, 3, output)
+            self.assertIn("critical config drift", output)
+            self.assertIn("optimizer.learning_rate", output)
+            self.assertIn("--fork", output)
+
+            # Extending the step budget is allowed and re-plans the
+            # scheduler: resume-extend proceeds.
+            code, output = _cli(
+                "train",
+                "--resume",
+                str(run_a),
                 "train.max_steps=4",
                 expect_code=None,
             )
             self.assertEqual(code, 0, output)
-            self.assertIn("[WARNING] resume config drift", output)
-            self.assertIn("optimizer.learning_rate", output)
+            self.assertIn("resume-extend", output)
             self.assertIn("Training finished", output)
             status = json.loads(
                 (run_a / "status.json").read_text(encoding="utf-8")

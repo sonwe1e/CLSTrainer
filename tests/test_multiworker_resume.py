@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 try:
     import numpy as np
@@ -92,7 +92,7 @@ class MultiWorkerResumeTests(unittest.TestCase):
             uninterrupted = collect(0)
             resumed = collect(2)
             self.assertEqual(len(resumed), 2)
-            for expected, actual in zip(uninterrupted[2:], resumed):
+            for expected, actual in zip(uninterrupted[2:], resumed, strict=False):
                 self.assertTrue(torch.equal(expected, actual))
 
 

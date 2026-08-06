@@ -3,7 +3,9 @@ base: npu_production.yaml
 data:
   backend: packed_uint8
   train_packed_index: /local_nvme/train_packed/packed_frames.parquet
+  val_packed_index: /local_nvme/val_packed/packed_frames.parquet
   test_packed_index: /local_nvme/test_packed/packed_frames.parquet
   train_packed_video_index: /local_nvme/train_packed/packed_video_entries.parquet
+  val_packed_video_index: /local_nvme/val_packed/packed_video_entries.parquet
   test_packed_video_index: /local_nvme/test_packed/packed_video_entries.parquet
   packed_max_open_shards: 16

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest import mock
 
 try:
@@ -41,10 +41,10 @@ class EvaluationScheduleTests(unittest.TestCase):
             )
             config["evaluation"].update(
                 {
-                    "quick_test_every_steps": 1,
-                    "quick_test_pairs_per_video": 2,
-                    "full_test_every_steps": 2,
-                    "full_test_at_end": True,
+                    "val_quick_every_steps": 1,
+                    "val_quick_pairs_per_video": 2,
+                    "val_full_every_steps": 2,
+                    "val_full_at_end": True,
                 }
             )
             config["checkpoint"]["save_last_every_steps"] = 2
@@ -52,8 +52,8 @@ class EvaluationScheduleTests(unittest.TestCase):
             self.assertEqual(result["evaluation_state"]["quick_test_count"], 1)
             self.assertEqual(result["evaluation_state"]["full_test_count"], 1)
             reports = Path(directory) / "run" / "reports"
-            quick_report = reports / "quick_step_00000001"
-            full_report = reports / "full_step_00000002"
+            quick_report = reports / "val_quick_step_00000001"
+            full_report = reports / "val_full_step_00000002"
             self.assertTrue((quick_report / "metrics.json").is_file())
             self.assertTrue((quick_report / "false_positive.parquet").is_file())
             self.assertFalse((quick_report / "errors.html").exists())
@@ -79,6 +79,31 @@ class EvaluationScheduleTests(unittest.TestCase):
                     / "model_best_observed_dev_test_selection.metadata.json"
                 ).is_file()
             )
+            # Multi-objective checkpoints required by the train/val/test
+            # protocol (step2 plan P2).
+            self.assertTrue(
+                (checkpoints / "model_best_selection.pth").is_file()
+            )
+            self.assertTrue(
+                (checkpoints / "model_best_val_loss.pth").is_file()
+            )
+            self.assertTrue(
+                (checkpoints / "model_best_worst_game.pth").is_file()
+            )
+            # Unified evaluation history (step2 plan P1).
+            history_path = Path(directory) / "run" / "metrics" / "evaluation.jsonl"
+            self.assertTrue(history_path.is_file())
+            history = [
+                json.loads(line)
+                for line in history_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(history[0]["split"], "validation")
+            self.assertEqual(history[0]["scope"], "quick")
+            self.assertIn("selection_score", history[0])
+            self.assertIn("objective_loss", history[0])
+            self.assertIn("positive_margin_pass_rate", history[0])
             metric_rows = [
                 json.loads(line)
                 for line in (

@@ -7,8 +7,11 @@ exist, what type they accept and what they mean. It enforces three rules:
    suggestion) instead of being silently ignored.
 2. Removed/deprecated keys raise a migration hint instead of being
    silently accepted.
-3. Business contracts that must stay consistent (the deployment decision
-   threshold) are resolved from exactly one place: ``decision.threshold``.
+3. Task-profile facts (the deployment decision threshold, frame size,
+   pair delta, output width, trainable scope) are resolved from exactly
+   one place: ``decision.threshold`` for the threshold; the rest are
+   defaults that recipes may override — the framework must stay
+   consistent with whatever the resolved config says.
 
 The schema deliberately avoids a heavyweight dependency such as Hydra or
 Pydantic; it is a small declarative registry that the config loader,
@@ -19,7 +22,7 @@ from __future__ import annotations
 
 import copy
 import difflib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -108,9 +111,20 @@ SCHEMA: dict[str, Any] = {
         ),
         "audit_path": _k("str", "Path to audit.json produced by audit_dataset."),
         "train_index": _k("str", "Train frame index parquet."),
+        "val_index": _k(
+            "str",
+            "Validation frame index parquet. When omitted, test_index is "
+            "aliased as validation and the run has no independent test set.",
+            nullable=True,
+        ),
         "test_index": _k("str", "Test frame index parquet."),
         "train_video_index": _k(
             "str", "Train video-level entries parquet (row-per-video)."
+        ),
+        "val_video_index": _k(
+            "str",
+            "Validation video-level entries parquet (row-per-video).",
+            nullable=True,
         ),
         "test_video_index": _k(
             "str", "Test video-level entries parquet (row-per-video)."
@@ -124,6 +138,10 @@ SCHEMA: dict[str, Any] = {
             "str", "Packed train shard index (packed_uint8 backend).",
             nullable=True,
         ),
+        "val_packed_index": _k(
+            "str", "Packed validation shard index (packed_uint8 backend).",
+            nullable=True,
+        ),
         "test_packed_index": _k(
             "str", "Packed test shard index (packed_uint8 backend).",
             nullable=True,
@@ -131,15 +149,18 @@ SCHEMA: dict[str, Any] = {
         "train_packed_video_index": _k(
             "str", "Packed train integer video index.", nullable=True
         ),
+        "val_packed_video_index": _k(
+            "str", "Packed validation integer video index.", nullable=True
+        ),
         "test_packed_video_index": _k(
             "str", "Packed test integer video index.", nullable=True
         ),
         "packed_max_open_shards": _k(
             "int", "LRU limit of simultaneously memmapped packed shards."
         ),
-        "width": _k("int", "Frame width in pixels (contract: 448)."),
-        "height": _k("int", "Frame height in pixels (contract: 208)."),
-        "channels": _k("int", "Frame channels (contract: 3)."),
+        "width": _k("int", "Frame width in pixels (task profile default: 448)."),
+        "height": _k("int", "Frame height in pixels (task profile default: 208)."),
+        "channels": _k("int", "Frame channels (task profile default: 3)."),
         "frame_extensions": _k(
             "list", "File extensions accepted as frames during scanning."
         ),
@@ -167,11 +188,38 @@ SCHEMA: dict[str, Any] = {
             "bool",
             "Treat cross-split duplicate two-digit video ids as fatal.",
         ),
+        "require_independent_test": _k(
+            "bool",
+            "Production acceptance gate: refuse to train when the test "
+            "split is aliased as the validation split.",
+        ),
+        "split_migration": _k(
+            "dict",
+            "Auto-generated notes describing legacy split aliasing "
+            "(set by finalize_config; do not configure manually).",
+        ),
         "minimum_pairs_per_game_label_delta": _k(
             "dict",
             "Minimum legal pairs per (game,label) for each delta, "
             "e.g. {2: 1}.",
         ),
+        "deduplication": {
+            "level": _k(
+                "str",
+                "Within one global batch: 'pair' avoids identical "
+                "(video, delta, start) triples; 'video' avoids repeating "
+                "the same video at all; 'none' samples freely.",
+                choices=("none", "pair", "video"),
+            ),
+            "on_exhaustion": _k(
+                "str",
+                "What to do when a global batch cannot be filled without "
+                "repeating the dedup identity: 'error' fails the run, "
+                "'warn_and_relax' logs a warning and relaxes the "
+                "constraint for that batch.",
+                choices=("error", "warn_and_relax"),
+            ),
+        },
         "duplicate_policy": {
             "same_label_cross_split": _k(
                 "str", "Severity for same-content duplicates across splits.",
@@ -197,7 +245,7 @@ SCHEMA: dict[str, Any] = {
             "dict", "Training frame-delta sampling distribution, e.g. {2: 0.7}."
         ),
         "test_delta": _k(
-            "int", "Evaluation pair delta (contract: 2)."
+            "int", "Evaluation pair delta (task profile default: 2)."
         ),
     },
     "sampler": {
@@ -208,7 +256,10 @@ SCHEMA: dict[str, Any] = {
             "dict", "Label sampling probability, e.g. {0: 0.5, 1: 0.5}."
         ),
         "deduplicate_within_global_batch": _k(
-            "bool", "Avoid repeating a video inside one global batch."
+            "bool",
+            "Legacy alias of data.deduplication.level: true=pair, "
+            "false=none.",
+            legacy=True,
         ),
     },
     "augmentation": {
@@ -250,9 +301,9 @@ SCHEMA: dict[str, Any] = {
             nullable=True,
         ),
         "trainable_name_contains": _k(
-            "str", "Substring selecting trainable parameters (contract: cls)."
+            "str", "Substring selecting trainable parameters (task profile default: cls)."
         ),
-        "num_classes": _k("int", "Output classes (contract: 2)."),
+        "num_classes": _k("int", "Output classes (task profile default: 2)."),
         "freeze_backbone_batchnorm_stats": _k(
             "bool", "Keep backbone BatchNorm statistics frozen."
         ),
@@ -271,6 +322,12 @@ SCHEMA: dict[str, Any] = {
             "bool",
             "Fail unless every non-cls weight is fully loaded from the "
             "base checkpoint.",
+        ),
+        "kwargs": _k(
+            "dict",
+            "Free-form project-specific factory arguments (e.g. "
+            "cls_dropout). Passed to the model factory inside the model "
+            "config mapping.",
         ),
     },
     "decision": {
@@ -304,6 +361,24 @@ SCHEMA: dict[str, Any] = {
         ),
         "threshold_ramp_ratio": _k(
             "float", "Fraction of training used to ramp the margin weight."
+        ),
+        "threshold_warmup_steps": _k(
+            "int",
+            "Explicit step count before the margin loss activates. "
+            "Overrides threshold_warmup_ratio when set; keeps the "
+            "schedule independent of the total step budget.",
+            nullable=True,
+        ),
+        "threshold_ramp_steps": _k(
+            "int",
+            "Explicit step count used to ramp the margin weight. "
+            "Overrides threshold_ramp_ratio when set.",
+            nullable=True,
+        ),
+        "label_smoothing": _k(
+            "float",
+            "Cross-entropy label smoothing. 0.0 keeps legacy behavior; "
+            "keep small while the deployment threshold is fixed at 0.99.",
         ),
     },
     "optimizer": {
@@ -375,15 +450,55 @@ SCHEMA: dict[str, Any] = {
             choices=("float16", "bfloat16"),
         ),
         "quick_test_every_steps": _k(
-            "int", "Quick-test cadence; 0 disables."
+            "int",
+            "Legacy alias of val_quick_every_steps; migrated automatically.",
+            legacy=True,
         ),
         "quick_test_pairs_per_video": _k(
-            "int", "Quick-test pairs sampled per video."
+            "int",
+            "Legacy alias of val_quick_pairs_per_video; migrated "
+            "automatically.",
+            legacy=True,
         ),
         "full_test_every_steps": _k(
-            "int", "Full-test cadence (observed dev-test); 0 disables."
+            "int",
+            "Legacy alias of val_full_every_steps; migrated automatically.",
+            legacy=True,
         ),
-        "full_test_at_end": _k("bool", "Run a final full test after training."),
+        "full_test_at_end": _k(
+            "bool",
+            "Legacy alias of val_full_at_end; migrated automatically.",
+            legacy=True,
+        ),
+        "train_probe_every_steps": _k(
+            "int",
+            "Train-probe cadence (augmentation-free train subset evaluated "
+            "like validation); 0 disables.",
+        ),
+        "train_probe_pairs_per_video": _k(
+            "int", "Train-probe pairs sampled per train video."
+        ),
+        "val_quick_every_steps": _k(
+            "int",
+            "Quick validation cadence (fixed validation subset, high "
+            "frequency trend watching); 0 disables.",
+        ),
+        "val_quick_pairs_per_video": _k(
+            "int", "Quick validation pairs sampled per validation video."
+        ),
+        "val_full_every_steps": _k(
+            "int",
+            "Full validation cadence (drives model selection and early "
+            "stopping); 0 disables.",
+        ),
+        "val_full_at_end": _k(
+            "bool", "Run a final full validation after training."
+        ),
+        "tensorboard_live": _k(
+            "bool",
+            "Write TensorBoard scalars during training when the "
+            "tensorboard package is importable; 0-cost when absent.",
+        ),
         "full_auc_mode": _k(
             "str",
             "Distributed AUC strategy: fixed histogram or exact gather.",
@@ -401,8 +516,13 @@ SCHEMA: dict[str, Any] = {
         ),
         "selection_metric": _k(
             "str",
-            "Metric used to pick the best checkpoint.",
+            "Metric used to pick the best checkpoint. Neutral names do not "
+            "bake in a fixed decision threshold; the legacy _tau099 names "
+            "are still accepted.",
             choices=(
+                "global_f1_at_decision_threshold",
+                "macro_game_f1_at_decision_threshold",
+                "worst_game_f1_at_decision_threshold",
                 "global_f1_tau099",
                 "macro_game_f1_tau099",
                 "worst_game_f1_tau099",
@@ -421,15 +541,91 @@ SCHEMA: dict[str, Any] = {
             nullable=True,
         ),
     },
+    "early_stopping": {
+        "enabled": _k(
+            "bool",
+            "Stop training when the monitored validation metric plateaus. "
+            "train.max_steps remains a safety upper bound.",
+        ),
+        "monitor": _k(
+            "str",
+            "Validation metric watched for improvement.",
+            choices=(
+                "selection_score",
+                "cross_entropy",
+                "objective_loss",
+                "worst_game_f1_at_decision_threshold",
+                "worst_game_f1_tau099",
+            ),
+        ),
+        "mode": _k(
+            "str",
+            "max: higher monitor values are better; min: lower values.",
+            choices=("max", "min"),
+        ),
+        "full_validation_only": _k(
+            "bool",
+            "Only full-validation evaluations may update patience; quick "
+            "subsets are too noisy for stop decisions.",
+        ),
+        "burn_in_steps": _k(
+            "int", "Never stop before this global step."
+        ),
+        "patience_evaluations": _k(
+            "int",
+            "Consecutive non-improving full validations tolerated before "
+            "stopping.",
+        ),
+        "min_delta": _k(
+            "float",
+            "Minimum improvement that counts as an improvement; smaller "
+            "deltas increment the patience counter.",
+        ),
+        "restore_best": _k(
+            "bool",
+            "Reload the best-selection checkpoint weights before the run "
+            "finishes.",
+        ),
+    },
     "checkpoint": {
         "save_last_every_steps": _k(
             "int", "Periodic resume checkpoint cadence; 0 disables."
         ),
         "save_best_selection": _k(
-            "bool", "Clone the best observed dev-test checkpoint."
+            "bool",
+            "Clone the best validation selection-score checkpoint "
+            "(model_best_selection.pth).",
+        ),
+        "save_best_val_loss": _k(
+            "bool",
+            "Clone the best validation loss checkpoint "
+            "(model_best_val_loss.pth).",
+        ),
+        "save_best_worst_game": _k(
+            "bool",
+            "Clone the best worst-game-F1 checkpoint "
+            "(model_best_worst_game.pth).",
         ),
         "save_best_test_f1": _k(
             "bool", "Legacy alias of save_best_selection.", legacy=True
+        ),
+        "save_topk": _k(
+            "int",
+            "Keep the top-N full-validation checkpoints ranked by "
+            "checkpoint.topk_monitor (saved as model_topk_<step>.pth); "
+            "0 disables. Enabling it forces a last-checkpoint save after "
+            "every full validation so the topk snapshot always matches the "
+            "evaluated weights.",
+        ),
+        "topk_monitor": _k(
+            "str",
+            "Metric that ranks topk checkpoints; lower is better for "
+            "cross_entropy, higher is better otherwise.",
+            choices=(
+                "selection_score",
+                "cross_entropy",
+                "worst_game_f1_at_decision_threshold",
+            ),
         ),
         "periodic_state_mode": _k(
             "str",
@@ -531,12 +727,15 @@ def _walk(
                 f"{type(value).__name__} ({value!r})."
             )
             continue
-        if spec.choices is not None and value is not None:
-            if value not in spec.choices:
-                problems.append(
-                    f"{dotted}: must be one of {sorted(map(str, spec.choices))}, "
-                    f"got {value!r}."
-                )
+        if (
+            spec.choices is not None
+            and value is not None
+            and value not in spec.choices
+        ):
+            problems.append(
+                f"{dotted}: must be one of {sorted(map(str, spec.choices))}, "
+                f"got {value!r}."
+            )
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -652,6 +851,203 @@ def _apply_defaults(config: dict[str, Any]) -> None:
         experiment["name"] = "run"
 
 
+# Legacy evaluation cadence keys are silently migrated so old configs keep
+# working; the new train/validation/test protocol names are canonical.
+_LEGACY_EVALUATION_ALIASES: dict[str, str] = {
+    "quick_test_every_steps": "val_quick_every_steps",
+    "quick_test_pairs_per_video": "val_quick_pairs_per_video",
+    "full_test_every_steps": "val_full_every_steps",
+    "full_test_at_end": "val_full_at_end",
+}
+
+
+def migrate_split_roles(config: dict[str, Any]) -> None:
+    """Normalize legacy two-split configs onto train/val/test roles.
+
+    * When ``data.val_index`` is missing, ``data.test_index`` becomes the
+      validation split and ``data.split_migration.test_used_as_validation``
+      records that this run has no independent test set.
+    * Legacy ``quick_test_*``/``full_test_*`` evaluation cadence keys are
+      renamed to their ``val_*`` equivalents.
+
+    Idempotent: finalizing an already-finalized config changes nothing.
+    """
+    data_cfg = config.get("data")
+    if isinstance(data_cfg, dict):
+        migration = dict(data_cfg.get("split_migration") or {})
+        if not data_cfg.get("val_index") and data_cfg.get("test_index"):
+            data_cfg["val_index"] = data_cfg["test_index"]
+            if data_cfg.get("test_video_index"):
+                data_cfg["val_video_index"] = data_cfg["test_video_index"]
+            if data_cfg.get("test_packed_index"):
+                data_cfg["val_packed_index"] = data_cfg["test_packed_index"]
+            if data_cfg.get("test_packed_video_index"):
+                data_cfg["val_packed_video_index"] = data_cfg[
+                    "test_packed_video_index"
+                ]
+            migration["test_used_as_validation"] = True
+        data_cfg["split_migration"] = migration
+    evaluation_cfg = config.get("evaluation")
+    if isinstance(evaluation_cfg, dict):
+        for legacy_key, canonical_key in _LEGACY_EVALUATION_ALIASES.items():
+            if (
+                legacy_key in evaluation_cfg
+                and canonical_key not in evaluation_cfg
+            ):
+                evaluation_cfg[canonical_key] = evaluation_cfg.pop(legacy_key)
+            elif legacy_key in evaluation_cfg:
+                evaluation_cfg.pop(legacy_key)
+
+
+def split_role_warnings(config: dict[str, Any]) -> list[str]:
+    """Human-readable warnings about legacy split aliasing."""
+    warnings: list[str] = []
+    migration = (config.get("data") or {}).get("split_migration") or {}
+    if migration.get("test_used_as_validation"):
+        warnings.append(
+            "data.val_index is missing: test_index is used as the "
+            "validation split. This run has NO independent test set; final "
+            "test evaluation is unavailable until a val split is added."
+        )
+    return warnings
+
+
+def semantic_validate(config: dict[str, Any]) -> None:
+    """Third validation layer: ranges, probabilities and cross-field facts.
+
+    Structure (unknown keys/types) is checked by ``validate_config``; this
+    layer rejects configurations that are well-typed but meaningless, such
+    as non-positive batch sizes, negative learning rates, thresholds
+    outside (0, 1), probability vectors that do not sum to one, or
+    warmups longer than the whole training budget.
+    """
+    problems: list[str] = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            problems.append(message)
+
+    train_cfg = config.get("train") or {}
+    if isinstance(train_cfg.get("local_batch_size"), (int, float)):
+        require(
+            train_cfg["local_batch_size"] > 0,
+            "train.local_batch_size must be positive "
+            f"(got {train_cfg['local_batch_size']}).",
+        )
+    if isinstance(train_cfg.get("steps_per_epoch"), (int, float)):
+        require(
+            train_cfg["steps_per_epoch"] > 0,
+            "train.steps_per_epoch must be positive.",
+        )
+    if isinstance(train_cfg.get("log_every_steps"), (int, float)):
+        require(
+            train_cfg["log_every_steps"] > 0,
+            "train.log_every_steps must be positive (0 would never log).",
+        )
+    if isinstance(train_cfg.get("epochs"), (int, float)):
+        require(
+            train_cfg["epochs"] > 0,
+            "train.epochs must be positive.",
+        )
+
+    optimizer_cfg = config.get("optimizer") or {}
+    for key in ("learning_rate", "weight_decay"):
+        value = optimizer_cfg.get(key)
+        if isinstance(value, (int, float)):
+            require(
+                value >= 0,
+                f"optimizer.{key} must be non-negative (got {value}).",
+            )
+
+    decision = config.get("decision") or {}
+    threshold = decision.get("threshold")
+    if isinstance(threshold, (int, float)):
+        require(
+            0.0 < float(threshold) < 1.0,
+            f"decision.threshold must be strictly between 0 and 1 "
+            f"(got {threshold}).",
+        )
+
+    loss_cfg = config.get("loss") or {}
+    for key in ("threshold_temperature", "threshold_safety_margin"):
+        value = loss_cfg.get(key)
+        if isinstance(value, (int, float)):
+            require(
+                value > 0,
+                f"loss.{key} must be positive (got {value}).",
+            )
+    for key in ("cross_entropy_weight", "threshold_loss_weight", "label_smoothing"):
+        value = loss_cfg.get(key)
+        if isinstance(value, (int, float)):
+            require(
+                value >= 0,
+                f"loss.{key} must be non-negative (got {value}).",
+            )
+
+    evaluation_cfg = config.get("evaluation") or {}
+    for key in (
+        "train_probe_every_steps",
+        "val_quick_every_steps",
+        "val_full_every_steps",
+        "train_probe_pairs_per_video",
+        "val_quick_pairs_per_video",
+    ):
+        value = evaluation_cfg.get(key)
+        if isinstance(value, (int, float)):
+            require(
+                value >= 0,
+                f"evaluation.{key} must be non-negative (got {value}).",
+            )
+    weights = evaluation_cfg.get("selection_weights")
+    if isinstance(weights, dict) and weights:
+        require(
+            all(
+                isinstance(value, (int, float)) and value >= 0
+                for value in weights.values()
+            ),
+            "evaluation.selection_weights must all be non-negative.",
+        )
+        require(
+            sum(float(value) for value in weights.values()) > 0,
+            "evaluation.selection_weights must sum to a positive value.",
+        )
+
+    # Probability vectors: non-negative and (approximately) sum to one.
+    for key in ("class_probability", "delta_probability"):
+        probabilities = (config.get("sampler") or {}).get(key)
+        if not isinstance(probabilities, dict) or not probabilities:
+            continue
+        values = [float(item) for item in probabilities.values()]
+        require(
+            all(value >= 0 for value in values),
+            f"sampler.{key} must not contain negative probabilities.",
+        )
+        if values and all(value == 0 for value in values):
+            require(
+                False,
+                f"sampler.{key} is all zero; sampling would be meaningless.",
+            )
+        require(
+            abs(sum(values) - 1.0) < 1e-3,
+            f"sampler.{key} must sum to ~1 (got {sum(values):.4f}).",
+        )
+
+    # Cross-field: warmup must fit inside the total step budget.
+    warmup = train_cfg.get("warmup_steps")
+    max_steps = train_cfg.get("max_steps")
+    if isinstance(warmup, (int, float)) and isinstance(
+        max_steps, (int, float)
+    ):
+        require(
+            warmup <= max_steps,
+            f"train.warmup_steps ({warmup}) must not exceed "
+            f"train.max_steps ({max_steps}).",
+        )
+
+    if problems:
+        raise ConfigSchemaError(problems)
+
+
 def finalize_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate and normalize a merged configuration.
 
@@ -660,9 +1056,11 @@ def finalize_config(config: dict[str, Any]) -> dict[str, Any]:
     """
     finalized = copy.deepcopy(config)
     _apply_defaults(finalized)
+    migrate_split_roles(finalized)
     check_removed_keys(finalized)
     validate_config(finalized)
     resolve_decision_threshold(finalized)
+    semantic_validate(finalized)
     return finalized
 
 

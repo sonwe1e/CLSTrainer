@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections import OrderedDict, defaultdict
+import contextlib
 import json
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -188,10 +189,8 @@ class PackedUint8Backend:
         return state
 
     def __del__(self):
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 def pack_frame_index(

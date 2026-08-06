@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def resolve_factory(spec: str) -> Callable[..., Any]:
@@ -17,6 +18,11 @@ def resolve_factory(spec: str) -> Callable[..., Any]:
 
 def build_model(config: dict[str, Any]):
     factory = resolve_factory(config["factory"])
+    # Project-specific factory arguments (e.g. cls_dropout) live under
+    # model.kwargs and are visible to the factory inside the full model
+    # config mapping; normalize it here so factories can rely on its
+    # presence without an extra get() call.
+    config.setdefault("kwargs", {})
     model = factory(config)
     return model
 

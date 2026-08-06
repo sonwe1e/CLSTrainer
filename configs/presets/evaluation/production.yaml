@@ -1,10 +1,16 @@
-# Production evaluation policy: observed dev-test cadence, histogram AUC,
-# composite best-checkpoint selection.
+# Production evaluation policy: train/validation/test protocol.
+#
+# Cadence recommendation (step2 plan): with the overfitting knee around
+# 10k steps, full validation every 2000 steps resolves 8k/10k/12k; the
+# old 5000-step cadence could only see 5k/10k/15k.
 evaluation:
-  quick_test_every_steps: 1000
-  quick_test_pairs_per_video: 128
-  full_test_every_steps: 5000
-  full_test_at_end: true
+  train_probe_every_steps: 1000
+  train_probe_pairs_per_video: 32
+  val_quick_every_steps: 500
+  val_quick_pairs_per_video: 128
+  val_full_every_steps: 2000
+  val_full_at_end: true
+  tensorboard_live: false
   full_auc_mode: histogram
   auc_histogram_bins: 4096
   quick_save_error_limit: 200

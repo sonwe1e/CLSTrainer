@@ -72,14 +72,24 @@ class UniqueRunDirectoryTests(unittest.TestCase):
                     (run_dir / "status.json").read_text(encoding="utf-8")
                 )
                 self.assertEqual(status["state"], "SUCCEEDED")
-            # The runs root itself holds the index, one line per run.
+            # The runs root itself holds an append-only index: one RUNNING
+            # record per start plus one terminal record per finish. Readers
+            # aggregate by run identity, so the two runs surface as two
+            # records with final states.
             index_lines = (
                 (root / "index.jsonl").read_text(encoding="utf-8").splitlines()
             )
-            self.assertEqual(len(index_lines), 2)
+            self.assertEqual(len(index_lines), 4)
             records = [json.loads(line) for line in index_lines]
             self.assertEqual(
-                {record["state"] for record in records}, {"SUCCEEDED"}
+                {record["state"] for record in records}, {"RUNNING", "SUCCEEDED"}
+            )
+            from game_cls.cli import _find_index_records
+
+            aggregated = _find_index_records(root)
+            self.assertEqual(len(aggregated), 2)
+            self.assertEqual(
+                {record["state"] for record in aggregated}, {"SUCCEEDED"}
             )
 
     def test_fixed_mode_keeps_legacy_in_place_behavior(self) -> None:

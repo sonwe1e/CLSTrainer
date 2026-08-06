@@ -18,6 +18,7 @@ def test_npu_extension_and_device_are_ready_before_hccl_init():
     fake_dist.init_process_group = lambda **kwargs: events.append(
         ("init_process_group", kwargs["backend"])
     )
+    fake_dist.is_initialized = lambda: False
     fake_torch.distributed = fake_dist
     fake_torch_npu = ModuleType("torch_npu")
     environment = {"LOCAL_RANK": "1", "RANK": "1", "WORLD_SIZE": "8"}

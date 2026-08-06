@@ -12,17 +12,22 @@ data:
   synthetic: false
   strict_audit: true
   require_content_hash_audit: true
-  require_unique_video_keys_across_splits: false
+  require_unique_video_keys_across_splits: true
+  require_independent_test: true
   minimum_pairs_per_game_label_delta: {2: 1}
   audit_path: indexes/audit.json
   train_video_index: indexes/train_video_entries.parquet
+  val_video_index: indexes/val_video_entries.parquet
   test_video_index: indexes/test_video_entries.parquet
   train_index: indexes/train_frames.parquet
+  val_index: indexes/val_frames.parquet
   test_index: indexes/test_frames.parquet
   backend: png
   train_packed_index: null
+  val_packed_index: null
   test_packed_index: null
   train_packed_video_index: null
+  val_packed_video_index: null
   test_packed_video_index: null
   packed_max_open_shards: 16
   width: 448
@@ -43,7 +48,7 @@ data:
   unexpected_nested_directory_severity: warning
   ignored_example_limit: 20
   duplicate_policy:
-    same_label_cross_split: warning
+    same_label_cross_split: error
     same_label_within_split: warning
     cross_label_same_content: error
     same_basename: info
@@ -104,6 +109,12 @@ loss:
   threshold_temperature: 0.50
   threshold_warmup_ratio: 0.10
   threshold_ramp_ratio: 0.20
+  # Explicit-step alternatives (override the ratios when set, so extending
+  # max_steps no longer moves the margin-loss schedule):
+  threshold_warmup_steps: null
+  threshold_ramp_steps: null
+  # Regularization experiment knobs (keep 0.0 until ablation runs):
+  label_smoothing: 0.0
 
 optimizer:
   learning_rate: 0.001
@@ -142,10 +153,13 @@ dataloader:
 evaluation:
   amp: true
   amp_dtype: bfloat16
-  quick_test_every_steps: 1000
-  quick_test_pairs_per_video: 128
-  full_test_every_steps: 5000
-  full_test_at_end: true
+  train_probe_every_steps: 1000
+  train_probe_pairs_per_video: 32
+  val_quick_every_steps: 500
+  val_quick_pairs_per_video: 128
+  val_full_every_steps: 2000
+  val_full_at_end: true
+  tensorboard_live: false
   full_auc_mode: histogram
   auc_histogram_bins: 4096
   quick_save_error_limit: 200
@@ -158,8 +172,20 @@ evaluation:
     worst_game_f1: 0.20
   minimum_worst_game_f1: null
 
+early_stopping:
+  enabled: true
+  monitor: selection_score
+  mode: max
+  full_validation_only: true
+  burn_in_steps: 6000
+  patience_evaluations: 3
+  min_delta: 0.001
+  restore_best: true
+
 checkpoint:
   save_last_every_steps: 1000
   save_best_selection: true
+  save_best_val_loss: true
+  save_best_worst_game: true
   periodic_state_mode: trainable_only
   full_model_every_steps: 5000

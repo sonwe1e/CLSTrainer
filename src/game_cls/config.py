@@ -14,7 +14,7 @@ from game_cls.config_schema import (
 # Preset groups a recipe may reference, mapped to their configs subdirectory.
 PRESET_GROUPS = ("augmentation", "dataloader", "evaluation")
 
-RECIPE_MARKER_KEYS = ("profile", "presets", "contract")
+RECIPE_MARKER_KEYS = ("profile", "presets", "task_profile")
 
 
 def _yaml() -> Any:
@@ -72,7 +72,7 @@ def _read_raw_file(config_path: Path) -> dict[str, Any]:
     return _yaml().safe_load(text) or {}
 
 
-RECIPE_LEVEL_KEYS = ("profile", "contract", "presets")
+RECIPE_LEVEL_KEYS = ("profile", "task_profile", "presets")
 
 
 def _split_overrides(
@@ -80,7 +80,7 @@ def _split_overrides(
 ) -> tuple[list[str], list[str]]:
     """Split overrides into recipe-level and config-level groups.
 
-    Recipe-level targets (``profile``, ``contract``, ``presets.<group>``)
+    Recipe-level targets (``profile``, ``task_profile``, ``presets.<group>``)
     are honored only when the entry file actually is a recipe.
     """
     if not _is_recipe(raw):
@@ -107,7 +107,7 @@ def _apply_recipe_overrides(
         dotted_key, raw_value = item.split("=", 1)
         value = _parse_scalar(raw_value)
         parts = dotted_key.split(".")
-        if parts[0] in ("profile", "contract"):
+        if parts[0] in ("profile", "task_profile"):
             if len(parts) != 1:
                 raise ConfigSchemaError(
                     [f"Override target {dotted_key} is not a scalar key."]
@@ -162,9 +162,9 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> dict[st
     Two formats are supported:
 
     * Legacy flat configs (``base:`` inheritance chain).
-    * Recipes: ``profile`` + optional ``contract``/``presets`` plus only the
+    * Recipes: ``profile`` + optional ``task_profile``/``presets`` plus only the
       fields the user actually decides. Merge order is
-      contract -> profile -> presets -> recipe -> CLI overrides.
+      task_profile -> profile -> presets -> recipe -> CLI overrides.
 
     The returned config is schema-validated: unknown keys, removed keys and
     type mismatches all raise ``ConfigSchemaError``. ``decision.threshold``
@@ -244,9 +244,18 @@ def _load_raw_with_sources(
 def _load_recipe_with_sources(
     recipe_path: Path, raw: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Resolve contract/profile/presets and merge them under the recipe."""
+    """Resolve task_profile/profile/presets and merge them under the recipe."""
     raw = copy.deepcopy(raw)
-    contract_name = raw.pop("contract", "dual_frame_binary")
+    if "contract" in raw:
+        raise ConfigSchemaError(
+            [
+                f"{recipe_path}: the 'contract' layer has been renamed to "
+                "'task_profile'. Use 'task_profile: dual_frame_binary' "
+                "instead. Task profiles are defaults, not invariants — "
+                "recipes may override every field."
+            ]
+        )
+    contract_name = raw.pop("task_profile", "dual_frame_binary")
     profile_name = raw.pop("profile", None)
     presets = raw.pop("presets", {}) or {}
     if "base" in raw:
@@ -273,7 +282,7 @@ def _load_recipe_with_sources(
     if contract_name:
         layers.append(
             _resolve_layer_file(
-                recipe_path, "contracts", contract_name, "contract"
+                recipe_path, "task_profiles", contract_name, "task_profile"
             )
         )
     if profile_name:
@@ -298,7 +307,7 @@ def _load_recipe_with_sources(
         if _is_recipe(layer_raw):
             raise ConfigSchemaError(
                 [
-                    f"{layer_path}: layer files (contract/profile/preset) must "
+                    f"{layer_path}: layer files (task_profile/profile/preset) must "
                     "be plain config sections, not recipes."
                 ]
             )
@@ -326,7 +335,7 @@ def load_config_with_sources(
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Like ``load_config`` but also reports where each value came from.
 
-    The sources map covers the full merge tree (contract/profile/presets or
+    The sources map covers the full merge tree (task_profile/profile/presets or
     base files, plus the entry file); command line overrides are recorded
     as ``override:<item>``.
     """
@@ -345,10 +354,10 @@ def load_config_with_sources(
 
 
 def list_available_layers() -> dict[str, list[str]]:
-    """Available contracts/profiles/presets under ./configs, for errors and init."""
+    """Available task profiles/profiles/presets under ./configs, for errors and init."""
     root = Path("configs")
     result: dict[str, list[str]] = {}
-    for subdir in ("contracts", "profiles"):
+    for subdir in ("task_profiles", "profiles"):
         directory = root / subdir
         result[subdir] = (
             sorted(path.stem for path in directory.glob("*.yaml"))

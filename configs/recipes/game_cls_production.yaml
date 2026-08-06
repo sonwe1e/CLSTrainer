@@ -5,7 +5,7 @@
 #   cls-trainer train  --config configs/recipes/game_cls_production.yaml
 #
 # Business facts (threshold 0.99, delta=2 test pairs, cls-only training,
-# 448x208 frames) come from the contract and are intentionally absent here.
+# 448x208 frames) come from the task profile and are intentionally absent here.
 # NPU spawn/timeout/worker rules come from the profile.
 profile: npu_8p
 
@@ -26,12 +26,15 @@ model:
 data:
   synthetic: false
   require_content_hash_audit: true
-  require_unique_video_keys_across_splits: false
+  require_unique_video_keys_across_splits: true
+  require_independent_test: true
   minimum_pairs_per_game_label_delta: {2: 1}
   audit_path: indexes/audit.json
   train_video_index: indexes/train_video_entries.parquet
+  val_video_index: indexes/val_video_entries.parquet
   test_video_index: indexes/test_video_entries.parquet
   train_index: indexes/train_frames.parquet
+  val_index: indexes/val_frames.parquet
   test_index: indexes/test_frames.parquet
   backend: png
   frame_extensions: [".png"]
@@ -41,7 +44,7 @@ data:
   unexpected_nested_directory_severity: warning
   ignored_example_limit: 20
   duplicate_policy:
-    same_label_cross_split: warning
+    same_label_cross_split: error
     same_label_within_split: warning
     cross_label_same_content: error
     same_basename: info
@@ -76,5 +79,18 @@ train:
 checkpoint:
   save_last_every_steps: 1000
   save_best_selection: true
+  save_best_val_loss: true
+  save_best_worst_game: true
   periodic_state_mode: trainable_only
   full_model_every_steps: 5000
+
+# Stop on validation plateau instead of always consuming max_steps.
+early_stopping:
+  enabled: true
+  monitor: selection_score
+  mode: max
+  full_validation_only: true
+  burn_in_steps: 6000
+  patience_evaluations: 3
+  min_delta: 0.001
+  restore_best: true

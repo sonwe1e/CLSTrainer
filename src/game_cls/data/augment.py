@@ -75,8 +75,7 @@ class ConsistentPairAugment:
 
     def __init__(self, config: dict[str, Any]) -> None:
         try:
-            from torchvision.transforms import v2
-            from torchvision.transforms import InterpolationMode
+            from torchvision.transforms import InterpolationMode, v2
         except ImportError as exc:
             raise RuntimeError("Augmentation requires torchvision") from exc
 

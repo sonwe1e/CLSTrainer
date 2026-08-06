@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 try:
     import numpy as np
@@ -54,13 +54,14 @@ class SpawnDataLoaderTests(unittest.TestCase):
         "PNG spawn test dependencies are not installed",
     )
     def test_real_png_pair_dataset_with_augmentation_uses_spawn(self) -> None:
+        from torch.utils.data import DataLoader
+
         from game_cls.data.augment import ConsistentPairAugment
         from game_cls.data.lazy_pair_dataset import LazyTrainingPairDataset
         from game_cls.data.video_index import VideoEntry
         from game_cls.data.video_sampler import (
             VideoBalancedPairBatchSampler,
         )
-        from torch.utils.data import DataLoader
 
         with tempfile.TemporaryDirectory() as directory:
             video_directory = Path(directory) / "gameA" / "0"

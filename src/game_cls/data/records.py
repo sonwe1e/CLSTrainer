@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from pathlib import Path
 import re
 import struct
-from typing import Iterable
-
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 DEFAULT_FILENAME_PATTERN = r"^(?P<video_id>\d{2})(?P<frame_id>\d{5})\.png$"
 

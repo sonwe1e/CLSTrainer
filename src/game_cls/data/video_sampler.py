@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter
 import random
-from typing import Iterator, Sequence
+from collections import Counter
+from collections.abc import Iterator, Sequence
 
 from .lazy_pair_dataset import PairRequest
 from .video_index import VideoEntry
@@ -12,7 +12,12 @@ def _choice(rng: random.Random, values: Sequence, weights: Sequence[float]):
     if not values:
         raise RuntimeError("Cannot sample from an empty population")
     if not any(weight > 0 for weight in weights):
-        return rng.choice(list(values))
+        raise ValueError(
+            "All sampling weights are <= 0; the distribution would be "
+            "meaningless. Fix the weights in the config (e.g. "
+            "class_probability / delta_probability) instead of relying "
+            "on a silent uniform fallback."
+        )
     return rng.choices(values, weights=weights, k=1)[0]
 
 
@@ -31,12 +36,30 @@ class VideoBalancedPairBatchSampler:
         game_alpha: float = 0.25,
         class_probability: dict[int, float] | None = None,
         delta_probability: dict[int, float] | None = None,
-        deduplicate_within_global_batch: bool = True,
+        deduplicate_within_global_batch: bool | None = None,
+        dedup_level: str = "pair",
+        on_exhaustion: str = "warn_and_relax",
     ) -> None:
         if local_batch_size <= 0 or steps_per_epoch <= 0:
             raise ValueError("batch size and steps_per_epoch must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
+        if dedup_level not in ("none", "pair", "video"):
+            raise ValueError(
+                f"dedup_level must be none|pair|video; got {dedup_level!r}"
+            )
+        if on_exhaustion not in ("error", "warn_and_relax"):
+            raise ValueError(
+                f"on_exhaustion must be error|warn_and_relax; "
+                f"got {on_exhaustion!r}"
+            )
+        if deduplicate_within_global_batch is not None:
+            # Legacy boolean: True -> pair, False -> none. The explicit
+            # dedup_level wins when both are given.
+            if dedup_level == "pair" and not deduplicate_within_global_batch:
+                dedup_level = "none"
+            if dedup_level == "none" and deduplicate_within_global_batch:
+                dedup_level = "pair"
         self.videos = videos
         self.local_batch_size = local_batch_size
         self.steps_per_epoch = steps_per_epoch
@@ -46,9 +69,11 @@ class VideoBalancedPairBatchSampler:
         self.game_alpha = game_alpha
         self.class_probability = class_probability or {0: 0.5, 1: 0.5}
         self.delta_probability = delta_probability or {1: 0.15, 2: 0.70, 3: 0.15}
-        self.deduplicate = deduplicate_within_global_batch
+        self.dedup_level = dedup_level
+        self.on_exhaustion = on_exhaustion
         self.epoch = 0
         self.start_step = 0
+        self.last_epoch_dedup_failures = 0
         self.last_epoch_delta_counts: Counter[int] = Counter()
         self.last_epoch_game_label_delta_counts: Counter[
             tuple[str, int, int]
@@ -105,32 +130,56 @@ class VideoBalancedPairBatchSampler:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
         self.last_epoch_delta_counts = Counter()
         self.last_epoch_game_label_delta_counts = Counter()
+        self.last_epoch_dedup_failures = 0
         global_batch_size = self.local_batch_size * self.world_size
         deltas = list(self._support)
         delta_weights = [self.delta_probability.get(item, 0.0) for item in deltas]
         for step in range(self.steps_per_epoch):
             selected: list[PairRequest] = []
-            used: set[tuple[int, int, int]] = set()
+            used: set[tuple[int, int, int] | int] = set()
             attempts = 0
             max_attempts = max(100, global_batch_size * 20)
+            dedup_active = self.dedup_level != "none"
             while len(selected) < global_batch_size:
                 delta = _choice(rng, deltas, delta_weights)
                 request = self._sample_for_delta(rng, delta)
-                identity = (
-                    request.video_index,
-                    request.delta,
-                    request.start_position,
-                )
+                if self.dedup_level == "video":
+                    identity: tuple[int, int, int] | int = request.video_index
+                else:
+                    identity = (
+                        request.video_index,
+                        request.delta,
+                        request.start_position,
+                    )
                 attempts += 1
-                if self.deduplicate and identity in used and attempts < max_attempts:
-                    while identity in used and attempts < max_attempts:
-                        request = self._sample_for_delta(rng, delta)
-                        identity = (
-                            request.video_index,
-                            request.delta,
-                            request.start_position,
+                if dedup_active and identity in used:
+                    if attempts < max_attempts:
+                        # Re-sample INSIDE the same delta so the effective
+                        # per-delta distribution stays the configured one.
+                        while identity in used and attempts < max_attempts:
+                            request = self._sample_for_delta(rng, delta)
+                            identity = (
+                                request.video_index
+                                if self.dedup_level == "video"
+                                else (
+                                    request.video_index,
+                                    request.delta,
+                                    request.start_position,
+                                )
+                            )
+                            attempts += 1
+                            self.last_epoch_dedup_failures += 1
+                    elif self.on_exhaustion == "error":
+                        raise RuntimeError(
+                            "Deduplication exhausted: could not fill a "
+                            "global batch without repeating "
+                            f"{self.dedup_level} identities after "
+                            f"{max_attempts} attempts (batch size "
+                            f"{global_batch_size}). Reduce the batch size "
+                            "or set data.deduplication.on_exhaustion=warn_and_relax."
                         )
-                        attempts += 1
+                    else:
+                        self.last_epoch_dedup_failures += 1
                 selected.append(request)
                 used.add(identity)
                 self.last_epoch_delta_counts[request.delta] += 1

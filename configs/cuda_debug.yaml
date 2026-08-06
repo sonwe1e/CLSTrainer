@@ -102,10 +102,12 @@ dataloader:
 evaluation:
   amp: false
   amp_dtype: bfloat16
-  quick_test_every_steps: 50
-  quick_test_pairs_per_video: 16
-  full_test_every_steps: 100
-  full_test_at_end: true
+  train_probe_every_steps: 50
+  train_probe_pairs_per_video: 4
+  val_quick_every_steps: 50
+  val_quick_pairs_per_video: 16
+  val_full_every_steps: 100
+  val_full_at_end: true
   html_max_errors_per_group: 200
 
 checkpoint:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -17,6 +17,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build frame and video Parquet indexes")
     parser.add_argument("--config", required=True)
     parser.add_argument("--train-root", required=True)
+    parser.add_argument(
+        "--val-root",
+        default=None,
+        help=(
+            "Validation split root. When omitted, training treats the test "
+            "split as validation and no independent test set exists."
+        ),
+    )
     parser.add_argument("--test-root", required=True)
     parser.add_argument("--output-dir", default="indexes")
     parser.add_argument(
@@ -36,6 +44,7 @@ def main() -> None:
         image_spec=image_spec,
         scan_policy=ScanPolicy.from_config(data_config),
         duplicate_policy=DuplicatePolicy.from_config(data_config),
+        val_root=args.val_root,
         compute_content_hash=not args.skip_content_hash,
     )
     print(json.dumps(audit, ensure_ascii=False, indent=2))

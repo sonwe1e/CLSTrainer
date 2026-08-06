@@ -4,7 +4,7 @@
 #
 # A recipe only lists the fields YOU decide. Machine behavior comes from
 # the profile, stability defaults from presets, business facts from the
-# contract.
+# task profile.
 profile: cpu_debug
 
 presets:

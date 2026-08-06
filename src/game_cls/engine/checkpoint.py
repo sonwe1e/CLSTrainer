@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-import random
 import hashlib
-from functools import lru_cache
 import json
+import os
+import random
 import shutil
+from functools import lru_cache
+from pathlib import Path
 
 
 def unwrap_model(model):
@@ -71,6 +71,23 @@ def clone_checkpoint_pair(
         )
 
 
+def remove_checkpoint_pair(output_dir: str | Path, tag: str) -> None:
+    """Best-effort removal of a saved checkpoint pair (model/checkpoint +
+    metadata). Used when a topk checkpoint is evicted."""
+    output_dir = Path(output_dir)
+    for name in (
+        f"model_{tag}.pth",
+        f"checkpoint_{tag}.pth",
+        f"model_{tag}.metadata.json",
+    ):
+        path = output_dir / name
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
+
 @lru_cache(maxsize=8)
 def _file_sha256(path: str) -> str:
     digest = hashlib.sha256()
@@ -92,9 +109,13 @@ def capture_random_state() -> dict:
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
     npu = getattr(torch, "npu", None)
-    if npu is not None and callable(getattr(npu, "is_available", None)):
-        if npu.is_available() and hasattr(npu, "get_rng_state_all"):
-            state["npu"] = npu.get_rng_state_all()
+    if (
+        npu is not None
+        and callable(getattr(npu, "is_available", None))
+        and npu.is_available()
+        and hasattr(npu, "get_rng_state_all")
+    ):
+        state["npu"] = npu.get_rng_state_all()
     return state
 
 
@@ -183,6 +204,7 @@ def save_checkpoint_pair(
     )
     _atomic_torch_save(
         {
+            "cls_training_checkpoint": True,
             "model": checkpoint_state_dict,
             "model_state_mode": state_mode,
             "expected_trainable_state_keys": (
@@ -227,7 +249,18 @@ def restore_training_checkpoint(
 ) -> dict:
     import torch
 
+    # Internal resume checkpoints carry optimizer/RNG/sampler state and
+    # must be unpickled with full fidelity (weights_only=False). They are
+    # trusted only when they carry the CLSTrainer marker; a checkpoint
+    # without it is refused.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not checkpoint.get("cls_training_checkpoint"):
+        raise RuntimeError(
+            f"{path} is not a CLSTrainer internal training checkpoint "
+            "(missing cls_training_checkpoint marker). Only checkpoints "
+            "produced by this project may be resumed; use --fork to start "
+            "a new run from an untrusted file."
+        )
     state_mode = checkpoint.get("model_state_mode", "full")
     if state_mode == "trainable_only":
         stored_hash = checkpoint.get("base_checkpoint_sha256")

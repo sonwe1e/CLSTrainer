@@ -14,7 +14,7 @@ class EvaluationContractTests(unittest.TestCase):
         from game_cls.engine.evaluator import _make_reduction_tensors
 
         counts, floating = _make_reduction_tensors(
-            [1, 2, 3, 4], 10, 2.5, 1.25, torch.device("cpu")
+            [1, 2, 3, 4], 10, 2.5, 1.25, 0.5, torch.device("cpu")
         )
         self.assertEqual(counts.dtype, torch.int64)
         self.assertEqual(floating.dtype, torch.float32)

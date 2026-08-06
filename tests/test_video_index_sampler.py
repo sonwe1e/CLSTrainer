@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
 import unittest
+from collections import Counter
 
 from game_cls.data.lazy_pair_dataset import build_eval_dataset
 from game_cls.data.records import FrameRecord
@@ -85,13 +85,13 @@ class VideoIndexSamplerTests(unittest.TestCase):
         keys0 = set(
             zip(
                 rank0.video_indices.tolist(),
-                rank0.start_positions.tolist(),
+                rank0.start_positions.tolist(), strict=False,
             )
         )
         keys1 = set(
             zip(
                 rank1.video_indices.tolist(),
-                rank1.start_positions.tolist(),
+                rank1.start_positions.tolist(), strict=False,
             )
         )
         self.assertTrue(keys0.isdisjoint(keys1))

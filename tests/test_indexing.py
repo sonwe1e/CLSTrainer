@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import struct
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 try:
     import pyarrow.parquet as pq
@@ -197,7 +197,7 @@ class IndexBundleTests(unittest.TestCase):
                 scan_policy(),
                 DuplicatePolicy(),
             )
-            self.assertEqual(audit["audit_format_version"], 2)
+            self.assertEqual(audit["audit_format_version"], 3)
             self.assertEqual(
                 audit["expected"],
                 {"width": 448, "height": 208, "channels": 3},
@@ -237,6 +237,49 @@ class IndexBundleTests(unittest.TestCase):
             self.assertIsNone(video_entries[0]["frame_paths"])
             self.assertTrue(video_entries[0]["video_directory"])
             self.assertTrue(audit["duplicates"]["warnings"])
+
+    def test_three_split_bundle_and_source_uid_leakage(self) -> None:
+        """A source video spanning train/val/test must be detected."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Same video id '01' in train, val and test: leakage.
+            for split in ("train", "val", "test"):
+                write_png_header(
+                    root / split / "game_A" / "0" / "0100001.png"
+                )
+            output = root / "indexes"
+            audit = write_index_bundle(
+                root / "train",
+                root / "test",
+                output,
+                ImageSpec(width=448, height=208, channels=3),
+                scan_policy(),
+                DuplicatePolicy(),
+                val_root=root / "val",
+            )
+            self.assertEqual(
+                audit["leakage"]["source_video_uid_overlap"][
+                    "train__test"
+                ],
+                ["game_A::01"],
+            )
+            self.assertEqual(
+                audit["leakage"]["source_video_uid_overlap"][
+                    "train__val"
+                ],
+                ["game_A::01"],
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "source videos span"
+            ):
+                from game_cls.data.indexing import validate_audit
+
+                validate_audit(
+                    audit,
+                    image_spec=ImageSpec(width=448, height=208, channels=3),
+                    duplicate_policy=DuplicatePolicy(),
+                    require_content_hash=False,
+                )
 
 
 if __name__ == "__main__":

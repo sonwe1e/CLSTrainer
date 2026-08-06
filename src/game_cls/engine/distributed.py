@@ -1,47 +1,27 @@
+"""Compatibility shim over ``game_cls.runtime.distributed_runtime``.
+
+All validation and initialization logic lives in the unified
+``DistributedRuntime`` module; these helpers keep existing imports
+working.
+"""
+
 from __future__ import annotations
 
-import os
+from game_cls.runtime import distributed_runtime
 
+initialize_runtime = distributed_runtime.init_runtime
+distributed_barrier = distributed_runtime.barrier
+cleanup_distributed = distributed_runtime.cleanup
+is_distributed = distributed_runtime.is_initialized
+validate_launch_environment = distributed_runtime.validate_launch_environment
 
-def initialize_runtime(config: dict):
-    """Register the accelerator, bind the device, then initialize c10d."""
-    import torch
-    import torch.distributed as dist
-
-    distributed_config = config.get("distributed", {})
-    distributed = bool(distributed_config.get("enabled", False))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    accelerator = config["device"]["accelerator"]
-    if accelerator == "auto":
-        accelerator = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if accelerator == "npu":
-        try:
-            import torch_npu  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError("NPU training requires a preinstalled torch_npu") from exc
-        torch.npu.set_device(local_rank)
-        device = torch.device(f"npu:{local_rank}")
-    elif accelerator == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but is not available")
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    elif accelerator == "cpu":
-        device = torch.device("cpu")
-    else:
-        raise ValueError(f"Unsupported accelerator: {accelerator}")
-
-    if distributed:
-        if world_size <= 1:
-            raise RuntimeError("Distributed mode requires WORLD_SIZE greater than one")
-        dist.init_process_group(
-            backend=distributed_config["backend"],
-            init_method="env://",
-        )
-    return rank, world_size, local_rank, device
+__all__ = [
+    "initialize_runtime",
+    "distributed_barrier",
+    "cleanup_distributed",
+    "is_distributed",
+    "validate_launch_environment",
+]
 
 
 def distributed_context(config: dict) -> tuple[int, int, int]:
@@ -50,23 +30,3 @@ def distributed_context(config: dict) -> tuple[int, int, int]:
         {"distributed": config, "device": {"accelerator": "cpu"}}
     )
     return rank, world_size, local_rank
-
-
-def cleanup_distributed() -> None:
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def distributed_barrier() -> None:
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-
-
-def is_distributed() -> bool:
-    import torch.distributed as dist
-
-    return dist.is_available() and dist.is_initialized()

@@ -1,9 +1,11 @@
-# Contract: dual-frame binary classification.
+# Task profile: dual-frame binary classification.
 #
-# Fixed business facts. These values are the canonical defaults for every
-# recipe; hard invariants are additionally enforced by code (input shape
-# check, delta=2 evaluation pairs, strict non-cls checkpoint loading), so
-# overriding them here does not silently change the deployment contract.
+# Canonical defaults shared by every recipe of this task. Unlike a hard
+# contract, EVERY field here is a default: recipes, presets and CLI
+# overrides may change them, and the framework must stay consistent with
+# whatever the resolved configuration says. The code-level invariants
+# (input shape checks, delta-2 evaluation pairs, strict non-cls
+# checkpoint loading) are enforced by code, not by this file.
 decision:
   threshold: 0.99
 

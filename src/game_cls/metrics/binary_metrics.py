@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import math
-from typing import Iterable
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
 
 from game_cls.losses.threshold_loss import probability_threshold_to_margin
 
@@ -35,7 +35,7 @@ def _roc_auc(scores: list[float], targets: list[int]) -> float:
     negatives = len(targets) - positives
     if not positives or not negatives:
         return 0.0
-    ranked = sorted(zip(scores, targets))
+    ranked = sorted(zip(scores, targets, strict=False))
     positive_rank_sum = 0.0
     start = 0
     while start < len(ranked):
@@ -56,7 +56,7 @@ def _average_precision(scores: list[float], targets: list[int]) -> float:
     positives = sum(targets)
     if not positives:
         return 0.0
-    ranked = sorted(zip(scores, targets), reverse=True)
+    ranked = sorted(zip(scores, targets, strict=False), reverse=True)
     tp = fp = 0
     area = 0.0
     start = 0
@@ -82,7 +82,7 @@ def confusion_from_margins(
     targets = [int(value) for value in targets]
     cutoff = probability_threshold_to_margin(threshold)
     tp = fp = fn = tn = 0
-    for margin, target in zip(margins, targets):
+    for margin, target in zip(margins, targets, strict=False):
         prediction = float(margin) > cutoff
         if prediction and target == 1:
             tp += 1

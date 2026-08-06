@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 try:
     import numpy as np
@@ -18,14 +18,14 @@ except ImportError:
 class PackedBackendTests(unittest.TestCase):
     def test_packed_decode_matches_png_pixels(self) -> None:
         from game_cls.data.image_spec import ImageSpec
-        from game_cls.data.packed_backend import (
-            PackedUint8Backend,
-            pack_frame_index,
-        )
         from game_cls.data.lazy_pair_dataset import (
             LazyTrainingPairDataset,
             PairRequest,
             build_eval_dataset,
+        )
+        from game_cls.data.packed_backend import (
+            PackedUint8Backend,
+            pack_frame_index,
         )
         from game_cls.data.video_index import read_video_entries_parquet
 
@@ -73,7 +73,7 @@ class PackedBackendTests(unittest.TestCase):
             self.assertEqual(
                 tuple(reordered.shape), (4, 3, 208, 448)
             )
-            for actual, location in zip(reordered, [4, 0, 3, 1]):
+            for actual, location in zip(reordered, [4, 0, 3, 1], strict=False):
                 self.assertTrue(torch.equal(actual, expected[location]))
             self.assertEqual(
                 len(list((root / "packed").glob("shard_*.bin"))), 3

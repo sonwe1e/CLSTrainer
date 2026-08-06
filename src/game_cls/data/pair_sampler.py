@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import math
 import random
-from typing import Iterator, Sequence
+from collections.abc import Iterator, Sequence
 
 from .pair_dataset import group_pair_indices
 from .records import PairSample
@@ -11,6 +10,13 @@ from .records import PairSample
 def _weighted_choice(rng: random.Random, values: Sequence, weights: Sequence[float]):
     if not values:
         raise RuntimeError("Cannot sample from an empty population")
+    if not any(weight > 0 for weight in weights):
+        raise ValueError(
+            "All sampling weights are <= 0; the distribution would be "
+            "meaningless. Fix the weights in the config (e.g. "
+            "class_probability / delta_probability) instead of relying "
+            "on a silent uniform fallback."
+        )
     return rng.choices(values, weights=weights, k=1)[0]
 
 
@@ -28,12 +34,29 @@ class BalancedDistributedPairBatchSampler:
         game_alpha: float = 0.25,
         class_probability: dict[int, float] | None = None,
         delta_probability: dict[int, float] | None = None,
-        deduplicate_within_global_batch: bool = True,
+        deduplicate_within_global_batch: bool | None = None,
+        dedup_level: str = "pair",
+        on_exhaustion: str = "warn_and_relax",
     ) -> None:
         if local_batch_size <= 0 or steps_per_epoch <= 0:
             raise ValueError("batch size and steps_per_epoch must be positive")
         if not 0 <= rank < world_size:
             raise ValueError("rank must be in [0, world_size)")
+        if dedup_level not in ("none", "pair"):
+            raise ValueError(
+                f"dedup_level must be none|pair; got {dedup_level!r} "
+                "(video-level dedup requires the lazy video backend)"
+            )
+        if on_exhaustion not in ("error", "warn_and_relax"):
+            raise ValueError(
+                f"on_exhaustion must be error|warn_and_relax; "
+                f"got {on_exhaustion!r}"
+            )
+        if deduplicate_within_global_batch is not None:
+            if dedup_level == "pair" and not deduplicate_within_global_batch:
+                dedup_level = "none"
+            if dedup_level == "none" and deduplicate_within_global_batch:
+                dedup_level = "pair"
         self.pairs = list(pairs)
         self.groups = group_pair_indices(pairs)
         if not self.groups:
@@ -46,8 +69,10 @@ class BalancedDistributedPairBatchSampler:
         self.game_alpha = game_alpha
         self.class_probability = class_probability or {0: 0.5, 1: 0.5}
         self.delta_probability = delta_probability or {1: 0.15, 2: 0.70, 3: 0.15}
-        self.deduplicate = deduplicate_within_global_batch
+        self.dedup_level = dedup_level
+        self.on_exhaustion = on_exhaustion
         self.epoch = 0
+        self.last_epoch_dedup_failures = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -111,6 +136,8 @@ class BalancedDistributedPairBatchSampler:
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
         global_batch_size = self.local_batch_size * self.world_size
+        self.last_epoch_dedup_failures = 0
+        dedup_active = self.dedup_level != "none"
         for _ in range(self.steps_per_epoch):
             selected: list[int] = []
             used: set[int] = set()
@@ -119,8 +146,17 @@ class BalancedDistributedPairBatchSampler:
             while len(selected) < global_batch_size:
                 index = self._sample_one(rng)
                 attempts += 1
-                if self.deduplicate and index in used and attempts < max_attempts:
-                    continue
+                if dedup_active and index in used:
+                    if attempts < max_attempts:
+                        self.last_epoch_dedup_failures += 1
+                        continue
+                    if self.on_exhaustion == "error":
+                        raise RuntimeError(
+                            "Deduplication exhausted: could not fill a "
+                            "global batch without repeating pair "
+                            f"identities after {max_attempts} attempts."
+                        )
+                    self.last_epoch_dedup_failures += 1
                 selected.append(index)
                 used.add(index)
             start = self.rank * self.local_batch_size

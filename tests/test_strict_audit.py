@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import unittest
+from dataclasses import asdict
 
 from game_cls.data.image_spec import ImageSpec
 from game_cls.data.index_policy import DuplicatePolicy
@@ -10,7 +10,6 @@ from game_cls.data.indexing import (
     validate_audit,
 )
 from game_cls.data.records import FrameRecord
-
 
 SPEC = ImageSpec(width=448, height=208, channels=3)
 POLICY = DuplicatePolicy()
@@ -118,18 +117,33 @@ class StrictAuditTests(unittest.TestCase):
         ):
             validate_audit(audit)
 
-    def test_video_key_overlap_is_optional(self) -> None:
+    def test_video_key_overlap_is_always_fatal(self) -> None:
+        """Cross-split video keys are leakage; no opt-out flag anymore."""
         audit = valid_audit()
         audit["leakage"]["video_keys_across_splits"] = [
             {"game": "game_A", "label": 1, "video_id": "01"}
         ]
-        validate_audit(audit, require_content_hash=True)
-        with self.assertRaisesRegex(RuntimeError, "share video keys"):
-            validate_audit(
-                audit,
-                require_content_hash=True,
-                require_unique_video_keys=True,
-            )
+        with self.assertRaisesRegex(
+            RuntimeError, "share source video keys"
+        ):
+            validate_audit(audit, require_content_hash=True)
+
+    def test_source_video_uid_overlap_is_fatal(self) -> None:
+        """source_video_uid (game::video_id) must not span splits."""
+        audit = valid_audit()
+        audit["leakage"]["source_video_uid_overlap"] = {
+            "train__test": ["game_A::01"],
+            "train__val": [],
+            "val__test": [],
+        }
+        with self.assertRaisesRegex(RuntimeError, "source videos span"):
+            validate_audit(audit)
+        audit["leakage"]["source_video_uid_overlap"] = {
+            "train__test": [],
+            "train__val": [],
+            "val__test": [],
+        }
+        validate_audit(audit)
 
     def test_rejects_insufficient_game_label_delta_coverage(self) -> None:
         audit = valid_audit()
@@ -142,7 +156,8 @@ class StrictAuditTests(unittest.TestCase):
                 minimum_pairs_per_game_label_delta={2: 1},
             )
 
-    def test_same_label_cross_split_is_warning_not_error(self) -> None:
+    def test_same_label_cross_split_is_fatal(self) -> None:
+        """Identical content across splits is leakage, not a warning."""
         duplicates = analyze_content_duplicates(
             {
                 "train": [
@@ -171,7 +186,10 @@ class StrictAuditTests(unittest.TestCase):
         )
         audit = valid_audit()
         audit["duplicates"] = duplicates
-        validate_audit(audit, require_content_hash=True)
+        with self.assertRaisesRegex(
+            RuntimeError, "identical content crosses split boundaries"
+        ):
+            validate_audit(audit, require_content_hash=True)
 
     def test_same_content_with_different_labels_is_fatal(self) -> None:
         duplicates = analyze_content_duplicates(

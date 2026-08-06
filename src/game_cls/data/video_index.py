@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
 
 import numpy as np
 
@@ -70,7 +70,7 @@ def build_video_entries(
         parents = {str(Path(item.path).parent) for item in ordered}
         compact_paths = len(parents) == 1 and all(
             Path(item.path).name == expected
-            for item, expected in zip(ordered, expected_names)
+            for item, expected in zip(ordered, expected_names, strict=False)
         )
         frame_paths = (
             ()

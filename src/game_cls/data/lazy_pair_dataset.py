@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -138,7 +139,7 @@ class LazyTrainingPairDataset:
         )
         samples = []
         for request, images, meta in zip(
-            requests, decoded, metadata
+            requests, decoded, metadata, strict=False
         ):
             if self.transform is not None:
                 with torch.random.fork_rng(devices=[]):
@@ -251,7 +252,7 @@ class EvalPairDataset:
                 "meta": meta,
             }
             for request, images, meta in zip(
-                requests, decoded, metadata
+                requests, decoded, metadata, strict=False
             )
         ]
 

@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="CLSTrainer 项目目的、技术架构与完整使用教程">
-  <title>CLSTrainer · 双帧分类训练教程</title>
+  <meta name="description" content="CLSTrainer 双帧、多游戏二分类训练框架：技术路线、模型接入、配置说明、问题诊断与 NPU 上线教程">
+  <title>CLSTrainer · 从数据到 NPU 上线的完整教程</title>
   <style>
     :root {
       color-scheme: dark;
@@ -12,14 +12,16 @@
       --surface: #0d1a17;
       --surface-2: #12231f;
       --surface-3: #172c27;
+      --surface-soft: rgba(18, 35, 31, .66);
       --line: rgba(166, 219, 199, .16);
-      --line-strong: rgba(166, 219, 199, .32);
+      --line-strong: rgba(166, 219, 199, .34);
       --text: #edf8f3;
       --muted: #9db9ae;
       --accent: #55e6aa;
       --accent-2: #83bfff;
       --warm: #ffcb76;
       --danger: #ff8e8e;
+      --success: #78f0b9;
       --code: #050c0a;
       --shadow: 0 24px 70px rgba(0, 0, 0, .34);
       --radius: 22px;
@@ -28,7 +30,7 @@
     }
 
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; scroll-padding-top: 88px; }
+    html { scroll-behavior: smooth; scroll-padding-top: 86px; }
     body {
       margin: 0;
       font-family: var(--sans);
@@ -40,8 +42,15 @@
       line-height: 1.72;
     }
     a { color: inherit; }
-    button, a { -webkit-tap-highlight-color: transparent; }
-    code { font-family: var(--mono); }
+    button, input, select, a { -webkit-tap-highlight-color: transparent; }
+    code, pre, kbd { font-family: var(--mono); }
+    code.inline {
+      padding: .15em .42em;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255,255,255,.04);
+      font-size: .92em;
+    }
 
     .progress {
       position: fixed;
@@ -58,17 +67,17 @@
       top: 0;
       z-index: 50;
       border-bottom: 1px solid var(--line);
-      background: rgba(7, 17, 15, .82);
+      background: rgba(7, 17, 15, .86);
       backdrop-filter: blur(18px);
     }
     .topbar-inner {
-      width: min(1240px, calc(100% - 36px));
+      width: min(1320px, calc(100% - 32px));
       min-height: 68px;
       margin: auto;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 22px;
+      gap: 18px;
     }
     .brand {
       display: inline-flex;
@@ -77,6 +86,7 @@
       text-decoration: none;
       font-weight: 760;
       letter-spacing: -.02em;
+      white-space: nowrap;
     }
     .brand-mark {
       width: 34px;
@@ -94,16 +104,16 @@
     .topnav {
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 3px;
       overflow-x: auto;
       scrollbar-width: none;
     }
     .topnav::-webkit-scrollbar { display: none; }
     .topnav a {
-      padding: 8px 11px;
+      padding: 8px 10px;
       border-radius: 10px;
       color: var(--muted);
-      font-size: 13px;
+      font-size: 12px;
       text-decoration: none;
       white-space: nowrap;
       transition: .2s ease;
@@ -111,14 +121,15 @@
     .topnav a:hover,
     .topnav a.active {
       color: var(--text);
-      background: rgba(255, 255, 255, .06);
+      background: rgba(255,255,255,.06);
     }
 
     main { overflow: clip; }
-    .wrap { width: min(1160px, calc(100% - 36px)); margin-inline: auto; }
+    .wrap { width: min(1180px, calc(100% - 36px)); margin-inline: auto; }
+    section { padding: 84px 0; border-top: 1px solid var(--line); }
     .hero {
       position: relative;
-      min-height: 650px;
+      min-height: 720px;
       padding: 92px 0 76px;
       display: grid;
       align-items: center;
@@ -126,15 +137,15 @@
     .hero::after {
       content: "";
       position: absolute;
-      width: 420px;
-      height: 420px;
-      right: -190px;
-      top: 70px;
-      border: 1px solid rgba(85, 230, 170, .14);
+      width: 440px;
+      height: 440px;
+      right: -210px;
+      top: 72px;
+      border: 1px solid rgba(85,230,170,.14);
       border-radius: 50%;
       box-shadow:
-        0 0 0 54px rgba(85, 230, 170, .025),
-        0 0 0 108px rgba(131, 191, 255, .018);
+        0 0 0 58px rgba(85,230,170,.025),
+        0 0 0 116px rgba(131,191,255,.018);
       pointer-events: none;
     }
     .eyebrow {
@@ -146,7 +157,7 @@
       border: 1px solid var(--line-strong);
       border-radius: 999px;
       color: var(--accent);
-      background: rgba(85, 230, 170, .06);
+      background: rgba(85,230,170,.06);
       font-family: var(--mono);
       font-size: 12px;
       letter-spacing: .06em;
@@ -161,13 +172,22 @@
       box-shadow: 0 0 12px var(--accent);
     }
     h1 {
-      max-width: 900px;
+      max-width: 1020px;
       margin: 25px 0 20px;
-      font-size: clamp(46px, 7.4vw, 92px);
-      line-height: .98;
-      letter-spacing: -.065em;
+      font-size: clamp(46px, 7vw, 88px);
+      line-height: .99;
+      letter-spacing: -.062em;
       font-weight: 820;
     }
+    h2 {
+      margin: 8px 0 0;
+      font-size: clamp(32px, 4vw, 54px);
+      line-height: 1.06;
+      letter-spacing: -.045em;
+    }
+    h3 { margin: 0 0 12px; font-size: 20px; letter-spacing: -.025em; }
+    h4 { margin: 0 0 8px; font-size: 15px; }
+    p { margin: 0 0 16px; }
     .gradient-text {
       color: transparent;
       background: linear-gradient(110deg, var(--accent), #b7ffe3 45%, var(--accent-2));
@@ -175,7 +195,7 @@
       -webkit-background-clip: text;
     }
     .hero-lead {
-      max-width: 760px;
+      max-width: 850px;
       margin: 0;
       color: var(--muted);
       font-size: clamp(17px, 2vw, 21px);
@@ -184,7 +204,7 @@
       display: flex;
       flex-wrap: wrap;
       gap: 12px;
-      margin-top: 34px;
+      margin-top: 32px;
     }
     .button {
       min-height: 44px;
@@ -196,124 +216,114 @@
       justify-content: center;
       gap: 9px;
       color: var(--text);
-      background: rgba(255, 255, 255, .045);
+      background: rgba(255,255,255,.045);
       text-decoration: none;
       font-size: 14px;
       font-weight: 700;
+      cursor: pointer;
       transition: transform .2s ease, background .2s ease, border-color .2s ease;
     }
-    .button:hover { transform: translateY(-2px); border-color: rgba(85, 230, 170, .6); }
-    .button.primary {
-      color: #052219;
-      border-color: transparent;
-      background: var(--accent);
-      box-shadow: 0 12px 34px rgba(85, 230, 170, .2);
-    }
+    .button:hover { transform: translateY(-2px); border-color: rgba(85,230,170,.6); }
+    .button.primary { color: #052219; border-color: transparent; background: var(--accent); box-shadow: 0 12px 34px rgba(85,230,170,.2); }
+    .button.small-button { min-height: 36px; padding-inline: 12px; font-size: 12px; }
+
     .hero-metrics {
-      margin-top: 58px;
+      margin-top: 54px;
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      background: rgba(13, 26, 23, .72);
+      background: rgba(13,26,23,.72);
       box-shadow: var(--shadow);
       overflow: hidden;
     }
-    .metric {
-      min-height: 126px;
-      padding: 24px;
-      border-right: 1px solid var(--line);
-    }
+    .metric { min-height: 126px; padding: 24px; border-right: 1px solid var(--line); }
     .metric:last-child { border-right: 0; }
-    .metric strong {
-      display: block;
-      color: var(--accent);
-      font-family: var(--mono);
-      font-size: 25px;
-      letter-spacing: -.04em;
-    }
+    .metric strong { display: block; color: var(--accent); font-family: var(--mono); font-size: 24px; letter-spacing: -.04em; }
     .metric span { display: block; margin-top: 7px; color: var(--muted); font-size: 13px; }
 
-    section { padding: 86px 0; border-top: 1px solid var(--line); }
+    .status-strip {
+      margin-top: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(255,255,255,.025);
+      font-size: 12px;
+    }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warm); }
+    .status-dot.done { background: var(--success); }
+
     .section-head {
       display: grid;
-      grid-template-columns: .7fr 1.3fr;
+      grid-template-columns: .72fr 1.28fr;
       gap: 48px;
       align-items: end;
       margin-bottom: 42px;
     }
-    .section-index {
-      color: var(--accent);
-      font-family: var(--mono);
-      font-size: 13px;
-      letter-spacing: .1em;
-    }
-    h2 {
-      margin: 8px 0 0;
-      font-size: clamp(32px, 4vw, 54px);
-      line-height: 1.06;
-      letter-spacing: -.045em;
-    }
+    .section-index { color: var(--accent); font-family: var(--mono); font-size: 13px; letter-spacing: .1em; }
     .section-intro { margin: 0; color: var(--muted); font-size: 17px; }
-    h3 { margin: 0 0 12px; font-size: 20px; letter-spacing: -.025em; }
-    h4 { margin: 0 0 8px; font-size: 15px; }
-    p { margin: 0 0 16px; }
     .muted { color: var(--muted); }
     .small { font-size: 13px; }
+    .tiny { font-size: 11px; }
+    .strong { color: var(--text); font-weight: 700; }
 
+    .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 15px; }
     .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
     .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .stack { display: grid; gap: 16px; }
     .card {
       padding: 25px;
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      background: linear-gradient(145deg, rgba(18, 35, 31, .88), rgba(10, 23, 20, .86));
-      box-shadow: 0 18px 45px rgba(0, 0, 0, .16);
+      background: linear-gradient(145deg, rgba(18,35,31,.88), rgba(10,23,20,.86));
+      box-shadow: 0 18px 45px rgba(0,0,0,.16);
     }
-    .card-kicker {
-      margin-bottom: 17px;
-      color: var(--accent);
-      font-family: var(--mono);
-      font-size: 12px;
-    }
+    .card.emphasis { border-color: rgba(85,230,170,.38); background: linear-gradient(145deg, rgba(34,75,61,.58), rgba(10,23,20,.9)); }
+    .card-kicker { margin-bottom: 16px; color: var(--accent); font-family: var(--mono); font-size: 12px; letter-spacing: .04em; }
     .card p:last-child { margin-bottom: 0; }
-
-    .purpose-card { min-height: 255px; }
-    .purpose-icon {
-      width: 48px;
-      height: 48px;
-      margin-bottom: 35px;
+    .icon-box {
+      width: 46px;
+      height: 46px;
+      margin-bottom: 28px;
       border: 1px solid var(--line-strong);
-      border-radius: 15px;
+      border-radius: 14px;
       display: grid;
       place-items: center;
       color: var(--accent);
-      background: rgba(85, 230, 170, .06);
+      background: rgba(85,230,170,.06);
       font-family: var(--mono);
       font-weight: 800;
     }
+
+    .definition-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .definition {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--surface-soft);
+    }
+    .definition.good { border-color: rgba(85,230,170,.3); }
+    .definition.bad { border-color: rgba(255,142,142,.26); }
+    .definition ul { margin: 12px 0 0; padding-left: 20px; color: var(--muted); }
 
     .architecture {
       padding: 30px;
       border: 1px solid var(--line);
       border-radius: 28px;
-      background: rgba(5, 12, 10, .58);
+      background: rgba(5,12,10,.58);
       box-shadow: var(--shadow);
     }
-    .flow {
-      display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 12px;
-      align-items: stretch;
-    }
-    .flow-node {
-      position: relative;
-      min-height: 176px;
-      padding: 19px;
-      border: 1px solid var(--line);
-      border-radius: 17px;
-      background: var(--surface);
-    }
+    .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
+    .flow-node { position: relative; min-height: 185px; padding: 19px; border: 1px solid var(--line); border-radius: 17px; background: var(--surface); }
     .flow-node:not(:last-child)::after {
       content: "→";
       position: absolute;
@@ -333,273 +343,193 @@
       font-size: 12px;
     }
     .node-number { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-    .flow-node h3 { margin-top: 22px; font-size: 17px; }
-    .flow-node p { color: var(--muted); font-size: 13px; line-height: 1.55; }
-    .flow-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 14px; }
-    .tag {
-      padding: 3px 7px;
-      border-radius: 999px;
-      color: #c7dbd3;
-      background: rgba(255, 255, 255, .055);
-      font-family: var(--mono);
-      font-size: 10px;
-    }
-    .architecture-note {
-      margin-top: 18px;
-      padding: 18px 20px;
-      border-left: 3px solid var(--accent);
-      border-radius: 5px 14px 14px 5px;
-      color: var(--muted);
-      background: rgba(85, 230, 170, .055);
-      font-size: 14px;
-    }
+    .flow-node h3 { margin-top: 16px; }
+    .flow-node p { color: var(--muted); font-size: 13px; }
+    .flow-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 15px; }
+    .tag { padding: 4px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-family: var(--mono); font-size: 10px; }
+    .architecture-note { margin-top: 22px; padding: 16px 18px; border-left: 3px solid var(--accent); color: var(--muted); background: rgba(85,230,170,.04); }
 
-    .layer-list { display: grid; gap: 12px; }
-    .layer {
-      display: grid;
-      grid-template-columns: 140px 1fr;
-      gap: 20px;
-      padding: 18px 20px;
-      border: 1px solid var(--line);
-      border-radius: 15px;
-      background: rgba(13, 26, 23, .66);
-    }
-    .layer-label { color: var(--accent); font-family: var(--mono); font-size: 12px; }
-    .layer strong { display: block; margin-bottom: 5px; }
-    .layer span { color: var(--muted); font-size: 13px; }
+    .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 18px; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; background: rgba(8,18,15,.62); }
+    th, td { padding: 15px 17px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--accent); font-family: var(--mono); font-size: 11px; letter-spacing: .04em; background: rgba(85,230,170,.035); }
+    td { font-size: 13px; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: rgba(255,255,255,.018); }
 
-    .steps { position: relative; display: grid; gap: 18px; }
-    .steps::before {
-      content: "";
-      position: absolute;
-      left: 24px;
-      top: 30px;
-      bottom: 30px;
-      width: 1px;
-      background: linear-gradient(var(--accent), rgba(85, 230, 170, .08));
-    }
-    .step {
-      position: relative;
-      display: grid;
-      grid-template-columns: 50px 1fr;
-      gap: 20px;
-    }
+    .route-card { position: relative; min-height: 290px; display: flex; flex-direction: column; }
+    .route-card .route-use { margin-top: auto; padding-top: 18px; }
+    .route-card.recommended { border-color: rgba(85,230,170,.42); }
+    .route-badge { position: absolute; top: 17px; right: 17px; padding: 4px 8px; border-radius: 999px; color: #052219; background: var(--accent); font-family: var(--mono); font-size: 10px; font-weight: 800; }
+    .route-list { margin: 16px 0 0; padding-left: 19px; color: var(--muted); font-size: 13px; }
+
+    .steps { position: relative; display: grid; gap: 16px; }
+    .steps::before { content: ""; position: absolute; top: 28px; bottom: 28px; left: 27px; width: 1px; background: var(--line); }
+    .step { position: relative; display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 18px; }
     .step-number {
-      z-index: 1;
-      width: 49px;
-      height: 49px;
-      border: 1px solid rgba(85, 230, 170, .5);
-      border-radius: 15px;
+      position: relative;
+      z-index: 2;
+      width: 56px;
+      height: 56px;
+      border: 1px solid var(--line-strong);
+      border-radius: 16px;
       display: grid;
       place-items: center;
       color: var(--accent);
       background: var(--bg);
       font-family: var(--mono);
-      font-size: 13px;
-    }
-    .step-content {
-      padding: 22px 23px;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      background: rgba(13, 26, 23, .7);
-    }
-
-    .code-shell {
-      position: relative;
-      margin-top: 15px;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      background: var(--code);
-      overflow: hidden;
-    }
-    .code-head {
-      min-height: 38px;
-      padding: 0 11px 0 14px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      color: var(--muted);
-      background: rgba(255, 255, 255, .025);
-      font-family: var(--mono);
-      font-size: 11px;
-    }
-    .copy {
-      padding: 5px 8px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      color: var(--muted);
-      background: transparent;
-      cursor: pointer;
-      font: inherit;
-    }
-    .copy:hover { color: var(--text); border-color: var(--line-strong); }
-    pre {
-      margin: 0;
-      padding: 18px;
-      overflow: auto;
-      color: #c9eee0;
-      font-family: var(--mono);
-      font-size: 12px;
-      line-height: 1.65;
-      tab-size: 2;
-    }
-
-    .compare {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-    }
-    .compare-card { position: relative; overflow: hidden; }
-    .compare-card.recommended { border-color: rgba(85, 230, 170, .42); }
-    .ribbon {
-      position: absolute;
-      top: 16px;
-      right: -34px;
-      width: 130px;
-      padding: 4px;
-      transform: rotate(38deg);
-      color: #062018;
-      background: var(--accent);
-      text-align: center;
-      font-size: 9px;
       font-weight: 800;
-      letter-spacing: .08em;
     }
-    .checklist { margin: 18px 0 0; padding: 0; list-style: none; }
-    .checklist li {
-      position: relative;
-      margin: 9px 0;
-      padding-left: 22px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .checklist li::before {
-      content: "✓";
-      position: absolute;
-      left: 0;
-      color: var(--accent);
-      font-family: var(--mono);
-    }
+    .step-content { padding: 23px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-soft); }
+    .step-meta { margin-top: 14px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+    .meta-box { padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.02); }
+    .meta-box strong { display: block; margin-bottom: 4px; color: var(--accent); font-family: var(--mono); font-size: 10px; }
+    .meta-box span { color: var(--muted); font-size: 12px; }
 
-    .table-wrap {
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      overflow-x: auto;
-    }
-    table { width: 100%; border-collapse: collapse; min-width: 700px; background: rgba(13, 26, 23, .62); }
-    th, td { padding: 15px 17px; border-bottom: 1px solid var(--line); text-align: left; font-size: 13px; }
-    th { color: var(--muted); background: rgba(255, 255, 255, .025); font-weight: 650; }
-    tr:last-child td { border-bottom: 0; }
-    td code { color: var(--accent); font-size: 12px; }
+    .code-shell { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: var(--code); }
+    .code-head { min-height: 42px; padding: 0 12px 0 15px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
+    pre { margin: 0; padding: 18px; overflow-x: auto; color: #d9f5e8; font-size: 12px; line-height: 1.62; tab-size: 2; }
+    .copy { min-height: 28px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: rgba(255,255,255,.03); font: inherit; cursor: pointer; }
+    .copy:hover { color: var(--text); border-color: var(--line-strong); }
 
     .callout {
-      margin-top: 20px;
-      padding: 20px 22px;
-      border: 1px solid rgba(255, 203, 118, .27);
+      margin-top: 18px;
+      padding: 18px;
+      border: 1px solid rgba(255,203,118,.27);
       border-radius: 16px;
       display: grid;
       grid-template-columns: auto 1fr;
       gap: 14px;
       color: #e7d7bb;
-      background: rgba(255, 203, 118, .055);
+      background: rgba(255,203,118,.055);
     }
     .callout strong { color: var(--warm); }
-    .callout.danger {
-      border-color: rgba(255, 142, 142, .27);
-      color: #e8c5c5;
-      background: rgba(255, 142, 142, .05);
-    }
+    .callout.danger { border-color: rgba(255,142,142,.27); color: #e8c5c5; background: rgba(255,142,142,.05); }
     .callout.danger strong { color: var(--danger); }
+    .callout.success { border-color: rgba(85,230,170,.3); color: #d5f6e8; background: rgba(85,230,170,.05); }
+    .callout.success strong { color: var(--accent); }
+
+    .checklist { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 9px; }
+    .checklist li { position: relative; padding-left: 22px; color: var(--muted); font-size: 13px; }
+    .checklist li::before { content: "✓"; position: absolute; left: 0; color: var(--accent); font-family: var(--mono); }
+    .warning-list li::before { content: "!"; color: var(--warm); }
+
+    .model-contract { display: grid; gap: 9px; }
+    .contract-row { display: grid; grid-template-columns: 120px 1fr; gap: 16px; padding: 13px 0; border-bottom: 1px solid var(--line); }
+    .contract-row:last-child { border-bottom: 0; }
+    .contract-label { color: var(--accent); font-family: var(--mono); font-size: 11px; }
+    .contract-value { color: var(--muted); font-size: 13px; }
+
+    .inheritance { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; align-items: stretch; }
+    .inherit-node { position: relative; padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
+    .inherit-node:not(:last-child)::after { content: "继承 →"; position: absolute; right: -48px; top: 50%; z-index: 2; width: 84px; text-align: center; color: var(--accent); font-family: var(--mono); font-size: 10px; }
+
+    .recipe-layout { display: grid; grid-template-columns: 310px minmax(0,1fr); gap: 18px; align-items: start; }
+    .recipe-menu { position: sticky; top: 88px; padding: 20px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(13,26,23,.82); }
+    .field-label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+    select, input[type="search"] {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      padding: 0 12px;
+      color: var(--text);
+      background: var(--surface-2);
+      font: inherit;
+      outline: none;
+    }
+    select:focus, input[type="search"]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(85,230,170,.08); }
+    .recipe-panel { display: grid; gap: 16px; }
+    .recipe-title { display: flex; justify-content: space-between; gap: 16px; align-items: start; }
+    .severity { padding: 5px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--warm); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+    .recipe-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .recipe-box { padding: 18px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.02); }
+    .recipe-box h4 { color: var(--accent); }
+
+    .filter-bar { display: grid; grid-template-columns: 1fr 220px; gap: 12px; margin-bottom: 16px; }
+    .parameter-table tr[hidden] { display: none; }
+    .param-name { color: var(--accent-2); white-space: nowrap; }
+    .param-default { font-family: var(--mono); color: var(--muted); white-space: nowrap; }
+
+    .log-line {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0,1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .log-field { padding: 14px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.02); }
+    .log-field code { display: block; color: var(--accent); font-size: 11px; }
+    .log-field span { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+
+    .gate-list { display: grid; gap: 10px; }
+    .gate-item { display: grid; grid-template-columns: 26px 1fr; gap: 11px; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.02); }
+    .gate-mark { width: 24px; height: 24px; border: 1px solid var(--line-strong); border-radius: 8px; display: grid; place-items: center; color: var(--accent); font-family: var(--mono); font-size: 11px; }
+    .gate-item strong { display: block; margin-bottom: 3px; }
+    .gate-item span { color: var(--muted); font-size: 12px; }
 
     .faq { display: grid; gap: 10px; }
-    details {
-      border: 1px solid var(--line);
-      border-radius: 15px;
-      background: rgba(13, 26, 23, .65);
-      overflow: hidden;
-    }
-    summary {
-      padding: 18px 20px;
-      cursor: pointer;
-      font-weight: 700;
-      list-style: none;
-    }
+    details { border: 1px solid var(--line); border-radius: 15px; background: rgba(13,26,23,.65); overflow: hidden; }
+    summary { padding: 18px 20px; cursor: pointer; font-weight: 700; list-style: none; }
     summary::-webkit-details-marker { display: none; }
     summary::after { content: "+"; float: right; color: var(--accent); font-family: var(--mono); }
     details[open] summary::after { content: "−"; }
-    details p { margin: 0; padding: 0 20px 20px; color: var(--muted); font-size: 14px; }
+    details .detail-body { padding: 0 20px 20px; color: var(--muted); font-size: 14px; }
 
-    .final {
-      padding: 82px 0 96px;
-      text-align: center;
-    }
-    .final-box {
-      padding: 52px 28px;
-      border: 1px solid rgba(85, 230, 170, .3);
-      border-radius: 30px;
-      background:
-        linear-gradient(145deg, rgba(85, 230, 170, .09), rgba(131, 191, 255, .045)),
-        var(--surface);
-      box-shadow: var(--shadow);
-    }
-    .final h2 { max-width: 820px; margin-inline: auto; }
-    .final p { max-width: 720px; margin: 18px auto 0; color: var(--muted); }
+    .final { padding: 82px 0 96px; text-align: center; }
+    .final-box { padding: 52px 28px; border: 1px solid rgba(85,230,170,.3); border-radius: 30px; background: linear-gradient(145deg, rgba(85,230,170,.09), rgba(131,191,255,.045)), var(--surface); box-shadow: var(--shadow); }
+    .final h2 { max-width: 850px; margin-inline: auto; }
+    .final p { max-width: 760px; margin: 18px auto 0; color: var(--muted); }
     .final .hero-actions { justify-content: center; margin-top: 28px; }
-    footer {
-      padding: 24px 0 40px;
-      color: var(--muted);
-      text-align: center;
-      font-family: var(--mono);
-      font-size: 11px;
-    }
+    footer { padding: 24px 0 40px; color: var(--muted); text-align: center; font-family: var(--mono); font-size: 11px; }
 
+    @media (max-width: 1040px) {
+      .grid-4 { grid-template-columns: repeat(2,1fr); }
+      .flow { grid-template-columns: 1fr; }
+      .flow-node { min-height: auto; }
+      .flow-node:not(:last-child)::after { content: "↓"; top: auto; bottom: -19px; right: 50%; margin: 0 -13px 0 0; }
+      .recipe-layout { grid-template-columns: 1fr; }
+      .recipe-menu { position: static; }
+      .inheritance { grid-template-columns: 1fr; }
+      .inherit-node:not(:last-child)::after { content: "↓ 继承"; right: auto; left: 50%; top: auto; bottom: -25px; width: 90px; margin-left: -45px; }
+    }
     @media (max-width: 900px) {
-      .topbar-inner { width: min(100% - 22px, 1160px); }
       .brand span:last-child { display: none; }
       .hero { min-height: auto; padding-top: 70px; }
-      .hero-metrics { grid-template-columns: repeat(2, 1fr); }
+      .hero-metrics { grid-template-columns: repeat(2,1fr); }
       .metric:nth-child(2) { border-right: 0; }
       .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
       .section-head { grid-template-columns: 1fr; gap: 18px; }
       .grid-3 { grid-template-columns: 1fr; }
-      .flow { grid-template-columns: 1fr; }
-      .flow-node { min-height: auto; }
-      .flow-node:not(:last-child)::after {
-        content: "↓";
-        top: auto;
-        bottom: -19px;
-        right: 50%;
-        margin: 0 -13px 0 0;
-      }
+      .definition-grid { grid-template-columns: 1fr; }
+      .log-line { grid-template-columns: repeat(2,1fr); }
     }
-
     @media (max-width: 680px) {
-      .wrap { width: min(100% - 24px, 1160px); }
+      .wrap { width: min(100% - 24px, 1180px); }
+      .topbar-inner { width: calc(100% - 20px); }
       .topnav a { padding-inline: 8px; }
       .hero { padding: 56px 0 58px; }
-      h1 { font-size: clamp(42px, 15vw, 65px); }
-      section { padding: 65px 0; }
-      .hero-metrics, .grid-2, .compare { grid-template-columns: 1fr; }
+      h1 { font-size: clamp(42px, 14vw, 64px); }
+      section { padding: 64px 0; }
+      .hero-metrics, .grid-2, .grid-4, .recipe-grid, .filter-bar { grid-template-columns: 1fr; }
       .metric { border-right: 0; border-bottom: 1px solid var(--line); }
       .metric:last-child { border-bottom: 0; }
       .architecture { padding: 16px; }
-      .layer { grid-template-columns: 1fr; gap: 8px; }
-      .step { grid-template-columns: 40px 1fr; gap: 12px; }
-      .steps::before { left: 19px; }
-      .step-number { width: 40px; height: 40px; border-radius: 12px; }
+      .step { grid-template-columns: 42px 1fr; gap: 12px; }
+      .steps::before { left: 20px; }
+      .step-number { width: 42px; height: 42px; border-radius: 12px; font-size: 11px; }
       .step-content { padding: 18px; }
+      .step-meta { grid-template-columns: 1fr; }
+      .contract-row { grid-template-columns: 1fr; gap: 5px; }
       pre { font-size: 11px; }
+      .log-line { grid-template-columns: 1fr; }
     }
-
     @media print {
       :root { color-scheme: light; --bg: #fff; --surface: #fff; --surface-2: #f7faf8; --text: #11231d; --muted: #53665f; --line: #dbe5e1; }
       body { background: #fff; }
-      .topbar, .progress, .copy, .hero-actions { display: none !important; }
+      .topbar, .progress, .copy, .hero-actions, .filter-bar, .recipe-menu { display: none !important; }
       .hero { min-height: 0; padding-top: 40px; }
       section { break-inside: avoid; padding: 42px 0; }
-      .card, .architecture, .step-content, details { box-shadow: none; background: #fff; }
+      .card, .architecture, .step-content, details, .recipe-box { box-shadow: none; background: #fff; }
       details { break-inside: avoid; }
       details > * { display: block !important; }
       pre { color: #173b2f; background: #f4f7f5; white-space: pre-wrap; }
@@ -612,16 +542,19 @@
     <div class="topbar-inner">
       <a class="brand" href="#top" aria-label="返回教程顶部">
         <span class="brand-mark">CLS</span>
-        <span>CLSTrainer Tutorial</span>
+        <span>CLSTrainer Handbook</span>
       </a>
       <nav class="topnav" aria-label="教程目录">
-        <a href="#purpose">目的</a>
-        <a href="#architecture">架构</a>
-        <a href="#data">数据</a>
-        <a href="#quickstart">使用</a>
+        <a href="#overview">概览</a>
+        <a href="#advantages">优势</a>
+        <a href="#routes">路线</a>
+        <a href="#quickstart">上手</a>
+        <a href="#model">模型</a>
+        <a href="#configuration">配置</a>
+        <a href="#recipes">处方</a>
         <a href="#evaluation">评估</a>
-        <a href="#artifacts">产物</a>
-        <a href="#npu">NPU</a>
+        <a href="#npu">上线</a>
+        <a href="#reference">参数</a>
       </nav>
     </div>
   </header>
@@ -629,236 +562,221 @@
   <main id="top">
     <div class="hero wrap">
       <div>
-        <span class="eyebrow">Production-oriented two-frame classification</span>
-        <h1>把两张连续画面，训练成<span class="gradient-text">可信的分类决策</span></h1>
+        <span class="eyebrow">Production handbook · dual-frame classification</span>
+        <h1>从百万帧数据到<span class="gradient-text">可验证的 NPU 训练</span></h1>
         <p class="hero-lead">
-          CLSTrainer 是一个面向多游戏、双帧二分类任务的训练框架。它把数据审计、
-          懒采样、单卡/八卡训练、部署精度评估、错例报告与精确恢复组合成一条可验证的生产链路。
+          CLSTrainer 是面向多游戏、双帧二分类任务的生产训练框架。它不是“把模型塞进训练循环”的薄封装，
+          而是把数据审计、懒采样、冻结主干校验、单卡/八卡训练、部署阈值评估、错例报告和精确恢复组成一条可验收的链路。
         </p>
         <div class="hero-actions">
-          <a class="button primary" href="#quickstart">开始使用 <span aria-hidden="true">→</span></a>
-          <a class="button" href="#architecture">查看技术架构</a>
+          <a class="button primary" href="#quickstart">从零跑通 <span aria-hidden="true">→</span></a>
+          <a class="button" href="#recipes">按问题改配置</a>
+          <a class="button" href="#advantages">先看项目优势</a>
         </div>
         <div class="hero-metrics" aria-label="核心技术规格">
-          <div class="metric"><strong>2 × RGB</strong><span>每个样本由两张连续画面组成</span></div>
-          <div class="metric"><strong>448 × 208</strong><span>单帧 tensor 为 [3, 208, 448]</span></div>
-          <div class="metric"><strong>[B, 2]</strong><span>模型输出二分类 logits</span></div>
-          <div class="metric"><strong>p₁ &gt; 0.99</strong><span>固定业务分数判定规则</span></div>
+          <div class="metric"><strong>2 × RGB</strong><span>image0 与 image1 同时输入，捕捉时间变化</span></div>
+          <div class="metric"><strong>448 × 208</strong><span>单帧为 [3,208,448]，不静默交换宽高</span></div>
+          <div class="metric"><strong>[B, 2]</strong><span>模型输出二分类 logits，接口严格校验</span></div>
+          <div class="metric"><strong>p₁ &gt; 0.99</strong><span>固定业务分数规则，训练与评估围绕它对齐</span></div>
+        </div>
+        <div class="status-strip" aria-label="实现与验收状态说明">
+          <span class="status-chip"><span class="status-dot done"></span>CPU CI：自动测试</span>
+          <span class="status-chip"><span class="status-dot done"></span>NPU spawn：代码强制</span>
+          <span class="status-chip"><span class="status-dot"></span>1P / 8P：需在目标服务器验收</span>
+          <span class="status-chip"><span class="status-dot"></span>PNG / packed：需同机 A/B</span>
         </div>
       </div>
     </div>
 
-    <section id="purpose">
+    <section id="overview">
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">01 / PURPOSE</span>
-            <h2>项目要解决什么</h2>
+            <span class="section-index">01 / OVERVIEW</span>
+            <h2>30 秒理解这个项目</h2>
           </div>
           <p class="section-intro">
-            目标并非只让模型“跑起来”，而是让百万帧数据、严格阈值、多游戏公平性和
-            NPU 分布式训练在同一套可审计契约下工作。
+            先明确项目边界。CLSTrainer 针对固定的双帧、多游戏、二分类业务做深度工程化；它不是自动适配任意模型、任意尺寸和任意任务的通用 Trainer。
           </p>
         </div>
-        <div class="grid-3">
-          <article class="card purpose-card">
-            <div class="purpose-icon" aria-hidden="true">01</div>
-            <h3>捕捉时间变化</h3>
-            <p class="muted">
-              单张画面可能缺少动作上下文。框架同时输入 image0 与 image1，让模型学习两帧之间的变化，而不仅是静态纹理。
-            </p>
+
+        <div class="definition-grid">
+          <article class="definition good">
+            <div class="card-kicker">它是什么</div>
+            <h3>一条可审计、可恢复、可部署的训练链路</h3>
+            <ul>
+              <li>输入两张连续画面，学习帧间变化而非仅靠静态纹理。</li>
+              <li>支持多游戏数据平衡，防止大游戏样本淹没小数据游戏。</li>
+              <li>支持 CPU/CUDA 调试、Ascend 单卡与 HCCL 八卡训练。</li>
+              <li>固定以第二类 Softmax 分数严格大于 0.99 作为业务判定。</li>
+            </ul>
           </article>
-          <article class="card purpose-card">
-            <div class="purpose-icon" aria-hidden="true">08</div>
-            <h3>扩展到多卡训练</h3>
-            <p class="muted">
-              同一套入口支持 CPU/CUDA 调试、Ascend 单卡和 HCCL 八卡训练，并保留每个 rank 的随机状态以实现精确恢复。
-            </p>
+          <article class="definition bad">
+            <div class="card-kicker">它不是什么</div>
+            <h3>不是无约束的通用分类框架</h3>
+            <ul>
+              <li>不会自动 resize、自动交换宽高或猜测模型输入格式。</li>
+              <li>不会用 <code class="inline">strict=False</code> 悄悄忽略冻结主干缺失。</li>
+              <li>不会把参与选模的 validation 当作无偏测试集；test 只在训练结束后评估一次。</li>
+              <li>不会保证 packed 在所有存储和采样模式下都一定更快。</li>
+            </ul>
           </article>
-          <article class="card purpose-card">
-            <div class="purpose-icon" aria-hidden="true">99</div>
-            <h3>让指标可以解释</h3>
-            <p class="muted">
-              除全局 F1 外，同时观察 macro-game、worst-game、校准指标和按视频错例，避免大游戏掩盖小游戏退化。
-            </p>
+        </div>
+
+        <div class="grid-4" style="margin-top:18px">
+          <article class="card">
+            <div class="icon-box">IN</div>
+            <h3>输入契约</h3>
+            <p class="muted">每个 batch 形状为 <code>[B,2,3,208,448]</code>，两帧执行一致的数据增强。</p>
+          </article>
+          <article class="card">
+            <div class="icon-box">OUT</div>
+            <h3>输出契约</h3>
+            <p class="muted">模型必须返回 <code>[B,2]</code> logits；框架直接拒绝其他输出形状。</p>
+          </article>
+          <article class="card">
+            <div class="icon-box">CLS</div>
+            <h3>训练契约</h3>
+            <p class="muted">默认只训练名称包含小写 <code>cls</code> 的参数，其余主干被冻结。</p>
+          </article>
+          <article class="card">
+            <div class="icon-box">99</div>
+            <h3>部署契约</h3>
+            <p class="muted"><code>softmax(logits)[:,1] &gt; 0.99</code> 才判为正类；0.99 是业务分数，不等同于真实概率。</p>
           </article>
         </div>
       </div>
     </section>
 
-    <section id="architecture">
+    <section id="advantages">
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">02 / ARCHITECTURE</span>
-            <h2>从文件到决策的技术架构</h2>
+            <span class="section-index">02 / WHY CLSTRAINER</span>
+            <h2>项目做了什么，为什么值得使用</h2>
           </div>
           <p class="section-intro">
-            整体采用“离线索引 + 在线懒采样 + 设备端训练 + 分布式流式评估”的分层设计，
-            将大规模数据的内存压力和评估报告的 I/O 压力拆开处理。
+            项目的价值不在某个单独模块，而在于把“普通训练脚本容易静默出错的地方”全部变成显式契约、报告或停止条件。
           </p>
         </div>
 
-        <div class="architecture">
-          <div class="flow" aria-label="CLSTrainer 核心数据流">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>维度</th><th>普通训练脚本</th><th>CLSTrainer 的技术路线</th><th>直接收益</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>百万帧数据</td><td>预生成所有 pair 或每次递归扫描</td><td>Frame/Video Parquet + batch 时懒生成 PairRequest</td><td>内存随视频索引增长，而不是随全部 pair 数增长</td></tr>
+              <tr><td>数据正确性</td><td>文件能打开就训练</td><td>尺寸、命名、目录、重复内容、跨 split 泄漏与 delta 覆盖审计</td><td>在训练前发现错误标注、失效数据和评估污染</td></tr>
+              <tr><td>多游戏平衡</td><td>全局随机抽样</td><td>delta → game → label → video 分层采样，支持 game_alpha</td><td>控制大游戏与小游戏的训练权重</td></tr>
+              <tr><td>多卡一致性</td><td>各 rank 独立随机抽样</td><td>确定性全局 batch，再按 rank 切片</td><td>避免多卡重复、便于复现和精确恢复</td></tr>
+              <tr><td>预训练主干</td><td><code>strict=False</code> 后继续</td><td>所有非 cls 参数和 buffer 必须 100% 加载</td><td>避免随机初始化且被冻结的主干被误当作预训练模型</td></tr>
+              <tr><td>NPU DataLoader</td><td>沿用 Linux 默认 fork</td><td>NPU 多 worker 强制 spawn、180 秒 timeout、train/eval worker 分离</td><td>避免 NPU runtime 初始化后的 worker 静默死锁</td></tr>
+              <tr><td>评估</td><td>只看全局 accuracy/F1</td><td>global、macro-game、worst-game、video、AUC、Brier、ECE、margin 分位数，以及 train probe vs validation 的泛化差距</td><td>发现小游戏、特定标签或特定视频的退化，并区分过拟合与置信度漂移</td></tr>
+              <tr><td>错例</td><td>内存收集或手工挑选</td><td>分 rank 流式 Parquet + 合并 + HTML preview</td><td>大规模 full test 不需要在 rank 0 保存百万 Python 对象</td></tr>
+              <tr><td>恢复</td><td>模型 + optimizer</td><td>scheduler、scaler、sampler 位置、各 rank RNG 与基础权重哈希</td><td>中断后从同一采样位置继续，而不是近似恢复</td></tr>
+              <tr><td>部署产物</td><td>训练 checkpoint 与模型权重混杂</td><td>纯 state_dict 与完整 checkpoint 分离</td><td>部署侧无需加载 optimizer、sampler 或训练状态</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="architecture" style="margin-top:20px">
+          <div class="flow" aria-label="CLSTrainer 核心技术路线">
             <article class="flow-node">
               <span class="node-number">STAGE 01</span>
               <h3>原始画面</h3>
-              <p>按 split、game、label 组织 PNG，文件名编码 video 与 frame ID。</p>
-              <div class="flow-tags"><span class="tag">PNG</span><span class="tag">SHA-256</span></div>
+              <p>按 split、game、label 放置 PNG；文件名编码 video ID 和 frame ID。</p>
+              <div class="flow-tags"><span class="tag">PNG</span><span class="tag">448×208</span></div>
             </article>
             <article class="flow-node">
               <span class="node-number">STAGE 02</span>
               <h3>索引与审计</h3>
-              <p>生成 frame/video Parquet，检查尺寸、泄漏和 game × label × delta 覆盖。</p>
-              <div class="flow-tags"><span class="tag">Parquet</span><span class="tag">Audit</span></div>
+              <p>生成 frame/video Parquet，计算内容哈希，验证尺寸、泄漏和 pair 覆盖。</p>
+              <div class="flow-tags"><span class="tag">Parquet</span><span class="tag">SHA-256</span></div>
             </article>
             <article class="flow-node">
               <span class="node-number">STAGE 03</span>
               <h3>懒采样</h3>
-              <p>按 game → label → video → delta 采样，只生成当前 batch 的 PairRequest。</p>
+              <p>按配置实时生成当前 batch 的 pair；记录实际 delta 与 game-label 分布。</p>
               <div class="flow-tags"><span class="tag">Deterministic</span><span class="tag">Balanced</span></div>
             </article>
             <article class="flow-node">
               <span class="node-number">STAGE 04</span>
               <h3>训练</h3>
-              <p>两帧一致增强，uint8 传输后转 BF16/FP16；只训练名称包含 cls 的参数。</p>
-              <div class="flow-tags"><span class="tag">DDP</span><span class="tag">AMP</span><span class="tag">HCCL</span></div>
+              <p>CPU 保持 uint8，H2D 后转 BF16/FP16；只更新 cls 参数并保护冻结主干。</p>
+              <div class="flow-tags"><span class="tag">AMP</span><span class="tag">DDP</span><span class="tag">HCCL</span></div>
             </article>
             <article class="flow-node">
               <span class="node-number">STAGE 05</span>
               <h3>评估与产物</h3>
-              <p>直方图 AUC、组合选模、流式错例和纯 state_dict/checkpoint 双产物。</p>
+              <p>train probe 对照泛化差距，validation 驱动选模与 early stopping，test 训练后单独评估一次。</p>
               <div class="flow-tags"><span class="tag">F1@0.99</span><span class="tag">ECE</span><span class="tag">HTML</span></div>
             </article>
           </div>
           <div class="architecture-note">
-            关键约束：<strong>0.99 是业务分数阈值，不等同于真实概率 99%</strong>。
-            训练采用 50/50 平衡采样和阈值间隔损失，因此长期跨版本比较应增加自然分布 calibration 集。
+            <strong>核心原则：</strong>任何可能让结果失真的隐式行为，都应转换为配置、审计结果、日志或明确异常。
           </div>
-        </div>
-
-        <div class="grid-2" style="margin-top:18px">
-          <article class="card">
-            <div class="card-kicker">MODEL CONTRACT</div>
-            <h3>模型接口</h3>
-            <div class="layer-list">
-              <div class="layer">
-                <span class="layer-label">INPUT</span>
-                <div><strong>image0, image1</strong><span>两个 `[B, 3, H, W]` Tensor</span></div>
-              </div>
-              <div class="layer">
-                <span class="layer-label">OUTPUT</span>
-                <div><strong>logits</strong><span>形状必须为 `[B, 2]`</span></div>
-              </div>
-              <div class="layer">
-                <span class="layer-label">TRAINABLE</span>
-                <div><strong>名称包含 cls</strong><span>其余主干参数被冻结并检查不变性</span></div>
-              </div>
-            </div>
-          </article>
-          <article class="card">
-            <div class="card-kicker">LOSS &amp; SELECTION</div>
-            <h3>优化目标</h3>
-            <div class="layer-list">
-              <div class="layer">
-                <span class="layer-label">LOSS</span>
-                <div><strong>CE + threshold margin</strong><span>阈值损失包含 warmup 与 ramp</span></div>
-              </div>
-              <div class="layer">
-                <span class="layer-label">BEST</span>
-                <div><strong>Composite score</strong><span>global、macro-game 与 worst-game F1</span></div>
-              </div>
-              <div class="layer">
-                <span class="layer-label">GUARD</span>
-                <div><strong>worst-game floor</strong><span>建立基线后设置非零下限</span></div>
-              </div>
-            </div>
-          </article>
         </div>
       </div>
     </section>
 
-    <section id="data">
+    <section id="routes">
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">03 / DATA</span>
-            <h2>数据格式与存储后端</h2>
+            <span class="section-index">03 / CHOOSE A ROUTE</span>
+            <h2>先选择你当前要走的路线</h2>
           </div>
           <p class="section-intro">
-            先保证数据正确，再讨论吞吐。图像规格、扫描规则和重复数据严重程度都来自
-            同一个配置；严格审计只阻止 errors，warnings 会保留并继续训练。
+            不同阶段不要使用同一套配置。第一次验证、真实单卡、数据吞吐优化和八卡长跑各有独立入口。
           </p>
         </div>
 
-        <div class="grid-2">
-          <article class="card">
-            <div class="card-kicker">DIRECTORY CONTRACT</div>
-            <h3>目录与文件名</h3>
-            <div class="code-shell">
-              <div class="code-head"><span>dataset tree</span><button class="copy" type="button">复制</button></div>
-              <pre><code>train/
-├── game_A/
-│   ├── 0/
-│   │   ├── 0100001.png
-│   │   └── 0100003.png
-│   └── 1/
-│       ├── 0200001.png
-│       └── 0200003.png
-└── game_B/...
-
-test/
-└── game_A/...</code></pre>
-            </div>
-            <p class="muted small" style="margin-top:14px">
-              文件名格式：两位 video ID + 五位 frame ID + .png。MP4、JSON 和缓存目录
-              按策略忽略；非法命名的直接 PNG 仍会报错。
-            </p>
-          </article>
-
-          <article class="card">
-            <div class="card-kicker">PREPARATION ORDER</div>
-            <h3>百万帧推荐准备顺序</h3>
-            <div class="steps" style="margin-top:22px">
-              <div class="step"><div class="step-number">1</div><div class="step-content"><strong>复制到本地 NVMe</strong><div class="muted small">避免远程随机小文件链路反复扫描。</div></div></div>
-              <div class="step"><div class="step-number">2</div><div class="step-content"><strong>建索引并计算 SHA-256</strong><div class="muted small">同内容异标签报错；同标签重复只警告。</div></div></div>
-              <div class="step"><div class="step-number">3</div><div class="step-content"><strong>按需生成 packed 数据</strong><div class="muted small">消除训练热路径中的 PNG 解码。</div></div></div>
-              <div class="step"><div class="step-number">4</div><div class="step-content"><strong>审计后再训练</strong><div class="muted small">确认 game × label × delta 覆盖。</div></div></div>
-            </div>
-          </article>
-        </div>
-
-        <div class="compare" style="margin-top:18px">
-          <article class="card compare-card">
-            <div class="card-kicker">BACKEND A</div>
-            <h3>PNG · 默认与兼容</h3>
-            <p class="muted">无需额外转换，适合首次接入、调试和小数据集。</p>
-            <ul class="checklist">
-              <li>直接使用原始路径和 Image.open</li>
-              <li>错例 HTML 可直接引用原图</li>
-              <li>吞吐可能受 PNG 解码与小文件 I/O 限制</li>
+        <div class="grid-4">
+          <article class="card route-card">
+            <div class="card-kicker">ROUTE A · LOGIC</div>
+            <h3>验证代码与训练逻辑</h3>
+            <p class="muted">没有真实数据或真实模型时，使用合成数据验证训练、评估和 checkpoint 主流程。</p>
+            <ul class="route-list">
+              <li>CPU 或 CUDA</li>
+              <li>Demo model</li>
+              <li>2～10 step</li>
             </ul>
-            <div class="code-shell">
-              <div class="code-head"><span>config</span><button class="copy" type="button">复制</button></div>
-              <pre><code>data:
-  backend: png</code></pre>
-            </div>
+            <div class="route-use"><code class="inline">configs/cuda_debug.yaml</code></div>
           </article>
-          <article class="card compare-card recommended">
-            <span class="ribbon">HIGH THROUGHPUT</span>
-            <div class="card-kicker">BACKEND B</div>
-            <h3>packed_uint8 · 高吞吐</h3>
-            <p class="muted">预解码为固定 CHW uint8 shard，使用整数 frame index 与 LRU memmap。</p>
-            <ul class="checklist">
-              <li>不建立百万项路径字典</li>
-              <li>shard 路径相对 manifest，可整体移动</li>
-              <li>HTML 仅为有限错例导出 preview PNG</li>
+          <article class="card route-card recommended">
+            <span class="route-badge">START HERE</span>
+            <div class="card-kicker">ROUTE B · 1P</div>
+            <h3>单卡真实数据训练</h3>
+            <p class="muted">完成索引、真实模型和 checkpoint 接入后，先通过单卡 smoke，再开始正式单卡训练。</p>
+            <ul class="route-list">
+              <li>真实 PNG</li>
+              <li>Spawn worker</li>
+              <li>Probe / val_quick / val_full smoke</li>
             </ul>
-            <div class="code-shell">
-              <div class="code-head"><span>production profile</span><button class="copy" type="button">复制</button></div>
-              <pre><code>--config configs/npu_production_packed.yaml</code></pre>
-            </div>
+            <div class="route-use"><code class="inline">configs/npu_1p.yaml</code></div>
+          </article>
+          <article class="card route-card">
+            <div class="card-kicker">ROUTE C · DATA</div>
+            <h3>解决 PNG 输入瓶颈</h3>
+            <p class="muted">只有确认 host_data_wait 高、CPU 解码或小文件 I/O 限制 NPU 后，再打包为 uint8 shard。</p>
+            <ul class="route-list">
+              <li>本地 NVMe</li>
+              <li>memmap shard</li>
+              <li>必须与 PNG 同机 A/B</li>
+            </ul>
+            <div class="route-use"><code class="inline">configs/npu_production_packed.yaml</code></div>
+          </article>
+          <article class="card route-card">
+            <div class="card-kicker">ROUTE D · 8P</div>
+            <h3>八卡 HCCL 训练</h3>
+            <p class="muted">只有单卡 model、DataLoader、probe/validation 评估和恢复全部通过后，才进入八卡通信验证。</p>
+            <ul class="route-list">
+              <li>torchrun 8 rank</li>
+              <li>每 rank 独立 NPU</li>
+              <li>报告合并与无死锁退出</li>
+            </ul>
+            <div class="route-use"><code class="inline">configs/npu_8p.yaml</code></div>
           </article>
         </div>
       </div>
@@ -868,12 +786,11 @@ test/
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">04 / QUICK START</span>
-            <h2>从零到第一次训练</h2>
+            <span class="section-index">04 / END-TO-END QUICK START</span>
+            <h2>从空仓库到一次真实训练</h2>
           </div>
           <p class="section-intro">
-            以下命令按推荐执行顺序排列。NPU 环境必须先安装与服务器 CANN 版本匹配的
-            PyTorch 和 TorchNPU，项目本身不会替换它们。
+            每一步都包含输入、命令、预期产物和验收条件。不要跳过前置门槛直接启动多 epoch 训练。
           </p>
         </div>
 
@@ -881,17 +798,25 @@ test/
           <article class="step">
             <div class="step-number">01</div>
             <div class="step-content">
-              <h3>安装项目</h3>
-              <p class="muted small">基础安装用于 Ascend；开发机可安装 CUDA 或 dev 额外依赖。</p>
+              <h3>准备 Python 与设备环境</h3>
+              <p class="muted small">Ascend 环境先安装与当前 CANN 匹配的 PyTorch 和 TorchNPU；基础安装不会替换它们。</p>
               <div class="code-shell">
                 <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
-                <pre><code>python -m pip install -e .
+                <pre><code># Ascend：先激活已经配置好 torch + torch_npu 的环境
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python -m pip install -e .
 
 # CUDA 开发环境
 python -m pip install -e ".[cuda]"
 
 # CPU CI / 测试环境
-python -m pip install -e ".[dev]"</code></pre>
+python -m pip install -e ".[dev]"
+python -m pytest</code></pre>
+              </div>
+              <div class="step-meta">
+                <div class="meta-box"><strong>输入</strong><span>可用 Python 环境与设备运行时</span></div>
+                <div class="meta-box"><strong>验收</strong><span><code>import game_cls</code> 成功</span></div>
+                <div class="meta-box"><strong>失败</strong><span>先解决 torch / torch_npu 版本匹配</span></div>
               </div>
             </div>
           </article>
@@ -899,13 +824,55 @@ python -m pip install -e ".[dev]"</code></pre>
           <article class="step">
             <div class="step-number">02</div>
             <div class="step-content">
-              <h3>建立索引并执行审计</h3>
+              <h3>按契约放置数据</h3>
+              <div class="grid-2">
+                <div class="code-shell">
+                  <div class="code-head"><span>directory tree</span><button class="copy" type="button">复制</button></div>
+                  <pre><code>&lt;DATA_ROOT&gt;/
+├── train/
+│   ├── game_A/
+│   │   ├── 0/
+│   │   │   ├── 0100001.png
+│   │   │   └── 0100003.png
+│   │   └── 1/
+│   │       ├── 0200001.png
+│   │       └── 0200003.png
+│   └── game_B/...
+├── val/
+│   └── game_A/...
+└── test/
+    └── game_A/...</code></pre>
+                </div>
+                <div class="card" style="box-shadow:none">
+                  <div class="card-kicker">DATA CONTRACT</div>
+                  <ul class="checklist">
+                    <li>目录必须是 <code>split/game/0|1/frame.png</code>（split 为 train/val/test）。</li>
+                    <li>文件名是两位 video ID + 五位 frame ID。</li>
+                    <li>生产尺寸固定为 width=448、height=208、channels=3。</li>
+                    <li>系统不自动 resize，也不交换 width/height。</li>
+                    <li>MP4、JSON 和缓存可按策略忽略；非法 PNG 命名仍是 error。</li>
+                  </ul>
+                </div>
+              </div>
+              <div class="step-meta">
+                <div class="meta-box"><strong>输入</strong><span>train/val/test 原始 PNG</span></div>
+                <div class="meta-box"><strong>验收</strong><span>每个游戏两类均存在合法 pair</span></div>
+                <div class="meta-box"><strong>建议</strong><span>百万小文件先复制到本地 NVMe</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">03</div>
+            <div class="step-content">
+              <h3>建立索引并执行严格审计</h3>
               <div class="code-shell">
                 <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
                 <pre><code>python tools/build_index.py \
   --config configs/npu_production.yaml \
-  --train-root /local_nvme/data/train \
-  --test-root /local_nvme/data/test \
+  --train-root &lt;DATA_ROOT&gt;/train \
+  --val-root &lt;DATA_ROOT&gt;/val \
+  --test-root &lt;DATA_ROOT&gt;/test \
   --output-dir indexes
 
 python tools/audit_dataset.py \
@@ -914,24 +881,14 @@ python tools/audit_dataset.py \
   --output-dir reports/data_audit \
   --strict</code></pre>
               </div>
-            </div>
-          </article>
-
-          <article class="step">
-            <div class="step-number">03</div>
-            <div class="step-content">
-              <h3>可选：生成 packed 数据</h3>
-              <div class="code-shell">
-                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
-                <pre><code>python tools/pack_dataset.py \
-  --config configs/npu_production.yaml \
-  --frame-index indexes/train_frames.parquet \
-  --output-dir /local_nvme/train_packed
-
-python tools/pack_dataset.py \
-  --config configs/npu_production.yaml \
-  --frame-index indexes/test_frames.parquet \
-  --output-dir /local_nvme/test_packed</code></pre>
+              <div class="step-meta">
+                <div class="meta-box"><strong>生成</strong><span>frame/video Parquet 与 audit.json</span></div>
+                <div class="meta-box"><strong>验收</strong><span>看到 <code>Strict dataset audit passed.</code></span></div>
+                <div class="meta-box"><strong>重建条件</strong><span>尺寸、扫描或重复策略发生变化</span></div>
+              </div>
+              <div class="callout">
+                <span aria-hidden="true">◆</span>
+                <div><strong>重复数据与泄漏规则</strong><div class="small">同内容异标签是 error；相同 SHA-256 内容跨 split、同一源视频（source_video_uid = game::video_id）横跨 train/val/test 都是 error，训练前必须解决；split 内重复是 warning；仅文件名相同只做 info。</div></div>
               </div>
             </div>
           </article>
@@ -939,15 +896,23 @@ python tools/pack_dataset.py \
           <article class="step">
             <div class="step-number">04</div>
             <div class="step-content">
-              <h3>先跑 CPU/CUDA 合成数据 smoke</h3>
+              <h3>接入真实模型和基础 checkpoint</h3>
+              <p class="muted small">模型文件建议放入 <code>src/game_cls/model/</code>；完整示例见下一章节。</p>
               <div class="code-shell">
-                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
-                <pre><code>python tools/train.py \
-  --config configs/cuda_debug.yaml \
-  train.max_steps=2 \
-  train.steps_per_epoch=2 \
-  evaluation.quick_test_every_steps=1 \
-  evaluation.full_test_every_steps=2</code></pre>
+                <div class="code-head"><span>configs/npu_production.yaml</span><button class="copy" type="button">复制</button></div>
+                <pre><code>model:
+  factory: game_cls.model.my_classifier:build_model
+  checkpoint_path: &lt;ABSOLUTE_CHECKPOINT_PATH&gt;
+  trainable_name_contains: cls
+  num_classes: 2
+  freeze_backbone_batchnorm_stats: true
+  freeze_cls_batchnorm_stats: true
+  require_pretrained_backbone: true</code></pre>
+              </div>
+              <div class="step-meta">
+                <div class="meta-box"><strong>验收</strong><span>factory 可导入，forward 输出 [B,2]</span></div>
+                <div class="meta-box"><strong>权重</strong><span>所有非 cls 状态覆盖率必须为 100%</span></div>
+                <div class="meta-box"><strong>禁止</strong><span>不要在 factory 中调用 .npu() 或 set_device()</span></div>
               </div>
             </div>
           </article>
@@ -955,20 +920,363 @@ python tools/pack_dataset.py \
           <article class="step">
             <div class="step-number">05</div>
             <div class="step-content">
-              <h3>接入真实模型</h3>
-              <p class="muted small">
-                修改生产配置中的 factory 与 checkpoint。工厂函数必须返回接受两张图并输出 `[B,2]` 的 Module。
-              </p>
+              <h3>运行真实数据 2-step 基线</h3>
+              <p class="muted small">先关闭 worker、增强、评估和 checkpoint，只验证数据、模型、NPU forward/backward 与 optimizer。</p>
               <div class="code-shell">
-                <div class="code-head"><span>configs/npu_production.yaml</span><button class="copy" type="button">复制</button></div>
-                <pre><code>model:
-  factory: your_package.your_module:build_model
-  checkpoint_path: /models/pretrained_backbone.pth
-  trainable_name_contains: cls
-  require_pretrained_backbone: true</code></pre>
+                <div class="code-head"><span>single-process baseline</span><button class="copy" type="button">复制</button></div>
+                <pre><code>export ASCEND_RT_VISIBLE_DEVICES=0
+
+python -u tools/train.py \
+  --config configs/npu_production.yaml \
+  model.factory=game_cls.model.my_classifier:build_model \
+  model.checkpoint_path=&lt;ABSOLUTE_CHECKPOINT_PATH&gt; \
+  train.max_steps=2 \
+  train.steps_per_epoch=2 \
+  train.local_batch_size=2 \
+  train.log_every_steps=1 \
+  dataloader.train.num_workers=0 \
+  dataloader.eval.num_workers=0 \
+  augmentation.enabled=false \
+  evaluation.train_probe_every_steps=0 \
+  evaluation.val_quick_every_steps=0 \
+  evaluation.val_full_every_steps=0 \
+  evaluation.val_full_at_end=false \
+  checkpoint.save_last_every_steps=0 \
+  experiment.output_dir=runs/npu_baseline</code></pre>
+              </div>
+              <div class="step-meta">
+                <div class="meta-box"><strong>验收</strong><span>step 1/2 和 step 2/2 均完成</span></div>
+                <div class="meta-box"><strong>输入</strong><span>首 batch shape 必须为 [B,2,3,208,448]</span></div>
+                <div class="meta-box"><strong>失败</strong><span>按日志定位 H2D、forward、backward 或 optimizer</span></div>
               </div>
             </div>
           </article>
+
+          <article class="step">
+            <div class="step-number">06</div>
+            <div class="step-content">
+              <h3>运行固定单卡 smoke</h3>
+              <div class="code-shell">
+                <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+                <pre><code>bash scripts/smoke_npu_1p.sh</code></pre>
+              </div>
+              <p class="muted small" style="margin-top:14px">脚本依次执行：无 worker 基线 → spawn 1 worker → spawn 2 workers + 增强 → val_quick → val_full + checkpoint。</p>
+              <div class="step-meta">
+                <div class="meta-box"><strong>关键日志</strong><span><code>[DATALOADER] first batch ready</code></span></div>
+                <div class="meta-box"><strong>验收</strong><span>probe/val_quick/val_full 报告和 checkpoint 均生成</span></div>
+                <div class="meta-box"><strong>停止条件</strong><span>任何阶段 timeout 或异常都不进入长跑</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">07</div>
+            <div class="step-content">
+              <h3>启动正式单卡或八卡训练</h3>
+              <div class="grid-2">
+                <div class="code-shell">
+                  <div class="code-head"><span>1P</span><button class="copy" type="button">复制</button></div>
+                  <pre><code>bash scripts/run_npu_1p.sh</code></pre>
+                </div>
+                <div class="code-shell">
+                  <div class="code-head"><span>8P · only after smoke</span><button class="copy" type="button">复制</button></div>
+                  <pre><code>bash scripts/smoke_npu_8p.sh
+bash scripts/run_npu_8p.sh</code></pre>
+                </div>
+              </div>
+              <div class="callout danger">
+                <span aria-hidden="true">!</span>
+                <div><strong>八卡不是单卡命令的简单放大</strong><div class="small">必须验证 8 个 rank 的 first batch、HCCL 归约、probe/validation 评估、报告合并、checkpoint 保存和无死锁退出。</div></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="step">
+            <div class="step-number">08</div>
+            <div class="step-content">
+              <h3>从 checkpoint 精确恢复</h3>
+              <div class="code-shell">
+                <div class="code-head"><span>resume</span><button class="copy" type="button">复制</button></div>
+                <pre><code>python -u tools/train.py \
+  --config configs/npu_1p.yaml \
+  train.resume_path=runs/&lt;RUN_NAME&gt;/checkpoints/checkpoint_last.pth \
+  train.max_steps=&lt;NEW_TOTAL_STEP&gt;</code></pre>
+              </div>
+              <p class="muted small" style="margin-top:14px">恢复会校验基础 checkpoint 哈希和可训练状态集合，并恢复 optimizer、scheduler、scaler、sampler 位置及各 rank 随机状态。</p>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="model">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">05 / MODEL INTEGRATION</span>
+            <h2>如何接入你的真实模型</h2>
+          </div>
+          <p class="section-intro">
+            模型接入最容易出现模块路径、forward 接口、cls 命名和 checkpoint key 不一致。下面给出仓库内可以直接采用的适配器形式。
+          </p>
+        </div>
+
+        <div class="grid-2">
+          <article class="card">
+            <div class="card-kicker">FILE LOCATION</div>
+            <h3>建议目录</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>project tree</span><button class="copy" type="button">复制</button></div>
+              <pre><code>src/game_cls/
+├── __init__.py
+└── model/
+    ├── __init__.py
+    ├── builder.py
+    └── my_classifier.py</code></pre>
+            </div>
+            <p class="muted small" style="margin-top:14px">创建文件后执行 <code>python -m pip install -e .</code>，确保当前环境导入的是这个仓库。</p>
+          </article>
+          <article class="card">
+            <div class="card-kicker">MODEL CONTRACT</div>
+            <h3>框架要求</h3>
+            <div class="model-contract">
+              <div class="contract-row"><div class="contract-label">FACTORY</div><div class="contract-value"><code>package.module:function</code>，框架调用 <code>factory(config)</code></div></div>
+              <div class="contract-row"><div class="contract-label">FORWARD</div><div class="contract-value"><code>forward(image0, image1)</code>，两者均为 <code>[B,3,208,448]</code></div></div>
+              <div class="contract-row"><div class="contract-label">OUTPUT</div><div class="contract-value">必须是 <code>[B,2]</code> logits</div></div>
+              <div class="contract-row"><div class="contract-label">TRAINABLE</div><div class="contract-value">需要训练的参数名必须包含小写 <code>cls</code></div></div>
+              <div class="contract-row"><div class="contract-label">DEVICE</div><div class="contract-value">factory 只构建 CPU 模型，不调用 <code>.npu()</code>、DDP 或 set_device</div></div>
+            </div>
+          </article>
+        </div>
+
+        <div class="code-shell" style="margin-top:18px">
+          <div class="code-head"><span>src/game_cls/model/my_classifier.py</span><button class="copy" type="button">复制</button></div>
+          <pre><code>from __future__ import annotations
+
+from typing import Any
+
+import torch
+from torch import nn
+
+
+class MyDualFrameClassifier(nn.Module):
+    def __init__(self, num_classes: int = 2) -&gt; None:
+        super().__init__()
+        self.backbone = build_your_backbone()
+
+        # 所有需要训练的分类相关参数都使用小写 cls 命名。
+        self.cls = nn.Linear(self.backbone.output_dim, num_classes)
+
+    def forward(
+        self,
+        image0: torch.Tensor,
+        image1: torch.Tensor,
+    ) -&gt; torch.Tensor:
+        # image0 / image1: [B,3,208,448]
+        features = self.backbone(image0, image1)
+        logits = self.cls(features)
+        return logits  # [B,2]
+
+
+def build_model(config: dict[str, Any]) -&gt; nn.Module:
+    return MyDualFrameClassifier(
+        num_classes=int(config.get("num_classes", 2)),
+    )</code></pre>
+        </div>
+
+        <div class="grid-2" style="margin-top:18px">
+          <article class="card emphasis">
+            <div class="card-kicker">IMPORT CHECK</div>
+            <h3>先验证 factory，而不是直接训练</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
+              <pre><code>python - &lt;&lt;'PY'
+from game_cls.model.my_classifier import build_model
+
+model = build_model({"num_classes": 2})
+print(type(model))
+PY</code></pre>
+            </div>
+          </article>
+          <article class="card emphasis">
+            <div class="card-kicker">SHAPE CHECK</div>
+            <h3>验证双帧接口</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>python</span><button class="copy" type="button">复制</button></div>
+              <pre><code>import torch
+
+image0 = torch.randn(2, 3, 208, 448)
+image1 = torch.randn(2, 3, 208, 448)
+logits = model(image0, image1)
+assert logits.shape == (2, 2)</code></pre>
+            </div>
+          </article>
+        </div>
+
+        <div class="callout danger">
+          <span aria-hidden="true">!</span>
+          <div>
+            <strong>冻结主干检查是生产保护，不应随意关闭</strong>
+            <div class="small">如果出现 <code>missing_non_cls</code> 或 <code>shape_mismatch_non_cls</code>，说明当前模型结构与 checkpoint 不一致。应换正确权重、转换 key、重命名真实分类头，或把可重建缓存设为 non-persistent；不要通过关闭检查掩盖随机冻结参数。</div>
+          </div>
+        </div>
+
+        <div class="table-wrap" style="margin-top:18px">
+          <table>
+            <thead><tr><th>错误</th><th>最常见原因</th><th>正确处理</th></tr></thead>
+            <tbody>
+              <tr><td><code>ModuleNotFoundError</code></td><td>factory 模块路径不存在、目录写成 models/model 错误或项目未 editable install</td><td>放入 <code>src/game_cls/model/</code>，检查 <code>__init__.py</code> 并执行 <code>pip install -e .</code></td></tr>
+              <tr><td><code>missing_non_cls</code></td><td>当前冻结主干存在 checkpoint 没有的参数或 buffer</td><td>确认它属于 backbone、cls 还是可重建 buffer，再对齐模型和权重</td></tr>
+              <tr><td><code>shape_mismatch_non_cls</code></td><td>权重来自不同模型版本或结构配置</td><td>使用完全匹配的基础 checkpoint，不要跳过 shape mismatch</td></tr>
+              <tr><td>没有可训练参数</td><td>分类头名称不含小写 cls</td><td>将真实分类模块命名为 <code>cls</code>、<code>cls_head</code> 等</td></tr>
+              <tr><td>设备不匹配</td><td>factory 或模型构造阶段自行调用 NPU</td><td>factory 返回 CPU 模型，由 trainer 统一绑定设备和 DDP</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="configuration">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">06 / CONFIGURATION</span>
+            <h2>配置如何继承、覆盖和生效</h2>
+          </div>
+          <p class="section-intro">
+            绝大多数运行问题都应先查看最终生效配置。项目支持 YAML base 继承和命令行 dotted-key override；后者优先级最高。
+          </p>
+        </div>
+
+        <div class="inheritance" aria-label="配置继承关系">
+          <article class="inherit-node">
+            <div class="card-kicker">BASE</div>
+            <h3>npu_production.yaml</h3>
+            <p class="muted small">真实数据、模型、loss、dataloader、evaluation 和 checkpoint 的生产默认值。</p>
+          </article>
+          <article class="inherit-node">
+            <div class="card-kicker">1P PROFILE</div>
+            <h3>npu_1p.yaml</h3>
+            <p class="muted small">继承生产配置，保持单进程单设备运行。</p>
+          </article>
+          <article class="inherit-node">
+            <div class="card-kicker">8P PROFILE</div>
+            <h3>npu_8p.yaml</h3>
+            <p class="muted small">继承单卡配置，开启 distributed.enabled 与 HCCL。</p>
+          </article>
+        </div>
+
+        <div class="grid-2" style="margin-top:18px">
+          <article class="card">
+            <div class="card-kicker">RULE 1</div>
+            <h3>命令行覆盖使用 dotted key</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>examples</span><button class="copy" type="button">复制</button></div>
+              <pre><code>train.local_batch_size=32
+evaluation.val_full_at_end=false
+model.checkpoint_path=/abs/model.pth
+data.backend=packed_uint8
+sampler.game_alpha=0.0</code></pre>
+            </div>
+            <p class="muted small" style="margin-top:13px">值由 YAML 解析，因此 <code>true</code>、<code>false</code>、<code>null</code>、数字和行内字典都会转换成对应类型。</p>
+          </article>
+          <article class="card">
+            <div class="card-kicker">RULE 2</div>
+            <h3>角色级 DataLoader 配置优先</h3>
+            <div class="code-shell">
+              <div class="code-head"><span>important</span><button class="copy" type="button">复制</button></div>
+              <pre><code># 生产配置已有 train/eval 子项时，这个旧写法不能覆盖它们：
+dataloader.num_workers=0
+
+# 正确关闭所有 worker：
+dataloader.train.num_workers=0
+dataloader.eval.num_workers=0</code></pre>
+            </div>
+          </article>
+        </div>
+
+        <div class="grid-2" style="margin-top:18px">
+          <article class="card">
+            <div class="card-kicker">RESOLVED CONFIG</div>
+            <h3>永远检查最终生效配置</h3>
+            <p class="muted">每次训练会把完整配置写入运行目录：</p>
+            <div class="code-shell">
+              <div class="code-head"><span>path</span><button class="copy" type="button">复制</button></div>
+              <pre><code>runs/&lt;RUN_NAME&gt;/resolved_config.json</code></pre>
+            </div>
+            <p class="muted small" style="margin-top:13px">排查 batch、worker、评估周期、factory 或 checkpoint 问题时，优先读取该文件，而不是只看原始 YAML。</p>
+          </article>
+          <article class="card">
+            <div class="card-kicker">PROFILE VS OVERRIDE</div>
+            <h3>什么时候改 YAML，什么时候用 CLI</h3>
+            <ul class="checklist">
+              <li>长期稳定默认值：写入配置文件。</li>
+              <li>短期 smoke、A/B 和诊断：使用命令行 override。</li>
+              <li>新数据后端或设备模式：建立新的 base profile。</li>
+              <li>不要把一次临时调试参数直接变成生产默认值。</li>
+            </ul>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="recipes">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">07 / CONFIG RECIPES</span>
+            <h2>针对具体问题修改配置</h2>
+          </div>
+          <p class="section-intro">
+            先根据现象定位瓶颈，再调整最小必要参数。选择问题后，页面会给出诊断条件、YAML、CLI override 和不应优先修改的内容。
+          </p>
+        </div>
+
+        <div class="recipe-layout">
+          <aside class="recipe-menu">
+            <label class="field-label" for="recipe-select">我遇到的问题</label>
+            <select id="recipe-select">
+              <option value="first_batch">首个 batch 卡住或 timeout</option>
+              <option value="low_npu">NPU 利用率低，host_data_wait 很高</option>
+              <option value="oom">NPU 显存不足或 OOM</option>
+              <option value="eval_slow">probe / validation evaluation 太慢</option>
+              <option value="fp_high">0.99 阈值下误报 FP 很高</option>
+              <option value="fn_high">0.99 阈值下漏报 FN 很高</option>
+              <option value="small_game">小游戏或 worst-game 表现差</option>
+              <option value="duplicates">重复数据 warning 很多</option>
+              <option value="resume">训练中断后需要继续</option>
+              <option value="packed">何时切换 packed_uint8</option>
+            </select>
+            <p class="muted small" style="margin-top:14px">所有示例都应先在短步数 smoke 中验证，再写入长期配置。</p>
+          </aside>
+
+          <div class="recipe-panel" id="recipe-panel" aria-live="polite">
+            <article class="card emphasis">
+              <div class="recipe-title">
+                <div><div class="card-kicker">DIAGNOSIS</div><h3 id="recipe-title">首个 batch 卡住或 timeout</h3></div>
+                <span class="severity" id="recipe-severity">P0 · BLOCKER</span>
+              </div>
+              <p class="muted" id="recipe-summary"></p>
+              <div class="recipe-grid">
+                <div class="recipe-box"><h4>先确认</h4><ul class="checklist" id="recipe-checks"></ul></div>
+                <div class="recipe-box"><h4>不要先做</h4><ul class="checklist warning-list" id="recipe-avoid"></ul></div>
+              </div>
+            </article>
+            <div class="grid-2">
+              <div class="code-shell">
+                <div class="code-head"><span>YAML</span><button class="copy" type="button">复制</button></div>
+                <pre><code id="recipe-yaml"></code></pre>
+              </div>
+              <div class="code-shell">
+                <div class="code-head"><span>CLI override</span><button class="copy" type="button">复制</button></div>
+                <pre><code id="recipe-cli"></code></pre>
+              </div>
+            </div>
+            <div class="callout success">
+              <span aria-hidden="true">✓</span>
+              <div><strong>验收标准</strong><div class="small" id="recipe-acceptance"></div></div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -977,38 +1285,57 @@ python tools/pack_dataset.py \
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">05 / EVALUATION</span>
-            <h2>评估、选模与错例</h2>
+            <span class="section-index">08 / LOGS & EVALUATION</span>
+            <h2>如何读训练日志和评估报告</h2>
           </div>
           <p class="section-intro">
-            quick 用于训练过程中的轻量观察，full 用于完整指标和 best 选择。
-            同一步同时满足两者时只运行 full。
+            训练是否“在跑”不等于训练是否“高效”或“可信”。日志用于定位数据、主机提交和评估开销；报告用于判断全局与各游戏的业务表现。
           </p>
         </div>
 
-        <div class="grid-3">
+        <div class="code-shell">
+          <div class="code-head"><span>example training log</span><button class="copy" type="button">复制</button></div>
+          <pre><code>step=200/10000 loss=0.265080 ce=0.217867 threshold_loss=0.042100 \
+threshold_weight=0.2000 accuracy=0.8740 \
+interval_samples/s=2650.23 interval_step_time=0.0377s \
+data_wait_ratio=37.6% learning_rate=8.6e-05 grad_norm=0.2841 \
+evaluation_seconds=0.000 checkpoint_seconds=0.000 wall_samples/s=53.30 \
+host_enqueue_timing={'host_data_wait': 0.998, 'host_h2d_enqueue': 0.0077,
+'host_forward_enqueue': 0.0053, 'host_backward_enqueue': 0.0038,
+'host_optimizer_enqueue': 0.0024}</code></pre>
+        </div>
+
+        <div class="log-line">
+          <div class="log-field"><code>loss / ce / threshold_loss</code><span>区间内按样本加权的平均损失（多卡下在 rank 间 all-reduce），曲线不再被单个 batch 噪声主导；原始 last-batch 值仍写入 train_metrics.jsonl 的 loss/ce/threshold_loss 字段。</span></div>
+          <div class="log-field"><code>accuracy / recall / specificity</code><span>区间内 0.99 阈值下的训练集 accuracy、正类 recall 与负类 specificity（interval_* 字段）。</span></div>
+          <div class="log-field"><code>threshold_weight</code><span>经过 warmup/ramp 后的当前阈值损失权重。</span></div>
+          <div class="log-field"><code>interval_samples/s</code><span>日志区间样本吞吐；wall_samples/s 是从运行开始累计的端到端吞吐，受冷启动和评估影响。</span></div>
+          <div class="log-field"><code>host_data_wait</code><span>主进程等待下一批数据的时间；明显高于其他字段时输入流水线是瓶颈。</span></div>
+        </div>
+
+        <div class="grid-3" style="margin-top:20px">
           <article class="card">
-            <div class="card-kicker">QUICK TEST</div>
-            <h3>快速反馈</h3>
-            <p class="muted">每视频时间均匀抽取固定数量的 delta=2 pair，只写 metrics 与有限 FP/FN、临界样本 Parquet。</p>
+            <div class="card-kicker">TRAIN PROBE</div>
+            <h3>同口径泛化对照</h3>
+            <p class="muted">固定、无增强的 train 子集，与 validation 使用完全相同的 evaluator；train probe 与 validation 的 CE/selection 差距就是泛化间隙。</p>
           </article>
           <article class="card">
-            <div class="card-kicker">FULL TEST</div>
-            <h3>完整评估</h3>
-            <p class="muted">枚举全部合法 pair，使用直方图分布式 AUC、整数分组聚合和缓冲 Parquet 写入。</p>
+            <div class="card-kicker">VALIDATION</div>
+            <h3>趋势观察与选模</h3>
+            <p class="muted">val_quick 每个视频均匀抽样做高频趋势监控；val_full 枚举全部合法 pair、流式写错例并参与 best 模型选择与 early stopping。</p>
           </article>
           <article class="card">
-            <div class="card-kicker">FINAL FULL</div>
-            <h3>最终比较</h3>
-            <p class="muted">训练结束的 full 同样参与组合分数比较，可更新 best checkpoint，不会遗漏最后一步模型。</p>
+            <div class="card-kicker">TEST</div>
+            <h3>训练后的唯一一次评估</h3>
+            <p class="muted">训练循环内永不评估 test；训练结束后用 <code>cls-trainer evaluate --split test</code> 只评估一次，绝不参与选模。</p>
           </article>
         </div>
 
         <div class="grid-2" style="margin-top:18px">
           <article class="card">
-            <h3>组合选模</h3>
+            <h3>组合选模配置</h3>
             <div class="code-shell">
-              <div class="code-head"><span>selection config</span><button class="copy" type="button">复制</button></div>
+              <div class="code-head"><span>evaluation</span><button class="copy" type="button">复制</button></div>
               <pre><code>evaluation:
   selection_metric: composite
   selection_weights:
@@ -1017,27 +1344,25 @@ python tools/pack_dataset.py \
     worst_game_f1: 0.20
   minimum_worst_game_f1: null</code></pre>
             </div>
-            <p class="muted small" style="margin-top:13px">
-              首轮可靠基线完成后再设置非零 worst-game 下限，不要凭空猜测门限。
-            </p>
+            <p class="muted small" style="margin-top:13px">先完成可靠基线，再根据真实分布设置非零 worst-game floor，不要凭空猜门槛。</p>
           </article>
           <article class="card">
-            <h3>报告如何解释</h3>
+            <h3>指标应该如何解释</h3>
             <ul class="checklist">
-              <li>正类 game-label：重点看 recall 与 FN rate</li>
-              <li>负类 game-label：重点看 specificity 与 FP rate</li>
-              <li>Brier、ECE：观察分数校准稳定性</li>
-              <li>observed_dev_test：说明该集合参与了选模</li>
+              <li><strong class="strong">global F1</strong>：总体业务效果，但可能被大游戏主导。</li>
+              <li><strong class="strong">macro-game F1</strong>：每个游戏等权，更能反映跨游戏稳定性。</li>
+              <li><strong class="strong">worst-game F1</strong>：最弱游戏的底线，适合建立上线 guardrail。</li>
+              <li><strong class="strong">FP/FN by game-label</strong>：定位误报和漏报来自哪些游戏。</li>
+              <li><strong class="strong">Brier / ECE / margin 分位数</strong>：观察分数校准与阈值附近分离程度；0.99 仍是业务分数而非自然概率。</li>
+              <li><strong class="strong">train probe vs validation</strong>：同口径下 probe CE 继续下降而 validation CE 上升，就是泛化退化；固定 0.99 阈值 F1 变差但 PR-AUC 基本不变时，更可能是置信度漂移。</li>
+              <li><strong class="strong">validation</strong>：参与选模与 early stopping；对外无偏结果必须来自从未参与选模的独立 test（<code>cls-trainer evaluate --split test</code>）。</li>
             </ul>
           </article>
         </div>
 
         <div class="callout">
           <span aria-hidden="true">◆</span>
-          <div>
-            <strong>部署精度一致性</strong>
-            <div class="small">生产评估使用 evaluation.amp=true 与 bfloat16，模型选择依据与部署一致的低精度前向，而不是固定 FP32。</div>
-          </div>
+          <div><strong>同一步同时命中 val_quick 和 val_full 时只运行 val_full</strong><div class="small">smoke 时可关闭 <code>val_full_at_end</code> 以缩短验证；正式训练结束时应保留 final full validation，确保最后模型参与比较。test 永远不进入训练循环。每次评估追加一行到 <code>metrics/evaluation.jsonl</code>，train probe 与 val_full 同一步时额外记录 <code>generalization_ce_gap</code> / <code>generalization_score_gap</code>；overview.html 的六类曲线和关键 step 标记（best selection、best val loss、泛化退化起点、early-stop）都由它驱动。</div></div>
         </div>
       </div>
     </section>
@@ -1046,40 +1371,80 @@ python tools/pack_dataset.py \
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">06 / ARTIFACTS</span>
+            <span class="section-index">09 / ARTIFACTS</span>
             <h2>训练结束后会得到什么</h2>
           </div>
           <p class="section-intro">
-            权重、恢复状态和报告相互独立。部署端无需理解 optimizer 或 sampler，
-            训练恢复也不会依赖一个缺少随机状态的“纯权重”文件。
+            部署权重、恢复状态和评估报告相互分离。部署侧加载纯 state_dict；训练恢复使用完整 checkpoint。
           </p>
         </div>
 
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>产物</th><th>用途</th><th>关键契约</th></tr></thead>
-            <tbody>
-              <tr><td><code>model_last.pth</code></td><td>部署或独立推理</td><td>纯 state_dict，可直接 load_state_dict</td></tr>
-              <tr><td><code>model_last.metadata.json</code></td><td>追踪权重来源</td><td>记录 global_step、epoch 与角色</td></tr>
-              <tr><td><code>checkpoint_last.pth</code></td><td>精确恢复训练</td><td>模型、optimizer、scheduler、scaler、sampler 与各 rank RNG</td></tr>
-              <tr><td><code>metrics.json</code></td><td>全局指标</td><td>F1@0.99、AUC、Brier、ECE、置信度分布</td></tr>
-              <tr><td><code>metrics_by_*.csv</code></td><td>分组诊断</td><td>game、game-label 与 video 维度</td></tr>
-              <tr><td><code>false_*.parquet</code></td><td>完整错例集合</td><td>流式写入，不在 rank 0 集中保存 Python 列表</td></tr>
-              <tr><td><code>errors.html</code></td><td>人工复核</td><td>packed 模式自动引用有限的 previews/*.png</td></tr>
-            </tbody>
-          </table>
+        <div class="grid-2">
+          <div class="code-shell">
+            <div class="code-head"><span>run directory</span><button class="copy" type="button">复制</button></div>
+            <pre><code>runs/&lt;RUN_NAME&gt;/
+├── resolved_config.json
+├── train_metrics.jsonl
+├── metrics/
+│   └── evaluation.jsonl
+├── checkpoints/
+│   ├── model_last.pth
+│   ├── model_last.metadata.json
+│   ├── checkpoint_last.pth
+│   ├── model_best_selection.pth
+│   ├── model_best_val_loss.pth
+│   ├── model_best_worst_game.pth
+│   └── checkpoint_best_selection.pth
+└── reports/
+    ├── train_probe_step_00010000/
+    │   └── metrics.json
+    ├── val_quick_step_00000500/
+    │   └── metrics.json
+    └── val_full_step_00010000/
+        ├── metrics.json
+        ├── false_positive.parquet
+        ├── false_negative.parquet
+        ├── errors.html
+        └── ...</code></pre>
+          </div>
+          <article class="card">
+            <div class="card-kicker">ARTIFACT ROLES</div>
+            <div class="model-contract">
+              <div class="contract-row"><div class="contract-label">model_best_selection.pth</div><div class="contract-value">validation 选模最优权重；另有 best_val_loss（泛化损失最优）与 best_worst_game（最差游戏最优）两个目标别名。</div></div>
+              <div class="contract-row"><div class="contract-label">model_*.pth</div><div class="contract-value">完整纯 state_dict，用于部署或独立推理。</div></div>
+              <div class="contract-row"><div class="contract-label">checkpoint_*.pth</div><div class="contract-value">训练恢复，包含模型状态、optimizer、scheduler、scaler、sampler、RNG 与 early stopping 状态。</div></div>
+              <div class="contract-row"><div class="contract-label">metrics.json</div><div class="contract-value">全局指标、选模分数、评估角色和 checkpoint step；含 threshold loss 与 margin 分位数。</div></div>
+              <div class="contract-row"><div class="contract-label">evaluation.jsonl</div><div class="contract-value">统一评估历史：train probe / val_quick / val_full / test 的时序指标与泛化差距。</div></div>
+              <div class="contract-row"><div class="contract-label">metrics_by_*.csv</div><div class="contract-value">game、game-label 和 video 维度的诊断指标。</div></div>
+              <div class="contract-row"><div class="contract-label">false_*.parquet</div><div class="contract-value">完整流式错例集合，适合进一步分析。</div></div>
+              <div class="contract-row"><div class="contract-label">errors.html</div><div class="contract-value">有限错例的人工复核页面；packed 模式使用导出的 preview。</div></div>
+            </div>
+          </article>
         </div>
 
         <div class="code-shell" style="margin-top:18px">
-          <div class="code-head"><span>纯权重加载</span><button class="copy" type="button">复制</button></div>
+          <div class="code-head"><span>load pure model state_dict</span><button class="copy" type="button">复制</button></div>
           <pre><code>import torch
 
 state_dict = torch.load(
-    "runs/your_run/checkpoints/model_last.pth",
+    "runs/&lt;RUN_NAME&gt;/checkpoints/model_last.pth",
     map_location="cpu",
     weights_only=True,
 )
 model.load_state_dict(state_dict)</code></pre>
+        </div>
+
+        <div class="code-shell" style="margin-top:18px">
+          <div class="code-head"><span>evaluate the held-out test once</span><button class="copy" type="button">复制</button></div>
+          <pre><code># 训练结束后，对从未参与选模的 test split 执行唯一一次最终评估：
+cls-trainer evaluate \
+  --run &lt;RUN_ID 或 run 目录&gt; \
+  --checkpoint best_selection \
+  --split test
+
+# 结果写入 test_evaluation.json 并追加到 metrics/evaluation.jsonl（split=test）。
+# 没有独立 test 集（test 被别名成 validation）时，--split test 会直接拒绝；
+# 此时只能 --split validation，或补建 val 索引后重新训练。</code></pre>
         </div>
       </div>
     </section>
@@ -1088,71 +1453,158 @@ model.load_state_dict(state_dict)</code></pre>
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">07 / NPU VALIDATION</span>
-            <h2>正式长跑前的设备门槛</h2>
+            <span class="section-index">10 / NPU RELEASE GATES</span>
+            <h2>正式长跑前的上线门槛</h2>
           </div>
           <p class="section-intro">
-            CPU/Gloo 测试只能证明逻辑契约，不能替代 910B2 上的 TorchNPU、HCCL、
-            BF16 算子链和报告合并实测。
+            CPU CI 只能证明逻辑契约，不能替代目标服务器上的 TorchNPU、BF16、HCCL、DataLoader 和报告合并实测。
           </p>
         </div>
 
         <div class="grid-2">
-          <article class="card">
-            <div class="card-kicker">1P · STAGED</div>
-            <h3>单卡分阶段验证</h3>
+          <article class="card emphasis">
+            <div class="card-kicker">1P GATE</div>
+            <h3>单卡分阶段验收</h3>
             <div class="code-shell">
               <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
               <pre><code>bash scripts/smoke_npu_1p.sh</code></pre>
             </div>
-            <ul class="checklist">
-              <li>无 worker 基线排除模型与 NPU 算子问题</li>
-              <li>spawn 1→2 worker 与首 batch timeout</li>
-              <li>最后依次加入 quick/full 与 checkpoint</li>
-            </ul>
+            <div class="gate-list" style="margin-top:16px">
+              <div class="gate-item"><div class="gate-mark">1</div><div><strong>无 worker 基线</strong><span>排除模型、NPU 算子和 optimizer 问题。</span></div></div>
+              <div class="gate-item"><div class="gate-mark">2</div><div><strong>spawn 1 worker</strong><span>验证最小多进程 DataLoader。</span></div></div>
+              <div class="gate-item"><div class="gate-mark">3</div><div><strong>spawn 2 workers + augmentation</strong><span>验证真实训练输入路径。</span></div></div>
+              <div class="gate-item"><div class="gate-mark">4</div><div><strong>probe / val_quick / val_full / checkpoint</strong><span>验证临时 eval worker、报告和保存链路。</span></div></div>
+            </div>
           </article>
           <article class="card">
-            <div class="card-kicker">8P · 100 STEPS</div>
-            <h3>八卡通信验证</h3>
+            <div class="card-kicker">8P GATE</div>
+            <h3>八卡通信验收</h3>
             <div class="code-shell">
               <div class="code-head"><span>shell</span><button class="copy" type="button">复制</button></div>
               <pre><code>bash scripts/smoke_npu_8p.sh</code></pre>
             </div>
-            <ul class="checklist">
-              <li>每 rank 1 个 train/eval spawn worker</li>
-              <li>HCCL int64/float32 AllReduce</li>
-              <li>quick/full、报告合并与无死锁退出</li>
-            </ul>
+            <div class="gate-list" style="margin-top:16px">
+              <div class="gate-item"><div class="gate-mark">8</div><div><strong>8 个 rank 都拿到首 batch</strong><span>没有 rank 停在 spawn、文件系统或输入 shape。</span></div></div>
+              <div class="gate-item"><div class="gate-mark">H</div><div><strong>HCCL 归约成功</strong><span>混淆矩阵、损失和评估状态正常同步。</span></div></div>
+              <div class="gate-item"><div class="gate-mark">R</div><div><strong>报告合并成功</strong><span>probe/validation 分片和错例由 rank 0 正确合并。</span></div></div>
+              <div class="gate-item"><div class="gate-mark">C</div><div><strong>checkpoint 可恢复</strong><span>恢复后 rank、step、sampler 和 RNG 状态一致。</span></div></div>
+            </div>
           </article>
         </div>
 
-        <div class="callout danger">
-          <span aria-hidden="true">!</span>
-          <div>
-            <strong>不要跳过 smoke 直接长跑</strong>
-            <div class="small">只有 1P/8P 均触发 full test、生成 checkpoint，并能从 checkpoint 恢复后，才应启动正式多 epoch 训练。</div>
-          </div>
-        </div>
-
         <div class="card" style="margin-top:18px">
-          <h3>PNG 与 packed A/B 应记录</h3>
+          <div class="card-kicker">DATA PIPELINE PERFORMANCE</div>
+          <h3>PNG 与 packed 的正确比较方式</h3>
           <div class="table-wrap" style="margin-top:14px">
             <table>
-              <thead><tr><th>维度</th><th>为什么重要</th><th>建议观察窗口</th></tr></thead>
+              <thead><tr><th>指标</th><th>含义</th><th>如何比较</th><th>判断</th></tr></thead>
               <tbody>
-                <tr><td><code>interval_samples/s</code></td><td>NPU 同步后的区间真实吞吐</td><td>page cache 稳定后的 500～1000 step</td></tr>
-                <tr><td><code>data_wait_ratio</code></td><td>判断 DataLoader 是否成为瓶颈</td><td>相同 worker 与 batch 配置</td></tr>
-                <tr><td><code>worker RSS</code></td><td>检查 packed 索引和 LRU 的内存成本</td><td>运行足够久以访问多个 shard</td></tr>
-                <tr><td><code>NPU utilization</code></td><td>识别设备是否持续等待输入</td><td>排除 quick/full 与 checkpoint 窗口</td></tr>
-                <tr><td><code>step P95</code></td><td>发现随机 I/O 与 page fault 长尾</td><td>同时测试 shard 512/1024/2048/4096</td></tr>
+                <tr><td><code>host_data_wait</code></td><td>主线程等待下一批数据</td><td>相同 batch、增强、步数和 worker</td><td>明显高于其他主机字段时数据受限</td></tr>
+                <tr><td><code>wall_samples/s</code></td><td>累计端到端吞吐</td><td>忽略冷启动，比较后半段区间</td><td>不能只看最后一个累计值</td></tr>
+                <tr><td>NPU utilization</td><td>设备是否持续工作</td><td>排除评估和 checkpoint 窗口</td><td>锯齿且 host_data_wait 高表示输入饥饿</td></tr>
+                <tr><td>CPU / iowait</td><td>PNG 解码或存储瓶颈</td><td>worker=2→4→8 逐级 A/B</td><td>提升不足 15% 时停止继续加 worker</td></tr>
+                <tr><td>worker RSS</td><td>多进程和 memmap 内存成本</td><td>访问多个 shard 后观察</td><td>防止八卡放大后主机内存过高</td></tr>
               </tbody>
             </table>
           </div>
-          <p class="muted small" style="margin-top:14px">
-            每个日志区间还会把 step、loss、学习率、梯度范数、评估耗时和 checkpoint
-            耗时写入 <code>train_metrics.jsonl</code>，便于直接生成曲线和比较实验。
+          <div class="callout">
+            <span aria-hidden="true">◆</span>
+            <div><strong>packed 是候选高吞吐后端，不是无条件更快</strong><div class="small">它消除训练热路径中的 PNG 解码，但随机 shard、page cache、存储位置和增强仍会影响结果。必须在同一台服务器上保持模型、batch、worker 和步数一致后 A/B。</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="reference">
+      <div class="wrap">
+        <div class="section-head">
+          <div>
+            <span class="section-index">11 / PARAMETER REFERENCE</span>
+            <h2>常用参数索引</h2>
+          </div>
+          <p class="section-intro">
+            参数表优先回答“什么时候改”和“改错会怎样”。可以按名称搜索，也可以按配置组过滤。
           </p>
         </div>
+
+        <div class="filter-bar">
+          <input id="param-search" type="search" placeholder="搜索参数、问题或关键词，例如 worker / OOM / worst-game" aria-label="搜索参数">
+          <select id="param-group" aria-label="按配置组过滤">
+            <option value="all">全部配置组</option>
+            <option value="data">data</option>
+            <option value="pair-sampler">pair / sampler</option>
+            <option value="model-loss">model / loss</option>
+            <option value="train">train / optimizer / scheduler</option>
+            <option value="dataloader">dataloader</option>
+            <option value="evaluation">evaluation</option>
+            <option value="early_stopping">early_stopping</option>
+            <option value="checkpoint">checkpoint / distributed</option>
+          </select>
+        </div>
+
+        <div class="table-wrap parameter-table">
+          <table>
+            <thead><tr><th>参数</th><th>默认/示例</th><th>控制什么</th><th>什么时候修改</th><th>主要风险</th></tr></thead>
+            <tbody id="parameter-body">
+              <tr data-group="data"><td class="param-name"><code>data.width / height / channels</code></td><td class="param-default">448 / 208 / 3</td><td>图像和 tensor 契约</td><td>仅在模型、数据、索引和 checkpoint 全部同步变更时</td><td>错误修改会导致 shape 校验失败或权重不兼容</td></tr>
+              <tr data-group="data"><td class="param-name"><code>data.backend</code></td><td class="param-default">png</td><td>选择 PNG 解码或 packed_uint8</td><td>确认 PNG 解码/小文件 I/O 限制 NPU 时</td><td>packed 占用大量磁盘，且不保证任何环境都更快</td></tr>
+              <tr data-group="data"><td class="param-name"><code>data.strict_audit</code></td><td class="param-default">true</td><td>训练前强制验证 audit</td><td>生产应保持开启</td><td>关闭后可能使用错误、过期或泄漏数据</td></tr>
+              <tr data-group="data"><td class="param-name"><code>data.val_index / val_video_index</code></td><td class="param-default">缺省时 test 充当 validation</td><td>独立 validation split，参与曲线、选模与 early stopping</td><td>生产必须配置，让 test 成为真正的 holdout</td><td>缺失时框架自动用 test 顶替并警告：该 run 没有独立测试集</td></tr>
+              <tr data-group="data"><td class="param-name"><code>data.require_independent_test</code></td><td class="param-default">生产 true</td><td>拒绝 test 被别名成 validation 的训练</td><td>生产验收强制要求独立 test 时开启</td><td>未建 val 索引时训练会直接失败</td></tr>
+              <tr data-group="data"><td class="param-name"><code>data.require_content_hash_audit</code></td><td class="param-default">true</td><td>要求内容哈希审计</td><td>生产防止同内容异标签和跨 split 泄漏</td><td>索引阶段需要完整读取文件，I/O 成本高</td></tr>
+              <tr data-group="data"><td class="param-name"><code>data.packed_max_open_shards</code></td><td class="param-default">16</td><td>每个 backend 的 LRU memmap 数量</td><td>packed 下根据访问局部性与内存调整</td><td>过小频繁重映射，过大增加 FD 和映射数量</td></tr>
+              <tr data-group="pair-sampler"><td class="param-name"><code>pair.train_delta_probability</code></td><td class="param-default">{1:.15,2:.70,3:.15}</td><td>训练 pair 的时间间隔分布</td><td>业务希望强调不同运动跨度时</td><td>某个 delta 数据不足会导致采样退化或审计失败</td></tr>
+              <tr data-group="pair-sampler"><td class="param-name"><code>pair.test_delta</code></td><td class="param-default">2</td><td>评估统一使用的帧间隔</td><td>只有业务评估定义变化时</td><td>改变后必须重审计合法 pair 覆盖</td></tr>
+              <tr data-group="pair-sampler"><td class="param-name"><code>sampler.game_alpha</code></td><td class="param-default">0.25</td><td>游戏采样权重与数据量的关系</td><td>小游戏欠拟合时降低；大游戏代表性不足时提高</td><td>极端值会破坏真实数据分布或小样本稳定性</td></tr>
+              <tr data-group="pair-sampler"><td class="param-name"><code>sampler.class_probability</code></td><td class="param-default">{0:.5,1:.5}</td><td>训练类别采样比例</td><td>需要改变优化先验时</td><td>训练分数不再等同自然概率，需额外校准</td></tr>
+              <tr data-group="pair-sampler"><td class="param-name"><code>sampler.deduplicate_within_global_batch</code></td><td class="param-default">true</td><td>减少同一全局 batch 内重复 pair</td><td>生产一般保持开启</td><td>极小数据集可能增加采样尝试</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>model.factory</code></td><td class="param-default">package.module:function</td><td>真实模型构建函数</td><td>接入模型时必须修改</td><td>模块路径、函数签名或 import 副作用都会阻止启动</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>model.checkpoint_path</code></td><td class="param-default">absolute path</td><td>基础预训练权重</td><td>生产必须设置</td><td>非 cls 状态不完整会直接终止</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>model.trainable_name_contains</code></td><td class="param-default">cls</td><td>选择可训练参数</td><td>分类头采用其他统一命名时</td><td>过宽会误训练主干，过窄会没有可训练参数</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>model.freeze_*_batchnorm_stats</code></td><td class="param-default">true</td><td>冻结 BN running stats</td><td>只有明确需要更新统计且处理好分布式同步时</td><td>多卡不同 rank 的 BN 统计可能不一致</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>model.kwargs</code></td><td class="param-default">{}</td><td>工厂透传的项目特有参数（如 cls_dropout）</td><td>head 结构需要额外参数时</td><td>工厂必须自行消费这些键</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>loss.label_smoothing</code></td><td class="param-default">0.0</td><td>交叉熵标签平滑</td><td>过拟合消融实验（先试 0.02/0.05）</td><td>0.99 固定阈值下过大平滑会改变校准</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>loss.threshold_warmup_steps / ramp_steps</code></td><td class="param-default">null</td><td>显式步数阈值损失调度，覆盖 ratio</td><td>延长 max_steps 后希望生效绝对步数不变</td><td>与 ratio 同时设置时以显式步数为准</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>loss.threshold_loss_weight</code></td><td class="param-default">0.20</td><td>阈值间隔损失最大权重</td><td>确认 CE 收敛但 0.99 附近分离不足时</td><td>过高可能同时放大 FP/FN 或造成优化不稳定</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>loss.threshold_safety_margin</code></td><td class="param-default">0.20</td><td>要求 logits margin 远离业务阈值</td><td>希望增加判定安全距离时</td><td>更严格不代表更好，可能损失召回或提高误报</td></tr>
+              <tr data-group="model-loss"><td class="param-name"><code>loss.threshold_warmup_ratio</code></td><td class="param-default">0.10</td><td>前期只用 CE 的训练比例</td><td>初期 loss 不稳定或阈值损失介入过早时</td><td>过长会延迟业务阈值对齐</td></tr>
+              <tr data-group="train"><td class="param-name"><code>train.local_batch_size</code></td><td class="param-default">64</td><td>每 rank batch size</td><td>OOM、吞吐 A/B 或总 batch 调整</td><td>改变总 batch 后学习率和优化行为可能变化</td></tr>
+              <tr data-group="train"><td class="param-name"><code>train.steps_per_epoch</code></td><td class="param-default">1000</td><td>采样器中的 epoch 长度</td><td>定义日志、delta 统计和 checkpoint 周期时</td><td>它不是数据集自然遍历次数</td></tr>
+              <tr data-group="train"><td class="param-name"><code>train.max_steps</code></td><td class="param-default">null</td><td>总训练 step 上限</td><td>smoke、固定预算实验和正式训练</td><td>恢复时必须大于 checkpoint global_step</td></tr>
+              <tr data-group="train"><td class="param-name"><code>train.gradient_clip_norm</code></td><td class="param-default">5.0</td><td>可训练参数的梯度范数裁剪</td><td>梯度爆炸或 NPU 兼容诊断时</td><td>过小会抑制有效更新</td></tr>
+              <tr data-group="train"><td class="param-name"><code>optimizer.learning_rate</code></td><td class="param-default">1e-3</td><td>AdamW 基础学习率</td><td>根据总 batch、分类头规模和收敛调整</td><td>过高震荡，过低收敛缓慢</td></tr>
+              <tr data-group="train"><td class="param-name"><code>scheduler.warmup_steps</code></td><td class="param-default">500</td><td>学习率线性 warmup</td><td>训练总步数或 batch 规模改变时</td><td>短训练中 warmup 可能覆盖大部分过程</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.multiprocessing_context</code></td><td class="param-default">spawn</td><td>worker 启动方式</td><td>NPU 下不可改为 fork/forkserver</td><td>错误方式可能在 NPU runtime 初始化后静默死锁</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.timeout_seconds</code></td><td class="param-default">180</td><td>等待 worker batch 的最长时间</td><td>存储确实较慢且无死锁时谨慎提高</td><td>盲目提高只会延迟暴露问题</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.train.num_workers</code></td><td class="param-default">2</td><td>每 rank 训练 worker 数</td><td>host_data_wait 高时按 2→4→8 A/B</td><td>八卡会乘以 rank 数，CPU、RSS 和 I/O 压力同步放大</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.eval.num_workers</code></td><td class="param-default">1</td><td>probe/validation 临时 worker 数</td><td>评估读取成为瓶颈时</td><td>全量评估可能同时增加文件系统压力</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.*.persistent_workers</code></td><td class="param-default">train:true / eval:false</td><td>遍历结束后是否保留 worker</td><td>训练常驻，评估按需启动</td><td>所有 DataLoader 都常驻会造成大量后台进程</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.*.prefetch_factor</code></td><td class="param-default">2</td><td>每 worker 预取 batch 数</td><td>worker 生产有抖动且内存允许时</td><td>不能解决平均解码速度不足，只增加队列内存</td></tr>
+              <tr data-group="dataloader"><td class="param-name"><code>dataloader.*.pin_memory</code></td><td class="param-default">false</td><td>CPU pinned memory</td><td>稳定后通过 H2D A/B 证明有收益时</td><td>当前主要瓶颈若是 PNG 解码，开启它通常无效</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.train_probe_every_steps</code></td><td class="param-default">1000</td><td>train probe 评估周期（无增强固定 train 子集）</td><td>调整泛化差距的观测频率</td><td>与 val_full 同一步时先跑 probe，用于计算泛化间隙</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.train_probe_pairs_per_video</code></td><td class="param-default">32</td><td>每 train 视频 probe pair 上限</td><td>smoke 时降到 1～8，正式监控按成本调整</td><td>太小会增大 probe 指标方差</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.val_quick_every_steps</code></td><td class="param-default">500</td><td>quick validation 周期（旧键 quick_test_every_steps 自动迁移）</td><td>调整趋势反馈频率</td><td>过频会显著降低训练 wall throughput</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.val_quick_pairs_per_video</code></td><td class="param-default">128</td><td>每视频 quick validation pair 上限</td><td>smoke 时降到 1～8，正式监控根据成本调整</td><td>太小会增大指标方差</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.val_full_every_steps</code></td><td class="param-default">2000</td><td>完整 validation 周期，驱动选模与 early stopping（旧键 full_test_every_steps 自动迁移）</td><td>根据 full 样本数和训练预算调整</td><td>full 很大时过频会让训练大部分时间用于评估</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.val_full_at_end</code></td><td class="param-default">true</td><td>训练结束是否做 final full validation</td><td>smoke 可关闭，正式训练建议开启</td><td>关闭后最后一步模型可能没有完整评估</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.selection_weights</code></td><td class="param-default">.4/.4/.2</td><td>global、macro、worst 的组合选模权重</td><td>业务更重视整体或最差游戏时</td><td>未经基线验证随意修改会改变 best 模型定义</td></tr>
+              <tr data-group="evaluation"><td class="param-name"><code>evaluation.minimum_worst_game_f1</code></td><td class="param-default">null</td><td>best 模型的最差游戏准入线</td><td>建立稳定基线后设置</td><td>过高可能导致没有任何 checkpoint eligible</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.enabled</code></td><td class="param-default">false</td><td>validation plateau 自动停止</td><td>正式长跑开启；max_steps 仍是安全上限</td><td>评估周期过大时停止点可能滞后</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.monitor / mode</code></td><td class="param-default">selection_score / max</td><td>监控的 validation 指标与优化方向</td><td>换用 CE（min）或 worst-game F1（max）时</td><td>监控值缺失（如 None）不会触发停止</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.patience_evaluations</code></td><td class="param-default">3</td><td>连续未改善的 full validation 次数</td><td>希望更早/更晚停止时</td><td>过小容易被单次噪声提前掐断</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.min_delta</code></td><td class="param-default">0.001</td><td>低于该幅度的改善不算新最佳</td><td>指标噪声较大时适当提高</td><td>过大会在仍有缓慢进步时停止</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.burn_in_steps</code></td><td class="param-default">6000</td><td>该 step 之前不停止</td><td>避免训练初期就触发 plateau</td><td>过大会削弱 early stopping 的意义</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.restore_best</code></td><td class="param-default">true</td><td>停止后恢复 best_selection 权重再收尾</td><td>希望最终产物就是最佳模型时</td><td>恢复后 last checkpoint 与 optimizer 状态不完全一致</td></tr>
+              <tr data-group="early_stopping"><td class="param-name"><code>early_stopping.full_validation_only</code></td><td class="param-default">true</td><td>只允许 full validation 更新 patience</td><td>quick 子集噪声大，一般保持 true</td><td>设为 false 时 quick 也可触发停止，噪声更大</td></tr>
+              <tr data-group="checkpoint"><td class="param-name"><code>checkpoint.save_best_val_loss</code></td><td class="param-default">true</td><td>保存 validation 损失最优 checkpoint</td><td>概率建模与泛化损失最优时用</td><td>与选模最优可能不是同一个 step</td></tr>
+              <tr data-group="checkpoint"><td class="param-name"><code>checkpoint.save_best_worst_game</code></td><td class="param-default">true</td><td>保存 worst-game F1 最优 checkpoint</td><td>最差游戏表现是上线 guardrail 时</td><td>额外别名增加少量 I/O</td></tr>
+              <tr data-group="checkpoint"><td class="param-name"><code>checkpoint.periodic_state_mode</code></td><td class="param-default">trainable_only</td><td>周期 checkpoint 保存完整模型或可训练状态</td><td>主干固定时减少 checkpoint 大小</td><td>恢复依赖相同基础 checkpoint 及其哈希</td></tr>
+              <tr data-group="checkpoint"><td class="param-name"><code>checkpoint.save_last_every_steps</code></td><td class="param-default">1000</td><td>周期性保存 last</td><td>根据容错目标和存储成本调整</td><td>过频会增加 I/O 和暂停</td></tr>
+              <tr data-group="checkpoint"><td class="param-name"><code>distributed.enabled / backend</code></td><td class="param-default">8P: true / hccl</td><td>开启 DDP 和通信后端</td><td>八卡配置使用</td><td>普通 python 单进程不可配 WORLD_SIZE&gt;1</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted small" id="param-count" style="margin-top:12px"></p>
       </div>
     </section>
 
@@ -1160,31 +1612,43 @@ model.load_state_dict(state_dict)</code></pre>
       <div class="wrap">
         <div class="section-head">
           <div>
-            <span class="section-index">08 / FAQ</span>
-            <h2>常见问题</h2>
+            <span class="section-index">12 / FAQ</span>
+            <h2>常见认知错误</h2>
           </div>
-          <p class="section-intro">这些问题通常决定一次训练是“可运行”，还是“结果可信”。</p>
+          <p class="section-intro">这些问题通常决定一次训练只是“能运行”，还是“结果可信”。</p>
         </div>
         <div class="faq">
           <details>
-            <summary>为什么只训练名称包含 cls 的参数？</summary>
-            <p>这是当前任务的冻结策略：使用完整预训练主干，只更新分类相关模块。正式训练会要求所有非 cls 参数和 buffer 100% 加载，并可验证冻结参数训练前后逐位不变。</p>
-          </details>
-          <details>
             <summary>为什么 0.99 不能直接称为 99% 真实概率？</summary>
-            <p>训练采样把类别调整为约 50/50，并加入阈值间隔损失，改变了自然先验。当前 0.99 被明确记录为业务分数；如需概率解释，应在自然分布 calibration 集上拟合 temperature 与 bias。</p>
+            <div class="detail-body">训练采样把类别调整为约 50/50，并加入阈值间隔损失，改变了自然先验。当前 0.99 应记录为业务分数；需要概率解释时，应在自然分布 calibration 集上重新校准。</div>
           </details>
           <details>
-            <summary>为什么周期 full test 叫 observed_dev_test？</summary>
-            <p>因为它参与最佳模型选择，本质上承担 dev set 角色。若需要对外报告无偏指标，还应准备一个从未参与选模的独立 final test。</p>
+            <summary>train / validation / test 三者有什么区别？</summary>
+            <div class="detail-body">train 只用于梯度更新；validation 用于曲线、模型选择和 early stopping；test 在训练结束后只评估一次，绝不参与选模。旧配置的 quick_test_*/full_test_* 会自动迁移为 val_quick_*/val_full_*；没有 val_index 时 test 会临时充当 validation 并给出明确警告。独立 test 通过 <code>cls-trainer evaluate --split test</code> 评估。</div>
           </details>
           <details>
-            <summary>什么时候应该使用 packed 后端？</summary>
-            <p>先在本地 NVMe 上做相同参数的 PNG/packed A/B。若 PNG 解码、CPU 或小文件随机读取限制了 NPU 利用率，再使用 packed；不要仅凭实现存在就假设它一定更快。</p>
+            <summary>如何判断约 10,000 step 附近是过拟合还是置信度漂移？</summary>
+            <div class="detail-body">同一 eval 口径下对比 train probe 与 validation：train probe CE 继续下降而 validation CE 上升，说明泛化退化；若固定 0.99 阈值 F1 变差但 PR-AUC 基本不变，则更可能是置信度漂移。overview.html 用 generalization gap 曲线和 best/退化/early-stop 标记辅助判断。</div>
           </details>
           <details>
-            <summary>如何从中断位置继续训练？</summary>
-            <p>将 train.resume_path 指向 checkpoint_last.pth。恢复会校验基础权重哈希和 trainable key 集，并恢复 optimizer、scheduler、scaler、sampler 位置及各 rank 随机状态。</p>
+            <summary>early stopping 会不会把训练提前掐断？</summary>
+            <div class="detail-body">只在 full validation 上判断，burn-in 之前不停止，连续 patience 次未改善才停止并恢复最佳权重；max_steps 仍是安全上限。状态（best_value、best_step、bad_evaluation_count、stop_reason）写入 checkpoint，恢复训练不会重算 patience。</div>
+          </details>
+          <details>
+            <summary>为什么 train_only_samples/s 很高，但 NPU 利用率仍然低？</summary>
+            <div class="detail-body">该指标主要反映 batch 返回后主机提交调用的速率，NPU 默认异步执行；它不是设备同步后的真实吞吐。应同时查看 wall_samples/s、host_data_wait 和 NPU utilization。</div>
+          </details>
+          <details>
+            <summary>为什么不能直接把 DataLoader timeout 调到很大？</summary>
+            <div class="detail-body">timeout 的目的在于把 worker 死锁或读取异常转成明确失败。首 batch 卡住时应先用 num_workers=0、1、2 分阶段定位，而不是把 180 秒改成 1800 秒继续等待。</div>
+          </details>
+          <details>
+            <summary>什么时候应该使用 packed_uint8？</summary>
+            <div class="detail-body">当同机实测表明 PNG 解码、CPU 或小文件随机读取限制 NPU 利用率时。切换前后应保持模型、batch、worker、增强和训练步数一致，比较稳定区间吞吐和 data wait。</div>
+          </details>
+          <details>
+            <summary>为什么只训练名称包含 cls 的参数？</summary>
+            <div class="detail-body">这是当前任务的冻结策略，用完整预训练主干只更新分类模块。严格加载检查确保所有被冻结的非 cls 参数和 buffer 都来自基础 checkpoint，而不是随机初始化。</div>
           </details>
         </div>
       </div>
@@ -1192,14 +1656,14 @@ model.load_state_dict(state_dict)</code></pre>
 
     <div class="final wrap">
       <div class="final-box">
-        <span class="eyebrow">Ready for hardware validation</span>
+        <span class="eyebrow">Reliable before scalable</span>
         <h2>先证明链路可靠，再让八张卡长时间工作</h2>
         <p>
-          推荐顺序是：数据审计 → CPU smoke → 1P smoke → 8P smoke → checkpoint 恢复 →
-          PNG/packed A/B → 正式训练。每一步都有明确产物和停止条件。
+          推荐顺序是：数据契约 → 索引与审计 → 模型和 checkpoint 校验 → 2-step 基线 → 1P smoke → probe/validation → 独立 test 评估 → 恢复 → PNG/packed A/B → 8P smoke → 正式训练。
         </p>
         <div class="hero-actions">
-          <a class="button primary" href="#quickstart">回到使用步骤</a>
+          <a class="button primary" href="#quickstart">回到完整上手</a>
+          <a class="button" href="#recipes">打开配置处方</a>
           <a class="button" href="#top">返回顶部</a>
         </div>
       </div>
@@ -1207,7 +1671,7 @@ model.load_state_dict(state_dict)</code></pre>
   </main>
 
   <footer>
-    <div class="wrap">CLSTrainer · Local self-contained tutorial · No external assets</div>
+    <div class="wrap">CLSTrainer · Self-contained production handbook · No external assets</div>
   </footer>
 
   <script>
@@ -1242,15 +1706,14 @@ model.load_state_dict(state_dict)</code></pre>
       addEventListener("resize", updateProgress);
       updateProgress();
 
-      document.querySelectorAll(".copy").forEach(button => {
-        button.addEventListener("click", async () => {
+      const copyText = async (button, text) => {
+        const previous = button.textContent;
+        try {
+          await navigator.clipboard.writeText(text);
+          button.textContent = "已复制";
+        } catch {
           const code = button.closest(".code-shell")?.querySelector("code");
-          if (!code) return;
-          const previous = button.textContent;
-          try {
-            await navigator.clipboard.writeText(code.textContent);
-            button.textContent = "已复制";
-          } catch {
+          if (code) {
             const range = document.createRange();
             range.selectNodeContents(code);
             const selection = getSelection();
@@ -1258,9 +1721,250 @@ model.load_state_dict(state_dict)</code></pre>
             selection.addRange(range);
             button.textContent = "已选择";
           }
-          setTimeout(() => { button.textContent = previous; }, 1400);
+        }
+        setTimeout(() => { button.textContent = previous; }, 1400);
+      };
+
+      document.querySelectorAll(".copy").forEach(button => {
+        button.addEventListener("click", () => {
+          const code = button.closest(".code-shell")?.querySelector("code");
+          if (code) copyText(button, code.textContent);
         });
       });
+
+      const recipes = {
+        first_batch: {
+          title: "首个 batch 卡住或 timeout",
+          severity: "P0 · BLOCKER",
+          summary: "先把问题分成数据路径与 NPU 训练两段。NPU 下多 worker 必须使用 spawn；首批异常不应通过延长 timeout 掩盖。",
+          checks: [
+            "确认日志是否已经出现 [DATALOADER] first batch ready。",
+            "将 train/eval num_workers 都设为 0，关闭增强，只跑 2 step。",
+            "单进程成功后按 1 worker → 2 workers 恢复。",
+            "查看 resolved_config.json，确认角色级 override 真正生效。"
+          ],
+          avoid: [
+            "不要把 timeout 从 180 秒直接提高到很大。",
+            "不要在模型 factory 中自行初始化 NPU。",
+            "不要同时恢复 worker、增强、quick 和 full。"
+          ],
+          yaml: `dataloader:\n  multiprocessing_context: spawn\n  timeout_seconds: 180\n  train:\n    num_workers: 0\n    pin_memory: false\n  eval:\n    num_workers: 0\n    pin_memory: false\naugmentation:\n  enabled: false`,
+          cli: `dataloader.train.num_workers=0 \\\ndataloader.eval.num_workers=0 \\\ndataloader.train.pin_memory=false \\\ndataloader.eval.pin_memory=false \\\naugmentation.enabled=false \\\nevaluation.train_probe_every_steps=0 \\\nevaluation.val_quick_every_steps=0 \\\nevaluation.val_full_every_steps=0 \\\nevaluation.val_full_at_end=false`,
+          acceptance: "2-step 基线完成；随后 spawn 1/2 worker 均能在 180 秒内返回首 batch。"
+        },
+        low_npu: {
+          title: "NPU 利用率低，host_data_wait 很高",
+          severity: "P1 · THROUGHPUT",
+          summary: "当 host_data_wait 远高于 H2D、forward、backward 主机提交时间时，瓶颈在 PNG 解码、增强或存储，而不是模型计算。",
+          checks: [
+            "比较稳定阶段而不是首步冷启动。",
+            "保持 batch 不变，按 worker=2→4→8 做 A/B。",
+            "观察 CPU、iowait、worker RSS 和共享存储负载。",
+            "在本地 NVMe 上对比 PNG 与 packed_uint8。"
+          ],
+          avoid: [
+            "不要先修改模型结构或 loss。",
+            "H2D 只有毫秒时不要把 pin_memory 当作首要方案。",
+            "worker 提升不足时不要继续无上限增加进程。"
+          ],
+          yaml: `dataloader:\n  train:\n    num_workers: 4\n    prefetch_factor: 2\n    worker_num_threads: 1\n    pin_memory: false`,
+          cli: `dataloader.train.num_workers=4 \\\ndataloader.train.prefetch_factor=2 \\\ndataloader.train.worker_num_threads=1 \\\ndataloader.train.pin_memory=false`,
+          acceptance: "稳定区间 wall throughput 明显提高，host_data_wait 降低，且 CPU/RSS/I/O 没有不可接受的放大。"
+        },
+        oom: {
+          title: "NPU 显存不足或 OOM",
+          severity: "P0 · MEMORY",
+          summary: "首先降低每 rank 的 local batch，而不是改变固定图像尺寸。八卡总 batch = local_batch_size × world_size。",
+          checks: [
+            "确认 OOM 出现在 forward、backward 还是 evaluation。",
+            "记录当前 local batch、AMP dtype 和模型实际输入 shape。",
+            "评估阶段 OOM 时分别调整 eval batch 路径或关闭不必要的 preview。"
+          ],
+          avoid: [
+            "不要随意修改 data.width/height 绕过 OOM。",
+            "不要通过关闭主干加载检查换小模型而不记录实验变化。",
+            "不要忘记总 batch 变化可能需要重新调学习率。"
+          ],
+          yaml: `train:\n  local_batch_size: 32\ndevice:\n  amp: true\n  amp_dtype: bfloat16`,
+          cli: `train.local_batch_size=32 \\\ndevice.amp=true \\\ndevice.amp_dtype=bfloat16`,
+          acceptance: "连续 100 step 无 OOM，loss 与梯度稳定，并记录新的全局 batch。"
+        },
+        eval_slow: {
+          title: "probe / validation evaluation 太慢",
+          severity: "P1 · EVALUATION",
+          summary: "val_quick 可以降低每视频采样数或降低频率；val_full 是完整评估，不应通过偷偷删样本来加速。train probe 频率独立于 validation，用于泛化差距观测。",
+          checks: [
+            "查看 Data pipeline 中 train_probe_samples_global、val_quick_samples_global 和 val_full_samples_global。",
+            "确认训练是否在 step 命中 full，而不是卡死。",
+            "评估使用 PNG 时检查 eval worker 和存储。",
+            "smoke 与正式训练使用不同评估周期。"
+          ],
+          avoid: [
+            "不要把 val_full 当作 val_quick 使用。",
+            "不要在 2-step smoke 中评估十万级 pair。",
+            "正式训练结束不要永久关闭 final full validation。"
+          ],
+          yaml: `evaluation:\n  train_probe_every_steps: 2000\n  train_probe_pairs_per_video: 8\n  val_quick_every_steps: 1000\n  val_quick_pairs_per_video: 8\n  val_full_every_steps: 10000\n  val_full_at_end: true`,
+          cli: `evaluation.train_probe_every_steps=2000 \\\nevaluation.train_probe_pairs_per_video=8 \\\nevaluation.val_quick_every_steps=1000 \\\nevaluation.val_quick_pairs_per_video=8 \\\nevaluation.val_full_every_steps=10000 \\\nevaluation.val_full_at_end=true`,
+          acceptance: "quick 在可接受时间内完成；full 按计划触发并生成完整 metrics、错例与报告。"
+        },
+        fp_high: {
+          title: "0.99 阈值下误报 FP 很高",
+          severity: "P1 · QUALITY",
+          summary: "先定位具体游戏、视频和困难负样本，再讨论阈值损失。提高 threshold loss 并不是只降低 FP 的单向旋钮。",
+          checks: [
+            "检查 false_positive.parquet 和 errors.html。",
+            "按 game-label 查看 specificity 与 FP rate。",
+            "检查错误标注、跨 split 重复和缺少困难负样本。",
+            "比较 FP 是否集中在某个游戏或 UI 模式。"
+          ],
+          avoid: [
+            "不要仅凭全局 F1 调参数。",
+            "不要直接把 threshold 提得更高而不评估 FN。",
+            "不要同时修改采样、loss 和模型，导致无法归因。"
+          ],
+          yaml: `loss:\n  threshold_loss_weight: 0.20\n  threshold_safety_margin: 0.20\nevaluation:\n  selection_weights:\n    global_f1: 0.35\n    macro_game_f1: 0.40\n    worst_game_f1: 0.25`,
+          cli: `# 先保持参数不变，补困难负样本并复评。\n# 确认阈值附近分离不足后，再做单变量 A/B：\nloss.threshold_loss_weight=0.25`,
+          acceptance: "目标游戏 FP rate 下降，同时正类 recall 和 worst-game F1 不出现不可接受退化。"
+        },
+        fn_high: {
+          title: "0.99 阈值下漏报 FN 很高",
+          severity: "P1 · QUALITY",
+          summary: "固定 0.99 会使正类 margin 要求很严格。先区分标签噪声、正类覆盖不足、特定游戏欠拟合和阈值损失过强。",
+          checks: [
+            "检查 false_negative.parquet 和临界正样本。",
+            "按游戏比较 recall，确认是否集中在小游戏。",
+            "检查正类训练样本质量和 delta 分布。",
+            "查看 threshold weight 介入后 FN 是否明显增加。"
+          ],
+          avoid: [
+            "不要直接降低部署阈值，除非业务规则允许。",
+            "不要只增加正类采样而忽略校准和 FP。",
+            "不要在没有自然分布验证集时宣称 0.99 是真实概率。"
+          ],
+          yaml: `loss:\n  threshold_loss_weight: 0.15\n  threshold_warmup_ratio: 0.15\n  threshold_ramp_ratio: 0.25`,
+          cli: `loss.threshold_loss_weight=0.15 \\\nloss.threshold_warmup_ratio=0.15 \\\nloss.threshold_ramp_ratio=0.25`,
+          acceptance: "FN 和正类 recall 改善，同时 FP、macro-game 与 worst-game 指标仍满足业务要求。"
+        },
+        small_game: {
+          title: "小游戏或 worst-game 表现差",
+          severity: "P1 · FAIRNESS",
+          summary: "game_alpha 控制游戏采样权重与数据量的关系：0 更接近游戏均匀，1 更接近按数据规模。",
+          checks: [
+            "查看 metrics_by_game 和 game-label 样本量。",
+            "确认小游戏是否缺少某类或某个 delta 的合法 pair。",
+            "比较训练实际 by_game_label_delta 分布。",
+            "先做 game_alpha 单变量 A/B。"
+          ],
+          avoid: [
+            "不要只看 global F1。",
+            "不要把 game_alpha 降到 0 后忽略极小样本过拟合。",
+            "不要在没有稳定基线时设置过高 worst-game floor。"
+          ],
+          yaml: `sampler:\n  game_alpha: 0.0\nevaluation:\n  selection_weights:\n    global_f1: 0.30\n    macro_game_f1: 0.40\n    worst_game_f1: 0.30`,
+          cli: `sampler.game_alpha=0.0 \\\nevaluation.selection_weights='{global_f1: 0.30, macro_game_f1: 0.40, worst_game_f1: 0.30}'`,
+          acceptance: "worst-game 和 macro-game 指标提升，且大游戏性能没有超过可接受退化。"
+        },
+        duplicates: {
+          title: "重复数据 warning 很多",
+          severity: "P1 · DATA QUALITY",
+          summary: "相同内容跨 split、同一源视频横跨 train/val/test 现在是 error，训练前必须解决；split 内重复是 warning，会浪费采样预算。",
+          checks: [
+            "区分 within-split warning 与 cross-split error。",
+            "检查是否来自合法静态帧、批量复制或目录重复。",
+            "确认没有 cross-label same-content error。",
+            "清理后重建 index、audit 和 packed 数据。"
+          ],
+          avoid: [
+            "不要用旧 audit.json 跑新协议：格式升级后必须重建索引。",
+            "不要把相同文件名误认为相同内容。",
+            "不要修改 duplicate policy 来掩盖同内容异标签或跨 split 泄漏。"
+          ],
+          yaml: `data:\n  duplicate_policy:\n    same_label_cross_split: error\n    same_label_within_split: warning\n    cross_label_same_content: error\n    same_basename: info`,
+          cli: `# 策略通常保持不变。清理数据后重新执行：\npython tools/build_index.py ...\npython tools/audit_dataset.py ... --strict`,
+          acceptance: "cross-label error 为 0；跨 split 重复经过人工确认或清理；重新生成的审计与当前配置一致。"
+        },
+        resume: {
+          title: "训练中断后需要继续",
+          severity: "P0 · RECOVERY",
+          summary: "必须使用 checkpoint_*.pth，而不是 model_*.pth。恢复目标 max_steps 必须大于 checkpoint 中的 global_step。",
+          checks: [
+            "确认基础 checkpoint 路径和哈希未变化。",
+            "确认模型 factory 和 trainable key 集未变化。",
+            "查看恢复日志中的 step、epoch 和 step_in_epoch。",
+            "恢复后跑短步数并比较采样和 loss。"
+          ],
+          avoid: [
+            "不要用纯 model state_dict 作为 resume_path。",
+            "不要更换基础 checkpoint 后强行恢复 trainable_only 状态。",
+            "不要把 max_steps 设置为小于或等于当前 step。"
+          ],
+          yaml: `train:\n  resume_path: runs/<RUN_NAME>/checkpoints/checkpoint_last.pth\n  max_steps: <NEW_TOTAL_STEP>`,
+          cli: `train.resume_path=runs/<RUN_NAME>/checkpoints/checkpoint_last.pth \\\ntrain.max_steps=<NEW_TOTAL_STEP>`,
+          acceptance: "日志显示正确恢复 step/epoch；继续训练、评估和 checkpoint 均正常。"
+        },
+        packed: {
+          title: "何时切换 packed_uint8",
+          severity: "P2 · OPTIMIZATION",
+          summary: "只有 PNG worker 增加后仍由 host_data_wait 主导，且本地 NVMe 空间充足时，才值得打包。",
+          checks: [
+            "先完成 PNG worker=2/4/8 的同机 A/B。",
+            "估算 3×208×448 bytes/帧 的未压缩磁盘成本。",
+            "train/test 分别打包，并设置 frame/video 两组索引。",
+            "保持模型、batch、增强、worker、步数一致后比较。"
+          ],
+          avoid: [
+            "不要在远程低带宽存储上假设 memmap 必然更快。",
+            "不要只看冷启动前几十步。",
+            "不要忘记尺寸或扫描策略变化后需要重新打包。"
+          ],
+          yaml: `data:\n  backend: packed_uint8\n  train_packed_index: /local_nvme/train_packed/packed_frames.parquet\n  train_packed_video_index: /local_nvme/train_packed/packed_video_entries.parquet\n  val_packed_index: /local_nvme/val_packed/packed_frames.parquet\n  val_packed_video_index: /local_nvme/val_packed/packed_video_entries.parquet\n  test_packed_index: /local_nvme/test_packed/packed_frames.parquet\n  test_packed_video_index: /local_nvme/test_packed/packed_video_entries.parquet`,
+          cli: `--config configs/npu_production_packed.yaml \\\ndataloader.train.num_workers=2 \\\ntrain.local_batch_size=64`,
+          acceptance: "稳定区间端到端吞吐提高，host_data_wait 降低，且 RSS、page fault 与存储压力可接受。"
+        }
+      };
+
+      const recipeSelect = document.getElementById("recipe-select");
+      const renderList = (element, items) => {
+        element.replaceChildren(...items.map(item => {
+          const li = document.createElement("li");
+          li.textContent = item;
+          return li;
+        }));
+      };
+      const renderRecipe = key => {
+        const recipe = recipes[key];
+        document.getElementById("recipe-title").textContent = recipe.title;
+        document.getElementById("recipe-severity").textContent = recipe.severity;
+        document.getElementById("recipe-summary").textContent = recipe.summary;
+        renderList(document.getElementById("recipe-checks"), recipe.checks);
+        renderList(document.getElementById("recipe-avoid"), recipe.avoid);
+        document.getElementById("recipe-yaml").textContent = recipe.yaml;
+        document.getElementById("recipe-cli").textContent = recipe.cli;
+        document.getElementById("recipe-acceptance").textContent = recipe.acceptance;
+      };
+      recipeSelect.addEventListener("change", event => renderRecipe(event.target.value));
+      renderRecipe(recipeSelect.value);
+
+      const searchInput = document.getElementById("param-search");
+      const groupSelect = document.getElementById("param-group");
+      const parameterRows = [...document.querySelectorAll("#parameter-body tr")];
+      const countOutput = document.getElementById("param-count");
+      const filterParameters = () => {
+        const query = searchInput.value.trim().toLowerCase();
+        const group = groupSelect.value;
+        let visible = 0;
+        parameterRows.forEach(row => {
+          const matchesGroup = group === "all" || row.dataset.group === group;
+          const matchesText = !query || row.textContent.toLowerCase().includes(query);
+          row.hidden = !(matchesGroup && matchesText);
+          if (!row.hidden) visible += 1;
+        });
+        countOutput.textContent = `显示 ${visible} / ${parameterRows.length} 个参数`;
+      };
+      searchInput.addEventListener("input", filterParameters);
+      groupSelect.addEventListener("change", filterParameters);
+      filterParameters();
     })();
   </script>
 </body>
