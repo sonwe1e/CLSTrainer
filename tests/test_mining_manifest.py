@@ -78,19 +78,66 @@ class ScanNegativePoolTests(unittest.TestCase):
         images[5, 0, 0, 0, 0] = 0.95
         labels = torch.zeros(6, dtype=torch.long)
         metas = [
-            {"game": "A", "video_id": "01", "frame0_id": 1, "frame1_id": 3, "delta": 2, "negative_subtype": "flat_floor"},
-            {"game": "A", "video_id": "01", "frame0_id": 2, "frame1_id": 4, "delta": 2, "negative_subtype": "flat_floor"},
-            {"game": "A", "video_id": "02", "frame0_id": 1, "frame1_id": 3, "delta": 2, "negative_subtype": "flat_floor"},
-            {"game": "A", "video_id": "02", "frame0_id": 2, "frame1_id": 4, "delta": 2, "negative_subtype": "flat_floor"},
-            {"game": "B", "video_id": "01", "frame0_id": 1, "frame1_id": 3, "delta": 2, "negative_subtype": None},
-            {"game": "B", "video_id": "01", "frame0_id": 1, "frame1_id": 3, "delta": 2, "negative_subtype": None},
+            {
+                "game": "A",
+                "video_id": "01",
+                "frame0_id": 1,
+                "frame1_id": 3,
+                "delta": 2,
+                "negative_subtype": "flat_floor",
+            },
+            {
+                "game": "A",
+                "video_id": "01",
+                "frame0_id": 2,
+                "frame1_id": 4,
+                "delta": 2,
+                "negative_subtype": "flat_floor",
+            },
+            {
+                "game": "A",
+                "video_id": "02",
+                "frame0_id": 1,
+                "frame1_id": 3,
+                "delta": 2,
+                "negative_subtype": "flat_floor",
+            },
+            {
+                "game": "A",
+                "video_id": "02",
+                "frame0_id": 2,
+                "frame1_id": 4,
+                "delta": 2,
+                "negative_subtype": "flat_floor",
+            },
+            {
+                "game": "B",
+                "video_id": "01",
+                "frame0_id": 1,
+                "frame1_id": 3,
+                "delta": 2,
+                "negative_subtype": None,
+            },
+            {
+                "game": "B",
+                "video_id": "01",
+                "frame0_id": 1,
+                "frame1_id": 3,
+                "delta": 2,
+                "negative_subtype": None,
+            },
         ]
         return [{"images": images, "labels": labels, "meta": metas}]
 
     def test_topk_per_video_and_dedup(self) -> None:
         model = self._ScoringModel()
         rows = scan_negative_pool(
-            model, self._batch_loader(), "cpu", top_k_per_video=1, score_threshold=None, max_samples=None
+            model,
+            self._batch_loader(),
+            "cpu",
+            top_k_per_video=1,
+            score_threshold=None,
+            max_samples=None,
         )
         by_uid = {row["source_video_uid"]: row["p_positive"] for row in rows}
         # softmax((-score, score))[1] = sigmoid(2*score), so p_positive is
@@ -101,19 +148,32 @@ class ScanNegativePoolTests(unittest.TestCase):
         # A::01 keeps its highest-scoring pair (score 0.9 -> sigmoid(1.8)).
         self.assertAlmostEqual(by_uid["A::01"], 0.858, places=3)
         # Rows are ranked best-first.
-        self.assertEqual([row["p_positive"] for row in rows], sorted((r["p_positive"] for r in rows), reverse=True))
+        self.assertEqual(
+            [row["p_positive"] for row in rows],
+            sorted((r["p_positive"] for r in rows), reverse=True),
+        )
 
     def test_score_threshold_filters(self) -> None:
         model = self._ScoringModel()
         rows = scan_negative_pool(
-            model, self._batch_loader(), "cpu", top_k_per_video=8, score_threshold=0.75, max_samples=None
+            model,
+            self._batch_loader(),
+            "cpu",
+            top_k_per_video=8,
+            score_threshold=0.75,
+            max_samples=None,
         )
         self.assertTrue(all(row["p_positive"] >= 0.75 for row in rows))
 
     def test_max_samples_caps(self) -> None:
         model = self._ScoringModel()
         rows = scan_negative_pool(
-            model, self._batch_loader(), "cpu", top_k_per_video=8, score_threshold=None, max_samples=2
+            model,
+            self._batch_loader(),
+            "cpu",
+            top_k_per_video=8,
+            score_threshold=None,
+            max_samples=2,
         )
         self.assertEqual(len(rows), 2)
 
@@ -121,7 +181,12 @@ class ScanNegativePoolTests(unittest.TestCase):
         loader = self._batch_loader()
         loader[0]["labels"] = torch.ones(6, dtype=torch.long)
         rows = scan_negative_pool(
-            self._ScoringModel(), loader, "cpu", top_k_per_video=8, score_threshold=None, max_samples=None
+            self._ScoringModel(),
+            loader,
+            "cpu",
+            top_k_per_video=8,
+            score_threshold=None,
+            max_samples=None,
         )
         self.assertEqual(rows, [])
 
