@@ -34,9 +34,9 @@ class ConsistentUint8RandomErasing:
         for _ in range(10):
             target_area = area * torch.empty(()).uniform_(*self.scale).item()
             aspect = math.exp(
-                torch.empty(()).uniform_(
-                    math.log(self.ratio[0]), math.log(self.ratio[1])
-                ).item()
+                torch.empty(())
+                .uniform_(math.log(self.ratio[0]), math.log(self.ratio[1]))
+                .item()
             )
             candidate_height = int(round(math.sqrt(target_area * aspect)))
             candidate_width = int(round(math.sqrt(target_area / aspect)))
@@ -205,11 +205,7 @@ class ConsistentPairAugment:
                             scale=affine.get("scale", [0.98, 1.02]),
                             shear=affine.get("shear", [-1.0, 1.0]),
                             interpolation=InterpolationMode[
-                                str(
-                                    affine.get(
-                                        "interpolation", "bilinear"
-                                    )
-                                ).upper()
+                                str(affine.get("interpolation", "bilinear")).upper()
                             ],
                             fill=affine.get("fill", 0),
                         )

@@ -38,9 +38,7 @@ class ScanPolicy:
             frame_extensions=frozenset(extensions),
             ignore_directory_prefixes=tuple(
                 str(item)
-                for item in data_config.get(
-                    "ignore_directory_prefixes", ["_", "."]
-                )
+                for item in data_config.get("ignore_directory_prefixes", ["_", "."])
             ),
             ignore_directory_names=frozenset(
                 str(item).casefold()
@@ -50,18 +48,13 @@ class ScanPolicy:
                 )
             ),
             ignore_file_globs=tuple(
-                str(item)
-                for item in data_config.get("ignore_file_globs", [])
+                str(item) for item in data_config.get("ignore_file_globs", [])
             ),
             unexpected_nested_directory_severity=_severity(
-                data_config.get(
-                    "unexpected_nested_directory_severity", "warning"
-                ),
+                data_config.get("unexpected_nested_directory_severity", "warning"),
                 field_name="unexpected_nested_directory_severity",
             ),
-            ignored_example_limit=int(
-                data_config.get("ignored_example_limit", 20)
-            ),
+            ignored_example_limit=int(data_config.get("ignored_example_limit", 20)),
         )
         policy.validate()
         return policy
@@ -73,19 +66,14 @@ class ScanPolicy:
             raise ValueError("ignored_example_limit must be non-negative")
 
     def ignore_directory(self, path: Path) -> bool:
-        return (
-            path.name.casefold() in self.ignore_directory_names
-            or any(
-                path.name.startswith(prefix)
-                for prefix in self.ignore_directory_prefixes
-            )
+        return path.name.casefold() in self.ignore_directory_names or any(
+            path.name.startswith(prefix) for prefix in self.ignore_directory_prefixes
         )
 
     def ignore_file(self, path: Path) -> bool:
         name = path.name.casefold()
         return any(
-            fnmatch(name, pattern.casefold())
-            for pattern in self.ignore_file_globs
+            fnmatch(name, pattern.casefold()) for pattern in self.ignore_file_globs
         )
 
     def is_frame_file(self, path: Path) -> bool:
@@ -94,12 +82,8 @@ class ScanPolicy:
     def to_dict(self) -> dict[str, Any]:
         return {
             "frame_extensions": sorted(self.frame_extensions),
-            "ignore_directory_prefixes": list(
-                self.ignore_directory_prefixes
-            ),
-            "ignore_directory_names": sorted(
-                self.ignore_directory_names
-            ),
+            "ignore_directory_prefixes": list(self.ignore_directory_prefixes),
+            "ignore_directory_names": sorted(self.ignore_directory_names),
             "ignore_file_globs": list(self.ignore_file_globs),
             "unexpected_nested_directory_severity": (
                 self.unexpected_nested_directory_severity
@@ -178,8 +162,7 @@ class ScanFindings:
             "ignored": {
                 "counts": dict(sorted(self.ignored_counts.items())),
                 "examples": {
-                    key: value
-                    for key, value in sorted(self.ignored_examples.items())
+                    key: value for key, value in sorted(self.ignored_examples.items())
                 },
             },
         }

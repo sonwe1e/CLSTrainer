@@ -66,9 +66,7 @@ def clone_checkpoint_pair(
         metadata = json.loads(source_metadata.read_text(encoding="utf-8"))
         metadata["filename"] = f"model_{target_tag}.pth"
         metadata["alias_source"] = f"model_{source_tag}.pth"
-        _atomic_json_save(
-            metadata, output_dir / f"model_{target_tag}.metadata.json"
-        )
+        _atomic_json_save(metadata, output_dir / f"model_{target_tag}.metadata.json")
 
 
 def remove_checkpoint_pair(output_dir: str | Path, tag: str) -> None:
@@ -172,8 +170,7 @@ def save_checkpoint_pair(
             for key, value in full_state_dict.items()
             if key in trainable_names
             or any(
-                key.startswith(name.rsplit(".", 1)[0] + ".")
-                for name in trainable_names
+                key.startswith(name.rsplit(".", 1)[0] + ".") for name in trainable_names
             )
         }
     elif state_mode == "full":
@@ -221,15 +218,14 @@ def save_checkpoint_pair(
             "step_in_epoch": step_in_epoch,
             "global_step": global_step,
             "sampler_epoch": epoch,
-            "sampler_state": sampler_state or {
+            "sampler_state": sampler_state
+            or {
                 "epoch": epoch,
                 "step_in_epoch": step_in_epoch,
             },
             "best_metrics": best_metrics,
             "random_state": (
-                rank_random_states[0]
-                if rank_random_states
-                else capture_random_state()
+                rank_random_states[0] if rank_random_states else capture_random_state()
             ),
             "rank_random_states": rank_random_states,
             "evaluation_state": evaluation_state or {},
@@ -265,9 +261,7 @@ def restore_training_checkpoint(
     if state_mode == "trainable_only":
         stored_hash = checkpoint.get("base_checkpoint_sha256")
         if stored_hash and expected_base_checkpoint:
-            actual_hash = _file_sha256(
-                str(Path(expected_base_checkpoint).resolve())
-            )
+            actual_hash = _file_sha256(str(Path(expected_base_checkpoint).resolve()))
             if actual_hash != stored_hash:
                 raise RuntimeError(
                     "Resume base checkpoint hash does not match the checkpoint state."
@@ -283,14 +277,11 @@ def restore_training_checkpoint(
             for key in target.state_dict()
             if key in trainable_names
             or any(
-                key.startswith(name.rsplit(".", 1)[0] + ".")
-                for name in trainable_names
+                key.startswith(name.rsplit(".", 1)[0] + ".") for name in trainable_names
             )
         }
         stored_expected = set(
-            checkpoint.get(
-                "expected_trainable_state_keys", checkpoint["model"].keys()
-            )
+            checkpoint.get("expected_trainable_state_keys", checkpoint["model"].keys())
         )
         actual_keys = set(checkpoint["model"])
         if stored_expected != current_expected or actual_keys != current_expected:

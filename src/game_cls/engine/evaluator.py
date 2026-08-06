@@ -369,6 +369,47 @@ def _worst_game_fpr_and_recall(game_counters: dict) -> tuple[float, float]:
     return worst_fpr, worst_recall
 
 
+def _build_subtype_group(group_catalogs: dict, subtype_counts_array) -> dict:
+    """Materialize the game_label_subtype counters dict (vectorized path)."""
+    catalog = group_catalogs.get("game_label_subtype")
+    if not catalog:
+        return {}
+    return {
+        tuple(key): values.tolist()
+        for key, values in zip(catalog, subtype_counts_array, strict=False)
+        if values.sum()
+    }
+
+
+def _worst_subtype_fpr_and_recall(
+    subtype_counters: dict,
+) -> tuple[float | None, float | None]:
+    """Worst negative-subtype FPR (max) and recall (min).
+
+    ``None`` when no subtype grouping was configured/available.
+    """
+    if not subtype_counters:
+        return None, None
+    fpr_values: list[float] = []
+    recall_values: list[float] = []
+    for counts in subtype_counters.values():
+        tp, fp, fn, tn = counts
+        if fp + tn:
+            fpr_values.append(fp / (fp + tn))
+        if tp + fn:
+            recall_values.append(tp / (tp + fn))
+    worst_fpr = max(fpr_values) if fpr_values else 0.0
+    worst_recall = min(recall_values) if recall_values else 0.0
+    return worst_fpr, worst_recall
+
+
+def _subtype_negative_counts(subtype_counters: dict) -> dict:
+    """Per-subtype negative denominators (fp + tn) for each group."""
+    return {
+        key: int(counts[1]) + int(counts[3]) for key, counts in subtype_counters.items()
+    }
+
+
 def _ece_tail(
     calibration_counts,
     calibration_probabilities,
@@ -540,6 +581,14 @@ def evaluate(
             (len(group_catalogs["game_label"]), 4), dtype=np.int64
         )
         video_counts_array = np.zeros((len(group_catalogs["video"]), 4), dtype=np.int64)
+        subtype_counts_array = (
+            np.zeros(
+                (len(group_catalogs["game_label_subtype"]), 4),
+                dtype=np.int64,
+            )
+            if "game_label_subtype" in group_catalogs
+            else None
+        )
         video_probability_count = np.zeros(len(group_catalogs["video"]), dtype=np.int64)
         video_probability_sum = np.zeros(len(group_catalogs["video"]), dtype=np.float64)
         video_probability_min = np.full(
@@ -712,6 +761,11 @@ def evaluate(
                         batch["game_label_id"],
                     )
                     accumulate_counts(video_counts_array, batch["video_group_id"])
+                    if subtype_counts_array is not None:
+                        accumulate_counts(
+                            subtype_counts_array,
+                            batch["game_label_subtype_id"],
+                        )
                     video_ids = (
                         batch["video_group_id"].numpy().astype(np.int64, copy=False)
                     )
@@ -801,6 +855,7 @@ def evaluate(
         if writer is not None:
             writer.close()
 
+    group_game_label_subtype: dict = {}
     if vectorized_groups and not distributed:
         assert group_catalogs is not None
         group_game, group_video, group_game_label, group_video_confidence = (
@@ -814,6 +869,9 @@ def evaluate(
                 video_probability_min,
                 video_probability_max,
             )
+        )
+        group_game_label_subtype = _build_subtype_group(
+            group_catalogs, subtype_counts_array
         )
     if distributed:
         import torch.distributed as dist
@@ -838,15 +896,18 @@ def evaluate(
             # All ranks share the same catalog, so the per-catalog index
             # arrays reduce directly as tensors instead of gathering large
             # Python dicts to rank 0.
+            sum_arrays = [
+                game_counts_array,
+                game_label_counts_array,
+                video_counts_array,
+                video_probability_count,
+                video_probability_sum,
+            ]
+            if subtype_counts_array is not None:
+                sum_arrays.append(subtype_counts_array)
             _all_reduce_group_arrays(
                 dist,
-                (
-                    game_counts_array,
-                    game_label_counts_array,
-                    video_counts_array,
-                    video_probability_count,
-                    video_probability_sum,
-                ),
+                tuple(sum_arrays),
                 video_probability_min,
                 video_probability_max,
                 device,
@@ -863,6 +924,9 @@ def evaluate(
                     video_probability_min,
                     video_probability_max,
                 )
+            )
+            group_game_label_subtype = _build_subtype_group(
+                group_catalogs, subtype_counts_array
             )
         gathered_scores: list[Any] | None = None
         if exact_scores:
@@ -898,6 +962,7 @@ def evaluate(
             video_counters = group_video
             game_label_counters = group_game_label
             video_confidence = group_video_confidence
+            subtype_counters = group_game_label_subtype
         else:
             assert gathered_groups is not None
             game_counters = _merge_group_counters(
@@ -912,6 +977,7 @@ def evaluate(
             video_confidence = _merge_confidence(
                 [payload[3] for payload in gathered_groups]
             )
+            subtype_counters = {}
         if exact_scores:
             assert gathered_scores is not None
             margins = [margin for payload in gathered_scores for margin in payload[0]]
@@ -929,6 +995,7 @@ def evaluate(
         video_counters = group_video
         game_label_counters = group_game_label
         video_confidence = group_video_confidence
+        subtype_counters = {}
         tp, fp, fn, tn = local_counts.tolist()
         (
             cross_entropy_sum,
@@ -963,6 +1030,11 @@ def evaluate(
     worst_game_fpr, worst_game_positive_recall = _worst_game_fpr_and_recall(
         game_counters
     )
+    (
+        worst_subtype_fpr,
+        worst_subtype_recall,
+    ) = _worst_subtype_fpr_and_recall(subtype_counters)
+    subtype_negative_counts = _subtype_negative_counts(subtype_counters)
     recall_at_max_fpr, low_fpr_partial_auc = _low_fpr_histogram_metrics(
         positive_histogram, negative_histogram, max_fpr_for_recall
     )
@@ -1044,6 +1116,9 @@ def evaluate(
             "worst_game_positive_recall_at_decision_threshold": (
                 worst_game_positive_recall
             ),
+            "worst_subtype_fpr_at_decision_threshold": worst_subtype_fpr,
+            "worst_subtype_recall_at_decision_threshold": worst_subtype_recall,
+            "subtype_negative_counts": subtype_negative_counts,
             "negative_score_p99": negative_tail_percentiles[0],
             "negative_score_p999": negative_tail_percentiles[1],
             "negative_score_max": negative_score_max,
@@ -1065,6 +1140,11 @@ def evaluate(
             "by_game": by_game,
             "by_video": by_video,
             "by_game_label": by_game_label,
+            "by_game_label_subtype": (
+                _group_rows(subtype_counters, ("game", "label", "negative_subtype"))
+                if subtype_counters
+                else []
+            ),
         },
         retained_errors,
         retained_near,

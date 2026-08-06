@@ -56,6 +56,7 @@ def _pair_references(
             "delta": request.delta,
             "image0_path": display(path0),
             "image1_path": display(path1),
+            "negative_subtype": entry.negative_subtype,
         },
     )
 
@@ -156,6 +157,7 @@ class EvalPairDataset:
         deltas: np.ndarray,
         start_positions: np.ndarray,
         decoder: Callable[[Any], Any] | None = None,
+        group_by_negative_subtype: bool = False,
     ) -> None:
         self.videos = videos
         self.video_indices = video_indices.astype(np.int32, copy=False)
@@ -178,6 +180,37 @@ class EvalPairDataset:
             [game_label_to_id[(video.game, video.label)] for video in videos],
             dtype=np.int32,
         )
+        # Optional negative-subtype grouping (step5 P2): an extra catalog that
+        # flows through the same vectorized reduction. Only present when
+        # enabled AND at least one video carries a subtype; videos without a
+        # subtype group under the "_untyped" sentinel so every batch is
+        # internally consistent.
+        self._subtype_id_by_video: np.ndarray | None = None
+        has_subtype_metadata = any(
+            video.negative_subtype is not None for video in videos
+        )
+        if group_by_negative_subtype and has_subtype_metadata:
+            subtype_keys = sorted(
+                {
+                    (video.game, video.label, video.negative_subtype or "_untyped")
+                    for video in videos
+                }
+            )
+            subtype_to_id = {key: index for index, key in enumerate(subtype_keys)}
+            self.group_catalogs["game_label_subtype"] = subtype_keys
+            self._subtype_id_by_video = np.asarray(
+                [
+                    subtype_to_id[
+                        (
+                            video.game,
+                            video.label,
+                            video.negative_subtype or "_untyped",
+                        )
+                    ]
+                    for video in videos
+                ],
+                dtype=np.int32,
+            )
 
     def __len__(self) -> int:
         return len(self.video_indices)
@@ -197,6 +230,11 @@ class EvalPairDataset:
             "game_id": int(self._game_id_by_video[request.video_index]),
             "game_label_id": int(self._game_label_id_by_video[request.video_index]),
             "video_group_id": request.video_index,
+            "game_label_subtype_id": (
+                int(self._subtype_id_by_video[request.video_index])
+                if self._subtype_id_by_video is not None
+                else -1
+            ),
             "meta": meta,
         }
 
@@ -220,6 +258,11 @@ class EvalPairDataset:
                 "game_id": int(self._game_id_by_video[request.video_index]),
                 "game_label_id": int(self._game_label_id_by_video[request.video_index]),
                 "video_group_id": request.video_index,
+                "game_label_subtype_id": (
+                    int(self._subtype_id_by_video[request.video_index])
+                    if self._subtype_id_by_video is not None
+                    else -1
+                ),
                 "meta": meta,
             }
             for request, images, meta in zip(requests, decoded, metadata, strict=False)
@@ -240,6 +283,7 @@ def build_eval_dataset(
     world_size: int = 1,
     max_pairs_per_video: int | None = None,
     decoder: Callable[[Any], Any] | None = None,
+    group_by_negative_subtype: bool = False,
 ) -> EvalPairDataset:
     video_indices: list[int] = []
     deltas: list[int] = []
@@ -264,4 +308,5 @@ def build_eval_dataset(
         np.asarray(deltas, dtype=np.int8),
         np.asarray(start_positions, dtype=np.int32),
         decoder=decoder,
+        group_by_negative_subtype=group_by_negative_subtype,
     )

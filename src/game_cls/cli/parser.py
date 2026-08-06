@@ -29,6 +29,7 @@ from game_cls.cli.config_tools import (
     cmd_config_validate,
 )
 from game_cls.cli.dataset import (
+    cmd_dataset_annotate,
     cmd_dataset_audit,
     cmd_dataset_pack,
     cmd_dataset_prepare,
@@ -249,5 +250,24 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument("--images-per-shard", type=int, default=4096)
     pack.add_argument("overrides", nargs="*", metavar="key=value")
     pack.set_defaults(func=cmd_dataset_pack)
+    annotate = dataset_sub.add_parser(
+        "annotate",
+        help="Import per-video metadata into the metadata sidecar "
+        "(negative_subtype, sample_weight).",
+    )
+    annotate.add_argument("--config", required=True)
+    annotate.add_argument(
+        "--metadata",
+        required=True,
+        help="CSV/parquet of per-video rows: source_video_uid, "
+        "negative_subtype, sample_weight, ...",
+    )
+    annotate.add_argument(
+        "--out",
+        default=None,
+        help="Output sidecar parquet path (default: data.metadata_sidecar).",
+    )
+    annotate.add_argument("overrides", nargs="*", metavar="key=value")
+    annotate.set_defaults(func=cmd_dataset_annotate)
 
     return parser

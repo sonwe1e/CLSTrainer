@@ -110,6 +110,14 @@ def _selection_eligible(metrics: dict, evaluation_config: dict) -> bool:
             eligible = recall is not None and float(recall) >= float(
                 min_positive_recall
             )
+        max_worst_subtype_fpr = evaluation_config.get("max_worst_subtype_fpr")
+        if eligible and max_worst_subtype_fpr is not None:
+            worst_subtype_fpr = _metric_value(
+                metrics, "worst_subtype_fpr_at_decision_threshold"
+            )
+            eligible = worst_subtype_fpr is not None and float(
+                worst_subtype_fpr
+            ) <= float(max_worst_subtype_fpr)
         minimum_worst = evaluation_config.get("minimum_worst_game_f1")
         if eligible and minimum_worst is not None:
             worst_f1 = float(

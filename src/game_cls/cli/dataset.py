@@ -212,3 +212,86 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def cmd_dataset_annotate(args: argparse.Namespace) -> int:
+    """Import per-video metadata into the sidecar (step5 P2).
+
+    Reads a CSV/parquet keyed by ``source_video_uid``, validates every uid
+    against the configured train/val/test video indexes, and writes the
+    canonical sidecar parquet atomically.
+    """
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+    from game_cls.data.sidecar import (
+        validate_sidecar_against_index,
+        write_metadata_sidecar,
+    )
+    from game_cls.engine.training.loaders import _build_real_data_components
+
+    try:
+        config = load_config(args.config, args.overrides)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+
+    source = Path(args.metadata)
+    if source.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+
+        rows = pq.read_table(source).to_pylist()
+    else:
+        import csv
+
+        with source.open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            rows = [dict(row) for row in reader]
+    if not rows:
+        print(f"No metadata rows in {source}", file=sys.stderr)
+        return 2
+    if "source_video_uid" not in rows[0]:
+        print(
+            "Metadata input must contain a source_video_uid column.",
+            file=sys.stderr,
+        )
+        return 2
+
+    components = _build_real_data_components(config, rank=0, world_size=1)
+    entries = (
+        components["train_videos"]
+        + components["val_videos"]
+        + (components["test_videos"] or [])
+    )
+    sidecar = {
+        str(row["source_video_uid"]): {
+            "negative_subtype": row.get("negative_subtype"),
+            "scene_type": row.get("scene_type"),
+            "capture_domain": row.get("capture_domain"),
+            "difficulty": row.get("difficulty"),
+            "sample_weight": float(row.get("sample_weight", 1.0)),
+        }
+        for row in rows
+    }
+    validate_sidecar_against_index(sidecar, entries)
+
+    out_path = Path(args.out) if args.out else Path(config["data"]["metadata_sidecar"])
+    if not out_path:
+        print(
+            "No output sidecar path: pass --out or set data.metadata_sidecar.",
+            file=sys.stderr,
+        )
+        return 2
+    fingerprint = write_metadata_sidecar(rows, out_path)
+    print(
+        json.dumps(
+            {
+                "sidecar": str(out_path),
+                "videos": len(sidecar),
+                "metadata_fingerprint": fingerprint,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0

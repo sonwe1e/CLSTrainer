@@ -114,17 +114,13 @@ class EvaluationShardWriter:
     @staticmethod
     def _table(rows: list[dict]):
         pa, _, _ = _arrow()
-        normalized = [
-            {field: row.get(field) for field in ERROR_FIELDS} for row in rows
-        ]
+        normalized = [{field: row.get(field) for field in ERROR_FIELDS} for row in rows]
         return pa.Table.from_pylist(normalized, schema=_report_schema())
 
     def write(self, errors: list[dict], near_threshold: list[dict]) -> None:
         self._error_buffer.extend(errors)
         self._near_buffer.extend(near_threshold)
-        self._flush_full_groups(
-            self._error_buffer, self._error_writer
-        )
+        self._flush_full_groups(self._error_buffer, self._error_writer)
         self._flush_full_groups(self._near_buffer, self._near_writer)
 
     def _flush_full_groups(self, buffer: list[dict], writer) -> None:
@@ -140,9 +136,7 @@ class EvaluationShardWriter:
 
     def close(self) -> None:
         if not self._closed:
-            self._flush_remaining(
-                self._error_buffer, self._error_writer
-            )
+            self._flush_remaining(self._error_buffer, self._error_writer)
             self._flush_remaining(self._near_buffer, self._near_writer)
             self._error_writer.close()
             self._near_writer.close()
@@ -215,8 +209,7 @@ def _write_html(path: Path, rows: list[dict]) -> None:
         "<style>body{font-family:system-ui;margin:24px;background:#f5f6f8}"
         "article{background:white;padding:16px;margin:16px 0;border-radius:10px}"
         ".images{display:flex;gap:12px;align-items:flex-start}pre{white-space:pre-wrap}"
-        "</style><h1>FP / FN 双帧报告</h1>"
-        + "".join(cards),
+        "</style><h1>FP / FN 双帧报告</h1>" + "".join(cards),
         encoding="utf-8",
     )
 
@@ -232,9 +225,7 @@ def _materialize_packed_previews(
         import numpy as np
         from PIL import Image
     except ImportError as exc:
-        raise RuntimeError(
-            "Packed HTML previews require NumPy and Pillow"
-        ) from exc
+        raise RuntimeError("Packed HTML previews require NumPy and Pillow") from exc
     preview_dir = output_dir / "previews"
     rewritten = []
     exported: dict[int, str] = {}
@@ -285,9 +276,7 @@ def _merge_error_shards(
                         writer.write_table(filtered)
                         remaining = html_max_errors - len(preview)
                         if remaining > 0:
-                            preview.extend(
-                                filtered.slice(0, remaining).to_pylist()
-                            )
+                            preview.extend(filtered.slice(0, remaining).to_pylist())
     finally:
         fp_writer.close()
         fn_writer.close()
@@ -339,6 +328,10 @@ def write_evaluation_report(
             output_dir / "metrics_by_game_label.csv",
             grouped_metrics.get("by_game_label", []),
         )
+        _write_group_csv(
+            output_dir / "metrics_by_game_label_subtype.csv",
+            grouped_metrics.get("by_game_label_subtype", []),
+        )
     if merge_shards:
         preview = _merge_error_shards(
             (output_dir / "shards").glob("errors_rank_*.parquet"),
@@ -361,11 +354,7 @@ def write_evaluation_report(
             [row for row in errors if row.get("error_type") == "FN"],
             output_dir / "false_negative.parquet",
         )
-        _write_parquet(
-            near_threshold or [], output_dir / "near_threshold.parquet"
-        )
+        _write_parquet(near_threshold or [], output_dir / "near_threshold.parquet")
     if not lightweight:
-        preview = _materialize_packed_previews(
-            output_dir, preview, preview_decoder
-        )
+        preview = _materialize_packed_previews(output_dir, preview, preview_decoder)
         _write_html(output_dir / "errors.html", preview)

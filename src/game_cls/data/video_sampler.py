@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 from collections.abc import Iterator, Sequence
+from dataclasses import replace
 
 from .lazy_pair_dataset import PairRequest
 from .video_index import VideoEntry
@@ -39,6 +40,7 @@ class VideoBalancedPairBatchSampler:
         deduplicate_within_global_batch: bool | None = None,
         dedup_level: str = "pair",
         on_exhaustion: str = "warn_and_relax",
+        hard_negative_cfg: dict | None = None,
     ) -> None:
         if local_batch_size <= 0 or steps_per_epoch <= 0:
             raise ValueError("batch size and steps_per_epoch must be positive")
@@ -50,8 +52,7 @@ class VideoBalancedPairBatchSampler:
             )
         if on_exhaustion not in ("error", "warn_and_relax"):
             raise ValueError(
-                f"on_exhaustion must be error|warn_and_relax; "
-                f"got {on_exhaustion!r}"
+                f"on_exhaustion must be error|warn_and_relax; got {on_exhaustion!r}"
             )
         if deduplicate_within_global_batch is not None:
             # Legacy boolean: True -> pair, False -> none. The explicit
@@ -60,6 +61,21 @@ class VideoBalancedPairBatchSampler:
                 dedup_level = "none"
             if dedup_level == "none" and deduplicate_within_global_batch:
                 dedup_level = "pair"
+        if hard_negative_cfg and hard_negative_cfg.get("max_pairs_per_video"):
+            # Deterministic per-video cap: only the first N start positions
+            # of each video are eligible, so the model cannot memorize a few
+            # scenes by revisiting every position of one video.
+            cap = int(hard_negative_cfg["max_pairs_per_video"])
+            videos = [
+                replace(
+                    video,
+                    valid_start_positions={
+                        delta: starts[:cap]
+                        for delta, starts in video.valid_start_positions.items()
+                    },
+                )
+                for video in videos
+            ]
         self.videos = videos
         self.local_batch_size = local_batch_size
         self.steps_per_epoch = steps_per_epoch
@@ -75,9 +91,9 @@ class VideoBalancedPairBatchSampler:
         self.start_step = 0
         self.last_epoch_dedup_failures = 0
         self.last_epoch_delta_counts: Counter[int] = Counter()
-        self.last_epoch_game_label_delta_counts: Counter[
-            tuple[str, int, int]
-        ] = Counter()
+        self.last_epoch_game_label_delta_counts: Counter[tuple[str, int, int]] = (
+            Counter()
+        )
         self._support: dict[int, dict[str, dict[int, list[int]]]] = {}
         for video_index, video in enumerate(videos):
             for delta, starts in video.valid_start_positions.items():
@@ -87,6 +103,46 @@ class VideoBalancedPairBatchSampler:
                     ).setdefault(video.label, []).append(video_index)
         if not self._support:
             raise ValueError("No legal training pairs are available")
+
+        # Hard-negative subtype buckets (step5 P2). Only built when enabled;
+        # otherwise sampling stays byte-identical. ``negative_subtype`` is
+        # read from the sidecar-joined VideoEntry (defaults to None).
+        self._hard_negative_enabled = bool(
+            hard_negative_cfg and hard_negative_cfg.get("enabled", False)
+        )
+        self._subtype_buckets: dict[int, dict[str, dict[str, list[int]]]] = {}
+        if self._hard_negative_enabled:
+            assert hard_negative_cfg is not None
+            subtype_field = str(
+                hard_negative_cfg.get("subtype_field", "negative_subtype")
+            )
+            hard_subtypes = set(hard_negative_cfg.get("hard_subtypes") or [])
+            ordinary_subtypes = set(hard_negative_cfg.get("ordinary_subtypes") or [])
+            for delta, games in self._support.items():
+                for game, labels in games.items():
+                    if 0 not in labels:
+                        continue
+                    hard: list[int] = []
+                    ordinary: list[int] = []
+                    for video_index in labels[0]:
+                        subtype = getattr(self.videos[video_index], subtype_field, None)
+                        if subtype in hard_subtypes:
+                            hard.append(video_index)
+                        elif ordinary_subtypes and subtype not in ordinary_subtypes:
+                            continue  # unclassified subtype: excluded from both
+                        else:
+                            ordinary.append(video_index)
+                    self._subtype_buckets.setdefault(delta, {}).setdefault(game, {})[
+                        "hard"
+                    ] = hard
+                    self._subtype_buckets[delta][game]["ordinary"] = ordinary
+            self._negative_mix: dict[str, float] = dict(
+                (hard_negative_cfg.get("negative_mix") or {})
+                or {"ordinary": 0.5, "hard": 0.5}
+            )
+            self._min_videos_per_subtype_bucket = int(
+                hard_negative_cfg.get("min_videos_per_subtype_bucket", 1)
+            )
 
     def set_epoch(self, epoch: int, start_step: int = 0) -> None:
         self.epoch = epoch
@@ -116,7 +172,10 @@ class VideoBalancedPairBatchSampler:
         label = _choice(
             rng, labels, [self.class_probability.get(item, 0.0) for item in labels]
         )
-        video_index = rng.choice(self._support[delta][game][label])
+        if self._hard_negative_enabled and label == 0:
+            video_index = self._sample_negative_video(rng, delta, game)
+        else:
+            video_index = rng.choice(self._support[delta][game][label])
         valid_starts = self.videos[video_index].valid_start_positions[delta]
         start_position = int(rng.choice(valid_starts))
         return PairRequest(
@@ -125,6 +184,29 @@ class VideoBalancedPairBatchSampler:
             start_position=start_position,
             augmentation_seed=rng.getrandbits(63),
         )
+
+    def _sample_negative_video(self, rng: random.Random, delta: int, game: str) -> int:
+        """Pick a negative video, mixing ordinary and hard subtype buckets.
+
+        The bucket is chosen by ``negative_mix`` weight; an empty or
+        under-sized bucket falls back to the other bucket so training never
+        stalls. Falls back to the ungrouped candidate list when no subtype
+        metadata exists for this (game, delta).
+        """
+        mix = self._negative_mix
+        bucket = _choice(
+            rng,
+            ["ordinary", "hard"],
+            [mix.get("ordinary", 0.0), mix.get("hard", 0.0)],
+        )
+        buckets = self._subtype_buckets.get(delta, {}).get(game, {})
+        candidates = list(buckets.get(bucket) or [])
+        if len(candidates) < self._min_videos_per_subtype_bucket:
+            other = "hard" if bucket == "ordinary" else "ordinary"
+            candidates = list(buckets.get(other) or [])
+        if not candidates:
+            candidates = list(self._support[delta][game][0])
+        return int(rng.choice(candidates))
 
     def __iter__(self) -> Iterator[list[PairRequest]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)

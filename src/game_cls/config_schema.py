@@ -56,9 +56,7 @@ def _k(kind: str, description: str, **kwargs: Any) -> Key:
 
 _DATALOADER_ROLE_KEYS: dict[str, Any] = {
     "num_workers": _k("int", "DataLoader worker processes for this role."),
-    "persistent_workers": _k(
-        "bool", "Keep workers alive between epochs/evaluations."
-    ),
+    "persistent_workers": _k("bool", "Keep workers alive between epochs/evaluations."),
     "prefetch_factor": _k("int", "Batches prefetched per worker."),
     "pin_memory": _k(
         "bool",
@@ -135,15 +133,18 @@ SCHEMA: dict[str, Any] = {
             choices=("png", "packed_uint8"),
         ),
         "train_packed_index": _k(
-            "str", "Packed train shard index (packed_uint8 backend).",
+            "str",
+            "Packed train shard index (packed_uint8 backend).",
             nullable=True,
         ),
         "val_packed_index": _k(
-            "str", "Packed validation shard index (packed_uint8 backend).",
+            "str",
+            "Packed validation shard index (packed_uint8 backend).",
             nullable=True,
         ),
         "test_packed_index": _k(
-            "str", "Packed test shard index (packed_uint8 backend).",
+            "str",
+            "Packed test shard index (packed_uint8 backend).",
             nullable=True,
         ),
         "train_packed_video_index": _k(
@@ -170,9 +171,7 @@ SCHEMA: dict[str, Any] = {
         "ignore_directory_names": _k(
             "list", "Exact directory names pruned during scanning."
         ),
-        "ignore_file_globs": _k(
-            "list", "File globs ignored during scanning."
-        ),
+        "ignore_file_globs": _k("list", "File globs ignored during scanning."),
         "unexpected_nested_directory_severity": _k(
             "str",
             "Severity for unexpected nested directories.",
@@ -211,18 +210,15 @@ SCHEMA: dict[str, Any] = {
         ),
         "prepare_if_missing": _k(
             "bool",
-            "Auto-run dataset prepare before training when split indexes "
-            "are missing.",
+            "Auto-run dataset prepare before training when split indexes are missing.",
         ),
         "split": _k(
             "dict",
-            "Source-video-level train/validation split configuration "
-            "(step4 §二).",
+            "Source-video-level train/validation split configuration (step4 §二).",
         ),
         "minimum_pairs_per_game_label_delta": _k(
             "dict",
-            "Minimum legal pairs per (game,label) for each delta, "
-            "e.g. {2: 1}.",
+            "Minimum legal pairs per (game,label) for each delta, e.g. {2: 1}.",
         ),
         "deduplication": {
             "level": _k(
@@ -243,11 +239,13 @@ SCHEMA: dict[str, Any] = {
         },
         "duplicate_policy": {
             "same_label_cross_split": _k(
-                "str", "Severity for same-content duplicates across splits.",
+                "str",
+                "Severity for same-content duplicates across splits.",
                 choices=("info", "warning", "error"),
             ),
             "same_label_within_split": _k(
-                "str", "Severity for same-content duplicates within a split.",
+                "str",
+                "Severity for same-content duplicates within a split.",
                 choices=("info", "warning", "error"),
             ),
             "cross_label_same_content": _k(
@@ -256,8 +254,48 @@ SCHEMA: dict[str, Any] = {
                 choices=("info", "warning", "error"),
             ),
             "same_basename": _k(
-                "str", "Severity for filename-only collisions.",
+                "str",
+                "Severity for filename-only collisions.",
                 choices=("info", "warning", "error"),
+            ),
+        },
+        "metadata_sidecar": _k(
+            "str",
+            "Optional per-video metadata parquet keyed by source_video_uid "
+            "(negative_subtype, sample_weight). Joined AFTER the split; "
+            "never part of split/dedup identity (step5 P2).",
+            nullable=True,
+        ),
+        "hard_negative": {
+            "enabled": _k(
+                "bool",
+                "Mix ordinary and hard negative videos by subtype bucket "
+                "during sampling (requires metadata_sidecar).",
+            ),
+            "subtype_field": _k(
+                "str",
+                "VideoEntry attribute holding the subtype label.",
+            ),
+            "hard_subtypes": _k("list", "Subtype values treated as hard negatives."),
+            "ordinary_subtypes": _k(
+                "list",
+                "Subtype values treated as ordinary negatives; empty means "
+                "every subtype not listed in hard_subtypes.",
+            ),
+            "negative_mix": _k(
+                "dict",
+                "Sampling weights per bucket, e.g. {ordinary: 0.5, hard: 0.5}.",
+            ),
+            "max_pairs_per_video": _k(
+                "int",
+                "Optional cap on how many start positions each video "
+                "contributes (deterministic first N).",
+                nullable=True,
+            ),
+            "min_videos_per_subtype_bucket": _k(
+                "int",
+                "Minimum eligible videos required in a bucket before it is "
+                "used; smaller buckets fall back to the other bucket.",
             ),
         },
     },
@@ -265,21 +303,16 @@ SCHEMA: dict[str, Any] = {
         "train_delta_probability": _k(
             "dict", "Training frame-delta sampling distribution, e.g. {2: 0.7}."
         ),
-        "test_delta": _k(
-            "int", "Evaluation pair delta (task profile default: 2)."
-        ),
+        "test_delta": _k("int", "Evaluation pair delta (task profile default: 2)."),
     },
     "sampler": {
-        "game_alpha": _k(
-            "float", "Dirichlet smoothing for per-game balancing."
-        ),
+        "game_alpha": _k("float", "Dirichlet smoothing for per-game balancing."),
         "class_probability": _k(
             "dict", "Label sampling probability, e.g. {0: 0.5, 1: 0.5}."
         ),
         "deduplicate_within_global_batch": _k(
             "bool",
-            "Legacy alias of data.deduplication.level: true=pair, "
-            "false=none.",
+            "Legacy alias of data.deduplication.level: true=pair, false=none.",
             legacy=True,
         ),
     },
@@ -358,11 +391,13 @@ SCHEMA: dict[str, Any] = {
             "that maps (image0, image1) to [B,2].",
         ),
         "checkpoint_path": _k(
-            "str", "Base checkpoint; all non-cls weights must load from it.",
+            "str",
+            "Base checkpoint; all non-cls weights must load from it.",
             nullable=True,
         ),
         "trainable_name_contains": _k(
-            "str", "Substring selecting trainable parameters (task profile default: cls)."
+            "str",
+            "Substring selecting trainable parameters (task profile default: cls).",
         ),
         "num_classes": _k("int", "Output classes (task profile default: 2)."),
         "freeze_backbone_batchnorm_stats": _k(
@@ -447,8 +482,7 @@ SCHEMA: dict[str, Any] = {
         ),
         "negative_tail_hard_negative_k": _k(
             "int",
-            "Top-k hardest negatives for the tail OHEM; null uses all "
-            "negatives.",
+            "Top-k hardest negatives for the tail OHEM; null uses all negatives.",
             nullable=True,
         ),
         "rank_loss_weight": _k(
@@ -474,16 +508,16 @@ SCHEMA: dict[str, Any] = {
         "epochs": _k("int", "Epoch count (used when max_steps is null)."),
         "steps_per_epoch": _k("int", "Sampler steps per epoch."),
         "max_steps": _k(
-            "int", "Global step budget; overrides epochs when set.",
+            "int",
+            "Global step budget; overrides epochs when set.",
             nullable=True,
         ),
         "stop_after_steps": _k(
-            "int", "Optional early stop for staged acceptance runs.",
+            "int",
+            "Optional early stop for staged acceptance runs.",
             nullable=True,
         ),
-        "resume_path": _k(
-            "str", "Checkpoint used for exact resume.", nullable=True
-        ),
+        "resume_path": _k("str", "Checkpoint used for exact resume.", nullable=True),
         "verify_frozen_parameters": _k(
             "bool", "Assert frozen weights stay bitwise unchanged."
         ),
@@ -498,9 +532,7 @@ SCHEMA: dict[str, Any] = {
             "values win when present.",
             legacy=True,
         ),
-        "persistent_workers": _k(
-            "bool", "Fallback persistent_workers.", legacy=True
-        ),
+        "persistent_workers": _k("bool", "Fallback persistent_workers.", legacy=True),
         "prefetch_factor": _k("int", "Fallback prefetch_factor.", legacy=True),
         "pin_memory": _k("bool", "Fallback pin_memory.", legacy=True),
         "multiprocessing_context": _k(
@@ -527,7 +559,8 @@ SCHEMA: dict[str, Any] = {
         ),
         "amp": _k("bool", "Mixed precision for evaluation forward passes."),
         "amp_dtype": _k(
-            "str", "Evaluation AMP dtype (deployment parity).",
+            "str",
+            "Evaluation AMP dtype (deployment parity).",
             choices=("float16", "bfloat16"),
         ),
         "quick_test_every_steps": _k(
@@ -537,8 +570,7 @@ SCHEMA: dict[str, Any] = {
         ),
         "quick_test_pairs_per_video": _k(
             "int",
-            "Legacy alias of val_quick_pairs_per_video; migrated "
-            "automatically.",
+            "Legacy alias of val_quick_pairs_per_video; migrated automatically.",
             legacy=True,
         ),
         "full_test_every_steps": _k(
@@ -572,9 +604,7 @@ SCHEMA: dict[str, Any] = {
             "Full validation cadence (drives model selection and early "
             "stopping); 0 disables.",
         ),
-        "val_full_at_end": _k(
-            "bool", "Run a final full validation after training."
-        ),
+        "val_full_at_end": _k("bool", "Run a final full validation after training."),
         "tensorboard_live": _k(
             "bool",
             "Write TensorBoard scalars during training when the "
@@ -586,9 +616,7 @@ SCHEMA: dict[str, Any] = {
             choices=("histogram", "exact"),
         ),
         "auc_histogram_bins": _k("int", "Histogram bins for AUC estimation."),
-        "quick_save_error_limit": _k(
-            "int", "Global cap on quick-test error exports."
-        ),
+        "quick_save_error_limit": _k("int", "Global cap on quick-test error exports."),
         "html_max_errors_per_group": _k(
             "int", "Per-group error cap in the HTML report."
         ),
@@ -652,6 +680,18 @@ SCHEMA: dict[str, Any] = {
         "tail_calibration_enabled": _k(
             "bool", "Compute ece_tail_95_100 in evaluation."
         ),
+        "group_by_negative_subtype": _k(
+            "bool",
+            "Add a game_label_subtype group catalog to evaluation and "
+            "compute worst-subtype FPR/recall metrics (requires sidecar "
+            "metadata with non-null negative_subtype).",
+        ),
+        "max_worst_subtype_fpr": _k(
+            "float",
+            "Constrained selection: reject candidates whose worst "
+            "negative-subtype FPR exceeds this (null disables).",
+            nullable=True,
+        ),
     },
     "early_stopping": {
         "enabled": _k(
@@ -680,13 +720,10 @@ SCHEMA: dict[str, Any] = {
             "Only full-validation evaluations may update patience; quick "
             "subsets are too noisy for stop decisions.",
         ),
-        "burn_in_steps": _k(
-            "int", "Never stop before this global step."
-        ),
+        "burn_in_steps": _k("int", "Never stop before this global step."),
         "patience_evaluations": _k(
             "int",
-            "Consecutive non-improving full validations tolerated before "
-            "stopping.",
+            "Consecutive non-improving full validations tolerated before stopping.",
         ),
         "min_delta": _k(
             "float",
@@ -695,8 +732,7 @@ SCHEMA: dict[str, Any] = {
         ),
         "restore_best": _k(
             "bool",
-            "Reload the best-selection checkpoint weights before the run "
-            "finishes.",
+            "Reload the best-selection checkpoint weights before the run finishes.",
         ),
     },
     "checkpoint": {
@@ -710,13 +746,11 @@ SCHEMA: dict[str, Any] = {
         ),
         "save_best_val_loss": _k(
             "bool",
-            "Clone the best validation loss checkpoint "
-            "(model_best_val_loss.pth).",
+            "Clone the best validation loss checkpoint (model_best_val_loss.pth).",
         ),
         "save_best_worst_game": _k(
             "bool",
-            "Clone the best worst-game-F1 checkpoint "
-            "(model_best_worst_game.pth).",
+            "Clone the best worst-game-F1 checkpoint (model_best_worst_game.pth).",
         ),
         "save_best_test_f1": _k(
             "bool", "Legacy alias of save_best_selection.", legacy=True
@@ -750,9 +784,7 @@ SCHEMA: dict[str, Any] = {
     },
     "distributed": {
         "enabled": _k("bool", "Initialize c10d process groups."),
-        "backend": _k(
-            "str", "Process group backend, e.g. gloo / nccl / hccl."
-        ),
+        "backend": _k("str", "Process group backend, e.g. gloo / nccl / hccl."),
     },
 }
 
@@ -777,15 +809,9 @@ _SPLIT_KEYS: dict[str, Any] = {
         "Deterministic split seed; the same seed and data produce a "
         "byte-identical manifest.",
     ),
-    "group_key": _k(
-        "str", "Split unit identity; must be 'source_video_uid'."
-    ),
-    "stratify_by": _k(
-        "list", "Stratum fields for balancing, e.g. ['game', 'label']."
-    ),
-    "balance_by": _k(
-        "str", "Balancing statistic; must be 'legal_pair_count'."
-    ),
+    "group_key": _k("str", "Split unit identity; must be 'source_video_uid'."),
+    "stratify_by": _k("list", "Stratum fields for balancing, e.g. ['game', 'label']."),
+    "balance_by": _k("str", "Balancing statistic; must be 'legal_pair_count'."),
     "target_delta": _k(
         "int", "Frame delta whose pair count drives balancing (1, 2 or 3)."
     ),
@@ -817,6 +843,7 @@ _NESTED_KEY_SCHEMAS: dict[str, dict[str, Any]] = {
 def _nested_key_schema(dotted: str) -> dict[str, Any] | None:
     """Sub-key schema of a dict-typed leaf, if one is registered."""
     return _NESTED_KEY_SCHEMAS.get(dotted)
+
 
 # Keys that used to exist but have no consumer anymore. They raise a
 # migration hint instead of being silently accepted ("looks effective but
@@ -897,15 +924,10 @@ def _walk(
         if not _type_matches(value, spec):
             allowed = spec.kind + (" or null" if spec.nullable else "")
             problems.append(
-                f"{dotted}: expected {allowed}, got "
-                f"{type(value).__name__} ({value!r})."
+                f"{dotted}: expected {allowed}, got {type(value).__name__} ({value!r})."
             )
             continue
-        if (
-            spec.choices is not None
-            and value is not None
-            and value not in spec.choices
-        ):
+        if spec.choices is not None and value is not None and value not in spec.choices:
             problems.append(
                 f"{dotted}: must be one of {sorted(map(str, spec.choices))}, "
                 f"got {value!r}."
@@ -992,14 +1014,10 @@ def resolve_decision_threshold(config: dict[str, Any]) -> float:
     candidates = {
         "decision.threshold": decision_cfg.get("threshold"),
         "loss.threshold": (config.get("loss") or {}).get("threshold"),
-        "evaluation.threshold": (config.get("evaluation") or {}).get(
-            "threshold"
-        ),
+        "evaluation.threshold": (config.get("evaluation") or {}).get("threshold"),
     }
     provided = {
-        name: float(value)
-        for name, value in candidates.items()
-        if value is not None
+        name: float(value) for name, value in candidates.items() if value is not None
     }
     if not provided:
         threshold = 0.99
@@ -1105,6 +1123,18 @@ _DEFAULT_LOSS_NEW_KEYS: dict[str, Any] = {
     "rank_margin": 0.2,
 }
 
+# Hard-negative subtype mixing (step5 P2). All defaults keep the legacy
+# sampler byte-identical when data.hard_negative.enabled is false.
+_DEFAULT_HARD_NEGATIVE: dict[str, Any] = {
+    "enabled": False,
+    "subtype_field": "negative_subtype",
+    "hard_subtypes": [],
+    "ordinary_subtypes": [],
+    "negative_mix": {"ordinary": 0.5, "hard": 0.5},
+    "max_pairs_per_video": None,
+    "min_videos_per_subtype_bucket": 1,
+}
+
 
 def _apply_defaults(config: dict[str, Any]) -> None:
     """Fill documented defaults for required keys a recipe may omit."""
@@ -1133,6 +1163,19 @@ def _apply_defaults(config: dict[str, Any]) -> None:
     data.setdefault("source_root", None)
     data.setdefault("test_root", None)
     data.setdefault("prepare_if_missing", False)
+    data.setdefault("metadata_sidecar", None)
+    hard_negative = data.setdefault("hard_negative", {})
+    if not isinstance(hard_negative, dict):
+        hard_negative = {}
+        data["hard_negative"] = hard_negative
+    for key, value in _DEFAULT_HARD_NEGATIVE.items():
+        if isinstance(value, dict):
+            block = hard_negative.setdefault(key, {})
+            if isinstance(block, dict):
+                for sub_key, sub_value in value.items():
+                    block.setdefault(sub_key, sub_value)
+        else:
+            hard_negative.setdefault(key, value)
     data["split"] = {**default_split, **(data.get("split") or {})}
 
     evaluation = config.setdefault("evaluation", {})
@@ -1142,6 +1185,8 @@ def _apply_defaults(config: dict[str, Any]) -> None:
     evaluation.setdefault("min_positive_recall", None)
     evaluation.setdefault("max_fpr_for_recall", 0.01)
     evaluation.setdefault("tail_calibration_enabled", True)
+    evaluation.setdefault("group_by_negative_subtype", False)
+    evaluation.setdefault("max_worst_subtype_fpr", None)
 
     # An absent augmentation block still yields the full dict with every
     # transform disabled; an absent loss block still yields the new feature
@@ -1199,18 +1244,13 @@ def migrate_split_roles(config: dict[str, Any]) -> None:
             if data_cfg.get("test_packed_index"):
                 data_cfg["val_packed_index"] = data_cfg["test_packed_index"]
             if data_cfg.get("test_packed_video_index"):
-                data_cfg["val_packed_video_index"] = data_cfg[
-                    "test_packed_video_index"
-                ]
+                data_cfg["val_packed_video_index"] = data_cfg["test_packed_video_index"]
             migration["test_used_as_validation"] = True
         data_cfg["split_migration"] = migration
     evaluation_cfg = config.get("evaluation")
     if isinstance(evaluation_cfg, dict):
         for legacy_key, canonical_key in _LEGACY_EVALUATION_ALIASES.items():
-            if (
-                legacy_key in evaluation_cfg
-                and canonical_key not in evaluation_cfg
-            ):
+            if legacy_key in evaluation_cfg and canonical_key not in evaluation_cfg:
                 evaluation_cfg[canonical_key] = evaluation_cfg.pop(legacy_key)
             elif legacy_key in evaluation_cfg:
                 evaluation_cfg.pop(legacy_key)
@@ -1281,8 +1321,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
     if isinstance(threshold, (int, float)):
         require(
             0.0 < float(threshold) < 1.0,
-            f"decision.threshold must be strictly between 0 and 1 "
-            f"(got {threshold}).",
+            f"decision.threshold must be strictly between 0 and 1 (got {threshold}).",
         )
 
     loss_cfg = config.get("loss") or {}
@@ -1355,8 +1394,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
                 isinstance(value, list)
                 and len(value) == 2
                 and all(
-                    isinstance(item, (int, float))
-                    and not isinstance(item, bool)
+                    isinstance(item, (int, float)) and not isinstance(item, bool)
                     for item in value
                 )
             ):
@@ -1376,8 +1414,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
             not isinstance(size, list)
             or len(size) != 2
             or not all(
-                isinstance(item, int) and not isinstance(item, bool)
-                for item in size
+                isinstance(item, int) and not isinstance(item, bool) for item in size
             )
         ):
             require(
@@ -1418,15 +1455,56 @@ def semantic_validate(config: dict[str, Any]) -> None:
     # probabilities in (0, 1). Every gate is optional (null disables it), so
     # a constrained selection with all gates disabled degrades to pure recall
     # ranking and remains legal.
-    for key in ("max_fpr_for_recall", "max_global_fpr", "max_worst_game_fpr",
-                "min_positive_recall"):
+    for key in (
+        "max_fpr_for_recall",
+        "max_global_fpr",
+        "max_worst_game_fpr",
+        "min_positive_recall",
+        "max_worst_subtype_fpr",
+    ):
         value = evaluation_cfg.get(key)
         if value is not None and isinstance(value, (int, float)):
             require(
                 0.0 < float(value) < 1.0,
-                f"evaluation.{key} must be strictly between 0 and 1 "
-                f"(got {value}).",
+                f"evaluation.{key} must be strictly between 0 and 1 (got {value}).",
             )
+
+    # Hard-negative subtype mixing (step5 P2): enabled requires a sidecar,
+    # and the per-bucket weights must be positive.
+    data_meta = config.get("data") or {}
+    hard_negative = data_meta.get("hard_negative") or {}
+    if hard_negative.get("enabled", False):
+        require(
+            bool(data_meta.get("metadata_sidecar")),
+            "data.hard_negative.enabled requires data.metadata_sidecar to "
+            "point at a per-video metadata parquet.",
+        )
+        negative_mix = hard_negative.get("negative_mix") or {}
+        mix_values = [
+            negative_mix.get("ordinary", 0.0),
+            negative_mix.get("hard", 0.0),
+        ]
+        require(
+            any(float(value) > 0 for value in mix_values),
+            "data.hard_negative.negative_mix must have a positive weight "
+            "for at least one of {ordinary, hard}.",
+        )
+        max_pairs = hard_negative.get("max_pairs_per_video")
+        if max_pairs is not None:
+            require(
+                int(max_pairs) >= 1,
+                "data.hard_negative.max_pairs_per_video must be >= 1 when set.",
+            )
+        require(
+            int(hard_negative.get("min_videos_per_subtype_bucket", 1)) >= 1,
+            "data.hard_negative.min_videos_per_subtype_bucket must be >= 1.",
+        )
+    if evaluation_cfg.get("group_by_negative_subtype", False):
+        require(
+            bool(data_meta.get("metadata_sidecar")),
+            "evaluation.group_by_negative_subtype requires "
+            "data.metadata_sidecar so subtype labels are available.",
+        )
 
     # Probability vectors: non-negative and (approximately) sum to one.
     for key in ("class_probability", "delta_probability"):
@@ -1451,9 +1529,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
     # Cross-field: warmup must fit inside the total step budget.
     warmup = train_cfg.get("warmup_steps")
     max_steps = train_cfg.get("max_steps")
-    if isinstance(warmup, (int, float)) and isinstance(
-        max_steps, (int, float)
-    ):
+    if isinstance(warmup, (int, float)) and isinstance(max_steps, (int, float)):
         require(
             warmup <= max_steps,
             f"train.warmup_steps ({warmup}) must not exceed "
@@ -1476,8 +1552,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
         if isinstance(target_delta, (int, float)):
             require(
                 int(target_delta) in (1, 2, 3),
-                f"data.split.target_delta must be 1, 2 or 3 "
-                f"(got {target_delta}).",
+                f"data.split.target_delta must be 1, 2 or 3 (got {target_delta}).",
             )
 
     if problems:

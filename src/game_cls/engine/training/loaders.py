@@ -185,6 +185,28 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
         else None
     )
 
+    # Join the optional per-video metadata sidecar AFTER the split is
+    # derived (step5 P2): it can never leak a video across splits, is not
+    # part of any dedup identity, and defaults every field to None/1.0 when
+    # absent — so a config without metadata_sidecar stays byte-identical.
+    metadata_sidecar_path = data_cfg.get("metadata_sidecar")
+    if metadata_sidecar_path:
+        from game_cls.data.sidecar import (
+            apply_sidecar,
+            read_metadata_sidecar,
+            validate_sidecar_against_index,
+        )
+
+        sidecar = read_metadata_sidecar(metadata_sidecar_path)
+        all_videos = (
+            train_videos + val_videos + (test_videos if test_videos is not None else [])
+        )
+        validate_sidecar_against_index(sidecar, all_videos)
+        train_videos = apply_sidecar(train_videos, sidecar)
+        val_videos = apply_sidecar(val_videos, sidecar)
+        if test_videos is not None:
+            test_videos = apply_sidecar(test_videos, sidecar)
+
     decoders: dict[str, Any] = {"train": None, "val": None, "test": None}
     if backend_name == "packed_uint8":
         from game_cls.data.packed_backend import PackedUint8Backend
@@ -257,6 +279,9 @@ def build_eval_loader_for_split(
         world_size=world_size,
         max_pairs_per_video=max_pairs_per_video,
         decoder=decoder,
+        group_by_negative_subtype=bool(
+            config["evaluation"].get("group_by_negative_subtype", False)
+        ),
     )
     loader = DataLoader(dataset, batch_size=batch_size, **eval_common)
     return loader, components
@@ -275,6 +300,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
     steps_per_epoch = int(train_cfg["steps_per_epoch"])
     train_common = _loader_common(config, role="train")
     eval_common = _loader_common(config, role="eval")
+    subtype_grouping = bool(evaluation_cfg.get("group_by_negative_subtype", False))
     probe_pairs_per_video = int(evaluation_cfg.get("train_probe_pairs_per_video", 32))
     val_quick_pairs_per_video = int(
         evaluation_cfg.get(
@@ -397,6 +423,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         delta_probability=delta_probability,
         dedup_level=dedup_level,
         on_exhaustion=str(dedup_cfg.get("on_exhaustion", "warn_and_relax")),
+        hard_negative_cfg=(config.get("data") or {}).get("hard_negative"),
     )
     # The train probe is a fixed, reproducible, augmentation-free subset of
     # the train split evaluated with the exact validation evaluator.
@@ -407,6 +434,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         world_size=world_size,
         max_pairs_per_video=probe_pairs_per_video,
         decoder=decoders["train"],
+        group_by_negative_subtype=subtype_grouping,
     )
     val_quick_dataset: Any = build_eval_dataset(
         val_videos,
@@ -415,6 +443,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         world_size=world_size,
         max_pairs_per_video=val_quick_pairs_per_video,
         decoder=decoders["val"],
+        group_by_negative_subtype=subtype_grouping,
     )
     val_full_dataset: Any = build_eval_dataset(
         val_videos,
@@ -422,6 +451,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         rank=rank,
         world_size=world_size,
         decoder=decoders["val"],
+        group_by_negative_subtype=subtype_grouping,
     )
     test_full_dataset: Any = (
         build_eval_dataset(
@@ -430,6 +460,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
             rank=rank,
             world_size=world_size,
             decoder=decoders["test"],
+            group_by_negative_subtype=subtype_grouping,
         )
         if test_videos is not None
         else None

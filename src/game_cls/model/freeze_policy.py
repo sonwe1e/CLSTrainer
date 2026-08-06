@@ -15,9 +15,7 @@ class FreezeSummary:
         return self.trainable_count / total if total else 0.0
 
 
-def configure_trainable_parameters(
-    model, name_contains: str = "cls"
-) -> FreezeSummary:
+def configure_trainable_parameters(model, name_contains: str = "cls") -> FreezeSummary:
     trainable_names: list[str] = []
     trainable_count = 0
     frozen_count = 0
@@ -59,9 +57,7 @@ def set_frozen_backbone_train_mode(
     for module_name, module in model.named_modules():
         if isinstance(module, nn.modules.batchnorm._BatchNorm):
             is_cls = name_contains in module_name
-            if (
-                is_cls and freeze_cls_batchnorm_stats
-            ) or (
+            if (is_cls and freeze_cls_batchnorm_stats) or (
                 not is_cls and freeze_backbone_batchnorm_stats
             ):
                 module.eval()

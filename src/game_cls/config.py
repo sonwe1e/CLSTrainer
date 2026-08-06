@@ -129,9 +129,7 @@ def _apply_recipe_overrides(
                 )
             presets[parts[1]] = value
             continue
-        raise ConfigSchemaError(
-            [f"Override target {dotted_key} is not recipe-level."]
-        )
+        raise ConfigSchemaError([f"Override target {dotted_key} is not recipe-level."])
     return raw
 
 
@@ -145,9 +143,7 @@ def _clear_legacy_thresholds_if_overridden(
     decision.threshold must not trip the conflict guard against those
     stale mirrors.
     """
-    override_keys = {
-        item.split("=", 1)[0] for item in overrides if "=" in item
-    }
+    override_keys = {item.split("=", 1)[0] for item in overrides if "=" in item}
     if "decision.threshold" not in override_keys:
         return
     for section_name in ("loss", "evaluation"):
@@ -181,9 +177,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> dict[st
     return finalize_config(merged)
 
 
-def _resolve_layer_file(
-    recipe_path: Path, subdir: str, name: str, kind: str
-) -> Path:
+def _resolve_layer_file(recipe_path: Path, subdir: str, name: str, kind: str) -> Path:
     """Locate ``<subdir>/<name>.yaml`` relative to the recipe's config tree."""
     if not str(name).strip():
         raise ConfigSchemaError([f"Empty {kind} name in {recipe_path}."])
@@ -205,14 +199,9 @@ def _resolve_layer_file(
         ]
     else:
         available = list_available_layers().get(subdir, [])
-    available_text = (
-        f" Available: {', '.join(available)}." if available else ""
-    )
+    available_text = f" Available: {', '.join(available)}." if available else ""
     raise ConfigSchemaError(
-        [
-            f"Unknown {kind} '{name}' referenced by {recipe_path}."
-            f"{available_text}"
-        ]
+        [f"Unknown {kind} '{name}' referenced by {recipe_path}.{available_text}"]
     )
 
 

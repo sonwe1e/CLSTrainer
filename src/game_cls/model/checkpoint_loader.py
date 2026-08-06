@@ -19,9 +19,7 @@ def validate_production_load(
     trainable_name_contains: str = "cls",
 ) -> float:
     state_keys = set(model.state_dict())
-    non_cls_keys = {
-        key for key in state_keys if trainable_name_contains not in key
-    }
+    non_cls_keys = {key for key in state_keys if trainable_name_contains not in key}
     loaded_non_cls = {
         key for key in report.loaded if trainable_name_contains not in key
     }
@@ -31,9 +29,7 @@ def validate_production_load(
     mismatch_non_cls = {
         key for key in report.shape_mismatch if trainable_name_contains not in key
     }
-    coverage = (
-        len(loaded_non_cls) / len(non_cls_keys) if non_cls_keys else 1.0
-    )
+    coverage = len(loaded_non_cls) / len(non_cls_keys) if non_cls_keys else 1.0
     if missing_non_cls or mismatch_non_cls or coverage < 1.0:
         raise RuntimeError(
             "Production checkpoint must load 100% of the frozen backbone "
@@ -48,7 +44,9 @@ def validate_production_load(
 def extract_state_dict(checkpoint) -> dict:
     if isinstance(checkpoint, dict) and isinstance(checkpoint.get("model"), dict):
         state = checkpoint["model"]
-    elif isinstance(checkpoint, dict) and isinstance(checkpoint.get("state_dict"), dict):
+    elif isinstance(checkpoint, dict) and isinstance(
+        checkpoint.get("state_dict"), dict
+    ):
         state = checkpoint["state_dict"]
     elif isinstance(checkpoint, dict):
         state = checkpoint
@@ -64,9 +62,7 @@ def load_model_checkpoint(model, path: str | Path) -> LoadReport:
     # containing one). weights_only=True refuses pickled code execution,
     # so untrusted .pth files cannot run arbitrary code at load time.
     try:
-        checkpoint = torch.load(
-            path, map_location="cpu", weights_only=True
-        )
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     except Exception as exc:
         raise RuntimeError(
             f"Base checkpoint {path} could not be loaded with "

@@ -64,11 +64,8 @@ def group_pair_indices(
         grouped[pair.game][pair.label][pair.video_id][pair.delta].append(index)
     return {
         game: {
-            label: {
-                video: dict(by_delta) for video, by_delta in by_video.items()
-            }
+            label: {video: dict(by_delta) for video, by_delta in by_video.items()}
             for label, by_video in by_label.items()
         }
         for game, by_label in grouped.items()
     }
-

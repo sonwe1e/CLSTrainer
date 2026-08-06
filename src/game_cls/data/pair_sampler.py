@@ -49,8 +49,7 @@ class BalancedDistributedPairBatchSampler:
             )
         if on_exhaustion not in ("error", "warn_and_relax"):
             raise ValueError(
-                f"on_exhaustion must be error|warn_and_relax; "
-                f"got {on_exhaustion!r}"
+                f"on_exhaustion must be error|warn_and_relax; got {on_exhaustion!r}"
             )
         if deduplicate_within_global_batch is not None:
             if dedup_level == "pair" and not deduplicate_within_global_batch:
@@ -170,9 +169,7 @@ def expected_game_probabilities(
     weights = {}
     for game, by_label in grouped.items():
         videos = {
-            (label, video)
-            for label, by_video in by_label.items()
-            for video in by_video
+            (label, video) for label, by_video in by_label.items() for video in by_video
         }
         weights[game] = len(videos) ** game_alpha
     denominator = sum(weights.values())

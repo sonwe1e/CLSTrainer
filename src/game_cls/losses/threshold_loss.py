@@ -146,9 +146,7 @@ def combined_loss(logits, target, config: dict, step: int, total_steps: int):
 
     label_smoothing = float(config.get("label_smoothing", 0.0))
     if label_smoothing:
-        ce = F.cross_entropy(
-            logits.float(), target, label_smoothing=label_smoothing
-        )
+        ce = F.cross_entropy(logits.float(), target, label_smoothing=label_smoothing)
     else:
         ce = F.cross_entropy(logits.float(), target)
     threshold_component = threshold_margin_loss(
@@ -219,4 +217,3 @@ def combined_loss(logits, target, config: dict, step: int, total_steps: int):
             else logits.new_zeros(())
         ),
     }
-

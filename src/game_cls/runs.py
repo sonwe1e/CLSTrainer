@@ -59,9 +59,7 @@ def allocate_run_dir(
             return run_dir, run_id
         except FileExistsError:
             continue
-    raise RuntimeError(
-        f"Could not allocate a unique run directory under {date_dir}"
-    )
+    raise RuntimeError(f"Could not allocate a unique run directory under {date_dir}")
 
 
 def atomic_write_text(path: str | Path, text: str) -> None:
@@ -73,9 +71,7 @@ def atomic_write_text(path: str | Path, text: str) -> None:
 
 
 def atomic_write_json(path: str | Path, payload: Any) -> None:
-    atomic_write_text(
-        path, json.dumps(payload, ensure_ascii=False, indent=2)
-    )
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def write_manifest(run_dir: str | Path, manifest: dict[str, Any]) -> None:
@@ -278,9 +274,7 @@ def render_summary_md(
         f"- Learning rate: `{config.get('optimizer', {}).get('learning_rate')}`"
     )
     lines.append(f"- Seed: `{experiment.get('seed')}`")
-    lines.append(
-        f"- Model factory: `{config.get('model', {}).get('factory')}`"
-    )
+    lines.append(f"- Model factory: `{config.get('model', {}).get('factory')}`")
     lines.append(
         f"- Base checkpoint: `{config.get('model', {}).get('checkpoint_path')}`"
     )
@@ -310,6 +304,7 @@ def render_summary_md(
             or summary_payload.get("best_observed_dev_test_metrics")
             or {}
         )
+
         def fmt(metrics: dict[str, Any]) -> str:
             if not metrics:
                 return "n/a"
@@ -328,9 +323,7 @@ def render_summary_md(
                 "worst_game_f1_at_decision_threshold",
                 metrics.get("worst_game_f1_tau099"),
             )
-            worst_text = (
-                f"{worst:.4f}" if isinstance(worst, (int, float)) else "n/a"
-            )
+            worst_text = f"{worst:.4f}" if isinstance(worst, (int, float)) else "n/a"
             return (
                 f"step={metrics.get('checkpoint_step', '?')} "
                 f"selection={selection_text} global_f1={global_text} "
@@ -372,16 +365,12 @@ def render_summary_md(
                 f"(best step {early.get('best_step')})"
             )
         if summary_payload.get("restored_best"):
-            lines.append(
-                "- Restored best-selection weights before finishing."
-            )
+            lines.append("- Restored best-selection weights before finishing.")
     lines.append("")
     lines.append("## Artifacts")
     lines.append("")
     lines.append(f"- Metrics: `{run_dir / 'train_metrics.jsonl'}`")
-    lines.append(
-        f"- Evaluation history: `{run_dir / 'metrics' / 'evaluation.jsonl'}`"
-    )
+    lines.append(f"- Evaluation history: `{run_dir / 'metrics' / 'evaluation.jsonl'}`")
     lines.append(f"- Reports: `{run_dir / 'reports'}`")
     lines.append(f"- Checkpoints: `{run_dir / 'checkpoints'}`")
     lines.append(f"- Machine summary: `{run_dir / 'training_summary.json'}`")
@@ -459,9 +448,7 @@ def _history_series(
         if value is None and fallback != field:
             value = row.get(fallback)
         step = row.get("step")
-        if isinstance(value, (int, float)) and isinstance(
-            step, (int, float)
-        ):
+        if isinstance(value, (int, float)) and isinstance(step, (int, float)):
             points.append((float(step), float(value)))
     return points
 
@@ -474,9 +461,7 @@ def _training_series(
         points = [
             (float(row["step"]), float(row[field]))
             for row in rows
-            if "step" in row
-            and field in row
-            and isinstance(row[field], (int, float))
+            if "step" in row and field in row and isinstance(row[field], (int, float))
         ]
         if points:
             return points
@@ -531,9 +516,7 @@ def _svg_multi_chart(
             f'font-size="9" fill="{color}">{_html_escape(marker.get("label", ""))}</text>'
         )
     for _, color, points in active:
-        polyline = " ".join(
-            f"{px},{py}" for px, py in (project(*p) for p in points)
-        )
+        polyline = " ".join(f"{px},{py}" for px, py in (project(*p) for p in points))
         parts.append(
             f'<polyline points="{polyline}" fill="none" stroke="{color}" '
             'stroke-width="2"/>'
@@ -549,14 +532,13 @@ def _svg_multi_chart(
         )
         legend_x += 12 + 6.2 * len(label)
     parts.append(
-        f'<text x="{pad}" y="12" font-size="10" fill="#64748b">'
-        f'max {max_y:.4g}</text>'
+        f'<text x="{pad}" y="12" font-size="10" fill="#64748b">max {max_y:.4g}</text>'
     )
     parts.append(
         f'<text x="{width - 150}" y="12" font-size="10" fill="#64748b">'
-        f'steps {min_x:.4g}\u2013{max_x:.4g}</text>'
+        f"steps {min_x:.4g}\u2013{max_x:.4g}</text>"
     )
-    parts.append('</svg>')
+    parts.append("</svg>")
     return "".join(parts)
 
 
@@ -587,9 +569,7 @@ def _evaluation_markers(
         if row.get("split") == "validation" and row.get("scope") == "full"
     ]
     scored = [
-        row
-        for row in full_rows
-        if isinstance(row.get("selection_score"), (int, float))
+        row for row in full_rows if isinstance(row.get("selection_score"), (int, float))
     ]
     if scored:
         best = max(scored, key=lambda row: float(row["selection_score"]))
@@ -615,9 +595,7 @@ def _evaluation_markers(
                 }
             )
     loss_rows = [
-        row
-        for row in full_rows
-        if isinstance(row.get("cross_entropy"), (int, float))
+        row for row in full_rows if isinstance(row.get("cross_entropy"), (int, float))
     ]
     if loss_rows:
         best_loss = min(loss_rows, key=lambda row: float(row["cross_entropy"]))
@@ -681,7 +659,9 @@ def render_overview_html(
     val_ce = _history_series(
         history, split="validation", field="cross_entropy", scope="full"
     )
-    probe_selection = _history_series(history, split="train_probe", field="selection_score")
+    probe_selection = _history_series(
+        history, split="train_probe", field="selection_score"
+    )
     val_selection = _history_series(
         history, split="validation", field="selection_score", scope="full"
     )
@@ -703,9 +683,7 @@ def render_overview_html(
                 (
                     "threshold loss",
                     "#d97706",
-                    _training_series(
-                        rows, "interval_threshold_loss", "threshold_loss"
-                    ),
+                    _training_series(rows, "interval_threshold_loss", "threshold_loss"),
                 ),
             ]
         )
@@ -811,8 +789,7 @@ def render_overview_html(
         ("data_wait_ratio", "Data wait ratio", "#d97706"),
     ):
         chart_cards.append(
-            f'<div class="card"><h3>{title}</h3>'
-            f'{_svg_chart(rows, field, color)}</div>'
+            f'<div class="card"><h3>{title}</h3>{_svg_chart(rows, field, color)}</div>'
         )
     charts = "\n".join(chart_cards)
     split_migration = data_cfg.get("split_migration") or {}
@@ -827,7 +804,10 @@ def render_overview_html(
         ("Split roles", split_roles),
         ("Local batch size", train_cfg.get("local_batch_size")),
         ("Max steps", train_cfg.get("max_steps")),
-        ("Epochs x steps/epoch", f"{train_cfg.get('epochs')} x {train_cfg.get('steps_per_epoch')}"),
+        (
+            "Epochs x steps/epoch",
+            f"{train_cfg.get('epochs')} x {train_cfg.get('steps_per_epoch')}",
+        ),
         ("Learning rate", config.get("optimizer", {}).get("learning_rate")),
         ("Seed", experiment.get("seed")),
         ("Model factory", config.get("model", {}).get("factory")),
@@ -836,7 +816,10 @@ def render_overview_html(
         ("Train probe cadence", evaluation_cfg.get("train_probe_every_steps")),
         ("Quick validation cadence", evaluation_cfg.get("val_quick_every_steps")),
         ("Full validation cadence", evaluation_cfg.get("val_full_every_steps")),
-        ("Selection metric", evaluation_cfg.get("selection_metric", "global_f1_at_decision_threshold")),
+        (
+            "Selection metric",
+            evaluation_cfg.get("selection_metric", "global_f1_at_decision_threshold"),
+        ),
         (
             "Early stopping",
             (
@@ -869,6 +852,7 @@ def render_overview_html(
                 if isinstance(value, (int, float)):
                     return f"{value:.4f}"
                 return str(value if value is not None else "n/a")
+
             metrics_rows += (
                 f"<tr><td>{label}</td><td>{cell('checkpoint_step')}</td>"
                 f"<td>{cell('selection_score')}</td>"
@@ -876,15 +860,13 @@ def render_overview_html(
                 f"<td>{cell('macro_game_f1_at_decision_threshold')}</td>"
                 f"<td>{cell('worst_game_f1_at_decision_threshold')}</td></tr>"
             )
-    duration_text = (
-        f"{duration_seconds / 60:.1f} min" if duration_seconds else "n/a"
-    )
+    duration_text = f"{duration_seconds / 60:.1f} min" if duration_seconds else "n/a"
     finished_text = finished or "running"
     return f"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Run {_html_escape(run_id or experiment.get('name', 'run'))}</title>
+<title>Run {_html_escape(run_id or experiment.get("name", "run"))}</title>
 <style>
   body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; color: #0f172a; }}
   h1 {{ font-size: 1.4rem; }} h3 {{ margin: 0 0 .5rem 0; font-size: .95rem; }}
@@ -901,7 +883,7 @@ def render_overview_html(
 </style>
 </head>
 <body>
-<h1>Run {_html_escape(run_id or experiment.get('name', 'run'))}</h1>
+<h1>Run {_html_escape(run_id or experiment.get("name", "run"))}</h1>
 <p><span class="banner">{_html_escape(state)}</span>
    &nbsp;{_html_escape(started)} \u2192 {_html_escape(finished_text)}
    ({_html_escape(duration_text)})</p>

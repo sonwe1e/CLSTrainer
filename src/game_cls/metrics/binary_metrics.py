@@ -47,9 +47,9 @@ def _roc_auc(scores: list[float], targets: list[int]) -> float:
             target for _, target in ranked[start:end]
         )
         start = end
-    return (
-        positive_rank_sum - positives * (positives + 1) / 2
-    ) / (positives * negatives)
+    return (positive_rank_sum - positives * (positives + 1) / 2) / (
+        positives * negatives
+    )
 
 
 def _average_precision(scores: list[float], targets: list[int]) -> float:

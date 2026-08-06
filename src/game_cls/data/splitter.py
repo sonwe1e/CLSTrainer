@@ -52,8 +52,7 @@ def compute_dataset_fingerprint(frames) -> str:
     frame_id, path) rows. Any content change re-fingerprints the data."""
     hasher = hashlib.sha256()
     for row in sorted(
-        (f.game, f.label, f.video_id, f.frame_id, f.path)
-        for f in frames
+        (f.game, f.label, f.video_id, f.frame_id, f.path) for f in frames
     ):
         hasher.update("|".join(str(part) for part in row).encode("utf-8"))
         hasher.update(b"\n")
@@ -149,9 +148,7 @@ def split_source_videos(
             assignment[uids[0]] = "train"
             continue
         ordered = sorted(uids, key=lambda uid: _stable_rank(seed, uid))
-        total_pairs = sum(
-            groups[uid]["pair_counts"][target_delta] for uid in ordered
-        )
+        total_pairs = sum(groups[uid]["pair_counts"][target_delta] for uid in ordered)
         if total_pairs <= 0:
             # No legal target_delta pairs in this stratum: keep all in
             # train (validation cannot rely on a delta with no support).
@@ -246,9 +243,7 @@ def load_split_manifest(path: str | Path) -> dict:
             "assignment": assignment,
             "dataset_fingerprint": first["dataset_fingerprint"],
             "split_seed": int(first["split_seed"]),
-            "split_algorithm_version": int(
-                first["split_algorithm_version"]
-            ),
+            "split_algorithm_version": int(first["split_algorithm_version"]),
         }
     return {
         "assignment": {},
@@ -271,34 +266,20 @@ def split_summary(
     groups = _group_frames(frames)
     splits: dict[str, dict] = {}
     for split in ("train", "val"):
-        members = {
-            uid
-            for uid, target in assignment.items()
-            if target == split
-        }
-        split_groups = [
-            group for uid, group in groups.items() if uid in members
-        ]
+        members = {uid for uid, target in assignment.items() if target == split}
+        split_groups = [group for uid, group in groups.items() if uid in members]
         splits[split] = {
             "source_video_count": len(members),
             "frame_count": sum(g["frame_count"] for g in split_groups),
-            "pair_count_delta1": sum(
-                g["pair_counts"][1] for g in split_groups
-            ),
-            "pair_count_delta2": sum(
-                g["pair_counts"][2] for g in split_groups
-            ),
-            "pair_count_delta3": sum(
-                g["pair_counts"][3] for g in split_groups
-            ),
+            "pair_count_delta1": sum(g["pair_counts"][1] for g in split_groups),
+            "pair_count_delta2": sum(g["pair_counts"][2] for g in split_groups),
+            "pair_count_delta3": sum(g["pair_counts"][3] for g in split_groups),
         }
-    total_pairs = splits["train"]["pair_count_delta2"] + splits["val"][
-        "pair_count_delta2"
-    ]
+    total_pairs = (
+        splits["train"]["pair_count_delta2"] + splits["val"]["pair_count_delta2"]
+    )
     val_ratio_achieved = (
-        splits["val"]["pair_count_delta2"] / total_pairs
-        if total_pairs
-        else 0.0
+        splits["val"]["pair_count_delta2"] / total_pairs if total_pairs else 0.0
     )
     return {
         "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
