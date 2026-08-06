@@ -14,7 +14,6 @@ import unittest
 import game_cls.engine.trainer as trainer
 import game_cls.engine.training.loop as loop
 
-
 # Mirrors the split map; every top-level name the old trainer.py exported.
 SHIM_OWNER: dict[str, str] = {
     "run_training": "loop",

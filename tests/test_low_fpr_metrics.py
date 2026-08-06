@@ -136,12 +136,8 @@ class LowFprEvaluationTests(unittest.TestCase):
         from game_cls.engine.evaluator import evaluate
 
         dataset = ControlledDataset()
-        result = evaluate(
-            SeparatingModel(), self._loader(dataset), self.device
-        )
-        tp, fp, fn, tn = _manual_confusion(
-            SeparatingModel(), dataset, 0.99
-        )
+        result = evaluate(SeparatingModel(), self._loader(dataset), self.device)
+        tp, fp, fn, tn = _manual_confusion(SeparatingModel(), dataset, 0.99)
         self.assertEqual((tp, fp, fn, tn), (2, 1, 1, 3))
         self.assertAlmostEqual(
             result.metrics["global_fpr_at_decision_threshold"],
@@ -201,7 +197,9 @@ class LowFprEvaluationTests(unittest.TestCase):
 
         loader = self._loader(ControlledDataset())
         enabled = evaluate(
-            SeparatingModel(), loader, self.device,
+            SeparatingModel(),
+            loader,
+            self.device,
             tail_calibration_enabled=True,
         )
         ece = enabled.metrics["ece_tail_95_100"]
@@ -210,7 +208,9 @@ class LowFprEvaluationTests(unittest.TestCase):
         self.assertLessEqual(ece, 1.0)
         self.assertGreater(ece, 0.0)  # the controlled set is miscalibrated
         disabled = evaluate(
-            SeparatingModel(), loader, self.device,
+            SeparatingModel(),
+            loader,
+            self.device,
             tail_calibration_enabled=False,
         )
         self.assertEqual(disabled.metrics["ece_tail_95_100"], 0.0)
@@ -240,11 +240,15 @@ class LowFprEvaluationTests(unittest.TestCase):
 
         loader = self._loader(ControlledDataset())
         default = evaluate(
-            SeparatingModel(), loader, self.device,
+            SeparatingModel(),
+            loader,
+            self.device,
             max_fpr_for_recall=0.01,
         )
         wider = evaluate(
-            SeparatingModel(), loader, self.device,
+            SeparatingModel(),
+            loader,
+            self.device,
             max_fpr_for_recall=0.5,
         )
         # A wider FPR bound can only keep or raise recall-at-bound.

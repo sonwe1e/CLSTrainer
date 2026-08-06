@@ -88,9 +88,7 @@ class DistributedEvaluatorTests(unittest.TestCase):
             )
             self.assertEqual(metrics["sample_count"], 16)
             self.assertEqual(metrics["auc_method"], "histogram_128_bins")
-            shards = list(
-                (root / "report" / "shards").glob("errors_rank_*.parquet")
-            )
+            shards = list((root / "report" / "shards").glob("errors_rank_*.parquet"))
             self.assertEqual(len(shards), 2)
 
 

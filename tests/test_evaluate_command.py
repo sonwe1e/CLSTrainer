@@ -85,12 +85,8 @@ class EvaluateCommandTests(unittest.TestCase):
             "audit_path": str(indexes / "audit.json"),
             "train_index": str(indexes / "train_frames.parquet"),
             "test_index": str(indexes / "test_frames.parquet"),
-            "train_video_index": str(
-                indexes / "train_video_entries.parquet"
-            ),
-            "test_video_index": str(
-                indexes / "test_video_entries.parquet"
-            ),
+            "train_video_index": str(indexes / "train_video_entries.parquet"),
+            "test_video_index": str(indexes / "test_video_entries.parquet"),
             "backend": "png",
             "width": 448,
             "height": 208,
@@ -98,9 +94,7 @@ class EvaluateCommandTests(unittest.TestCase):
         }
         if independent_test:
             data["val_index"] = str(indexes / "val_frames.parquet")
-            data["val_video_index"] = str(
-                indexes / "val_video_entries.parquet"
-            )
+            data["val_video_index"] = str(indexes / "val_video_entries.parquet")
         return {
             "experiment": {
                 "name": "eval_test",
@@ -136,9 +130,7 @@ class EvaluateCommandTests(unittest.TestCase):
         checkpoints = run_dir / "checkpoints"
         checkpoints.mkdir()
         model = __import__("evalmodel").build_model(config["model"])
-        torch.save(
-            model.state_dict(), checkpoints / "model_best_selection.pth"
-        )
+        torch.save(model.state_dict(), checkpoints / "model_best_selection.pth")
         args = type(
             "Args",
             (),
@@ -163,15 +155,13 @@ class EvaluateCommandTests(unittest.TestCase):
         self.assertEqual(summary["sample_count"], 4)
         history = [
             json.loads(line)
-            for line in (
-                run_dir / "metrics" / "evaluation.jsonl"
-            ).read_text(encoding="utf-8").splitlines()
+            for line in (run_dir / "metrics" / "evaluation.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
         ]
         self.assertEqual(history[-1]["split"], "test")
         self.assertEqual(history[-1]["scope"], "full")
-        self.assertTrue(
-            list((run_dir / "reports").glob("test_full_*"))
-        )
+        self.assertTrue(list((run_dir / "reports").glob("test_full_*")))
 
     def test_evaluate_test_split_refused_without_independent_test(self) -> None:
         from game_cls.cli import cmd_evaluate
@@ -186,9 +176,7 @@ class EvaluateCommandTests(unittest.TestCase):
         checkpoints = run_dir / "checkpoints"
         checkpoints.mkdir()
         model = __import__("evalmodel").build_model(config["model"])
-        torch.save(
-            model.state_dict(), checkpoints / "model_best_selection.pth"
-        )
+        torch.save(model.state_dict(), checkpoints / "model_best_selection.pth")
         args = type(
             "Args",
             (),
@@ -217,9 +205,7 @@ class EvaluateCommandTests(unittest.TestCase):
         checkpoints = run_dir / "checkpoints"
         checkpoints.mkdir()
         model = __import__("evalmodel").build_model(config["model"])
-        torch.save(
-            model.state_dict(), checkpoints / "model_best_selection.pth"
-        )
+        torch.save(model.state_dict(), checkpoints / "model_best_selection.pth")
         args = type(
             "Args",
             (),
@@ -234,9 +220,7 @@ class EvaluateCommandTests(unittest.TestCase):
         code = cmd_evaluate(args)
         self.assertEqual(code, 0)
         summary = json.loads(
-            (run_dir / "validation_evaluation.json").read_text(
-                encoding="utf-8"
-            )
+            (run_dir / "validation_evaluation.json").read_text(encoding="utf-8")
         )
         self.assertEqual(summary["split"], "validation")
         self.assertEqual(summary["sample_count"], 4)

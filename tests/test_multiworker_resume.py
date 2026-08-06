@@ -29,9 +29,7 @@ class MultiWorkerResumeTests(unittest.TestCase):
             frames = []
             for label in (0, 1):
                 for frame_id in range(1, 8):
-                    array = np.full(
-                        (32, 16, 3), label * 80 + frame_id, dtype=np.uint8
-                    )
+                    array = np.full((32, 16, 3), label * 80 + frame_id, dtype=np.uint8)
                     path = root / str(label) / f"01{frame_id:05d}.png"
                     path.parent.mkdir(parents=True, exist_ok=True)
                     Image.fromarray(array).save(path)

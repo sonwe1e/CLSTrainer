@@ -115,26 +115,23 @@ class DistributedGroupReductionTests(unittest.TestCase):
                 join=True,
             )
             payload = json.loads(
-                (root / "report" / "reduced_metrics.json").read_text(
-                    encoding="utf-8"
-                )
+                (root / "report" / "reduced_metrics.json").read_text(encoding="utf-8")
             )
             # Both ranks contributed their own samples.
             self.assertEqual(payload["sample_count"], 8)
             by_video = payload["grouped"]["by_video"]
-            games = {
-                (row["game"], row["label"]) for row in by_video
-            }
+            games = {(row["game"], row["label"]) for row in by_video}
             # Rank 0 saw A/B labels 0/1, rank 1 saw A/B labels 1/0; merged
             # counts cover every (game, label) with samples on both ranks.
-            self.assertEqual(
-                games, {("A", 0), ("A", 1), ("B", 0), ("B", 1)}
-            )
+            self.assertEqual(games, {("A", 0), ("A", 1), ("B", 0), ("B", 1)})
             counts: dict[str, int] = {}
             for row in by_video:
                 counts[row["game"]] = (
                     counts.get(row["game"], 0)
-                    + row["tp"] + row["fp"] + row["fn"] + row["tn"]
+                    + row["tp"]
+                    + row["fp"]
+                    + row["fn"]
+                    + row["tn"]
                 )
             # Each game has exactly 4 samples across ranks (2 per rank).
             self.assertEqual(counts, {"A": 4, "B": 4})

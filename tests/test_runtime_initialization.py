@@ -22,14 +22,17 @@ def test_npu_extension_and_device_are_ready_before_hccl_init():
     fake_torch.distributed = fake_dist
     fake_torch_npu = ModuleType("torch_npu")
     environment = {"LOCAL_RANK": "1", "RANK": "1", "WORLD_SIZE": "8"}
-    with patch.dict(
-        sys.modules,
-        {
-            "torch": fake_torch,
-            "torch.distributed": fake_dist,
-            "torch_npu": fake_torch_npu,
-        },
-    ), patch.dict(os.environ, environment, clear=False):
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "torch": fake_torch,
+                "torch.distributed": fake_dist,
+                "torch_npu": fake_torch_npu,
+            },
+        ),
+        patch.dict(os.environ, environment, clear=False),
+    ):
         from game_cls.engine.distributed import initialize_runtime
 
         rank, world_size, local_rank, device = initialize_runtime(
@@ -40,4 +43,3 @@ def test_npu_extension_and_device_are_ready_before_hccl_init():
         )
     assert (rank, world_size, local_rank, device) == (1, 8, 1, "npu:1")
     assert events == [("set_device", 1), ("init_process_group", "hccl")]
-

@@ -37,9 +37,7 @@ class BatchNormAndOptimizerTests(unittest.TestCase):
         from game_cls.model.freeze_policy import configure_trainable_parameters
 
         model = torch.nn.Module()
-        model.cls = torch.nn.Sequential(
-            torch.nn.Linear(4, 4), torch.nn.BatchNorm1d(4)
-        )
+        model.cls = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.BatchNorm1d(4))
         configure_trainable_parameters(model)
         groups = build_optimizer_parameter_groups(model, 0.01)
         by_decay = {group["weight_decay"]: group["params"] for group in groups}

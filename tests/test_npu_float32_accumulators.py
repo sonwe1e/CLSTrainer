@@ -61,7 +61,9 @@ class NoFloat64DeviceTensorTests(unittest.TestCase):
             offenders,
             [],
             "NPU forbids float64 device tensors (k::double). Found: "
-            + "; ".join(f"{path}:{line} {snippet}" for path, line, snippet in offenders),
+            + "; ".join(
+                f"{path}:{line} {snippet}" for path, line, snippet in offenders
+            ),
         )
 
 
@@ -93,9 +95,7 @@ class IntervalAccumulatorTests(unittest.TestCase):
         accum["threshold_sum"].add_(self.torch.tensor(0.5) * 8)
         accum["threshold_weight_sum"].add_(self.torch.tensor(0.2) * 8)
         accum["samples"] += 8
-        accum["counts"].add_(
-            self.torch.tensor([4, 1, 1, 2], dtype=self.torch.int64)
-        )
+        accum["counts"].add_(self.torch.tensor([4, 1, 1, 2], dtype=self.torch.int64))
 
         reduced = _reduce_interval_accumulator(accum, device)
         self.assertAlmostEqual(reduced["interval_loss"], 2.5)
@@ -130,9 +130,7 @@ class IntervalAccumulatorTests(unittest.TestCase):
                 nprocs=2,
                 join=True,
             )
-            payload = json.loads(
-                (root / "reduced.json").read_text(encoding="utf-8")
-            )
+            payload = json.loads((root / "reduced.json").read_text(encoding="utf-8"))
             self.assertAlmostEqual(payload["threshold_weight"], 0.3)
             self.assertEqual(payload["samples"], 16)
             self.assertAlmostEqual(payload["loss"], 1.0)

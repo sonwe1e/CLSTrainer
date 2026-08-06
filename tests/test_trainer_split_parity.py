@@ -55,9 +55,9 @@ class TrainerSplitParityTests(unittest.TestCase):
         output_dir = self._run_short_training()
         records = [
             json.loads(line)
-            for line in (output_dir / "train_metrics.jsonl").read_text(
-                encoding="utf-8"
-            ).splitlines()
+            for line in (output_dir / "train_metrics.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
             if line.strip()
         ]
         self.assertTrue(records, "train_metrics.jsonl must not be empty")

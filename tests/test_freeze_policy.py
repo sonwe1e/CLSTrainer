@@ -31,9 +31,7 @@ class FreezePolicyTests(unittest.TestCase):
     def test_only_lowercase_cls_is_trainable(self) -> None:
         model = FakeModel()
         summary = configure_trainable_parameters(model)
-        self.assertEqual(
-            summary.trainable_names, ("head.cls.weight", "head.cls.bias")
-        )
+        self.assertEqual(summary.trainable_names, ("head.cls.weight", "head.cls.bias"))
         self.assertEqual(summary.trainable_count, 10)
         self.assertEqual(summary.frozen_count, 110)
         self.assertFalse(model.parameters["head.Classifier.weight"].requires_grad)
@@ -46,4 +44,3 @@ class FreezePolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

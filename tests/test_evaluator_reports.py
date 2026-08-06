@@ -42,9 +42,7 @@ class EvaluatorReportTests(unittest.TestCase):
         self.assertEqual(len(result.grouped_metrics["by_video"]), 4)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            write_evaluation_shard(
-                output, 0, result.errors, result.near_threshold
-            )
+            write_evaluation_shard(output, 0, result.errors, result.near_threshold)
             write_evaluation_report(
                 output,
                 result.metrics,
@@ -108,21 +106,15 @@ class EvaluatorReportTests(unittest.TestCase):
             }
 
         def decoder(frame_index: int):
-            return torch.full(
-                (3, 8, 6), frame_index % 255, dtype=torch.uint8
-            )
+            return torch.full((3, 8, 6), frame_index % 255, dtype=torch.uint8)
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            with EvaluationShardWriter(
-                output, 0, row_group_size=2
-            ) as writer:
+            with EvaluationShardWriter(output, 0, row_group_size=2) as writer:
                 writer.write([row(123)], [])
                 writer.write([row(125)], [])
                 writer.write([row(127)], [])
-            shard = (
-                output / "shards" / "errors_rank_0000.parquet"
-            )
+            shard = output / "shards" / "errors_rank_0000.parquet"
             self.assertEqual(pq.ParquetFile(shard).num_row_groups, 2)
             write_evaluation_report(
                 output,

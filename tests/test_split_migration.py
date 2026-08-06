@@ -19,16 +19,10 @@ class SplitMigrationTests(unittest.TestCase):
         config["evaluation"]["quick_test_every_steps"] = 7
         config["evaluation"]["quick_test_pairs_per_video"] = 9
         finalized = finalize_config(config)
-        self.assertEqual(
-            finalized["evaluation"]["val_quick_every_steps"], 7
-        )
-        self.assertEqual(
-            finalized["evaluation"]["val_quick_pairs_per_video"], 9
-        )
+        self.assertEqual(finalized["evaluation"]["val_quick_every_steps"], 7)
+        self.assertEqual(finalized["evaluation"]["val_quick_pairs_per_video"], 9)
         self.assertNotIn("quick_test_every_steps", finalized["evaluation"])
-        self.assertNotIn(
-            "quick_test_pairs_per_video", finalized["evaluation"]
-        )
+        self.assertNotIn("quick_test_pairs_per_video", finalized["evaluation"])
 
     def test_missing_val_index_aliases_test_and_warns(self) -> None:
         config = load_config("configs/cuda_debug.yaml")
@@ -50,15 +44,11 @@ class SplitMigrationTests(unittest.TestCase):
     def test_independent_val_and_test_splits_do_not_warn(self) -> None:
         config = load_config("configs/cuda_debug.yaml")
         config["data"]["val_index"] = "indexes/val_frames.parquet"
-        config["data"]["val_video_index"] = (
-            "indexes/val_video_entries.parquet"
-        )
+        config["data"]["val_video_index"] = "indexes/val_video_entries.parquet"
         config["data"].pop("split_migration", None)
         finalized = finalize_config(config)
         self.assertFalse(
-            finalized["data"]["split_migration"].get(
-                "test_used_as_validation"
-            )
+            finalized["data"]["split_migration"].get("test_used_as_validation")
         )
         self.assertEqual(split_role_warnings(finalized), [])
 

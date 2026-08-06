@@ -85,16 +85,10 @@ class ProductionCheckpointTests(unittest.TestCase):
             self.assertEqual(set(payload["model"]), {"cls.weight", "cls.bias"})
             fresh = build_demo_model({})
             configure_trainable_parameters(fresh)
-            restore_training_checkpoint(
-                Path(directory) / "checkpoint_last.pth", fresh
-            )
+            restore_training_checkpoint(Path(directory) / "checkpoint_last.pth", fresh)
             payload["model"].pop("cls.bias")
-            torch.save(
-                payload, Path(directory) / "checkpoint_corrupt.pth"
-            )
-            with self.assertRaisesRegex(
-                RuntimeError, "key set does not match"
-            ):
+            torch.save(payload, Path(directory) / "checkpoint_corrupt.pth")
+            with self.assertRaisesRegex(RuntimeError, "key set does not match"):
                 restore_training_checkpoint(
                     Path(directory) / "checkpoint_corrupt.pth", fresh
                 )

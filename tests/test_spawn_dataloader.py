@@ -45,9 +45,7 @@ class SpawnDataLoaderTests(unittest.TestCase):
         batches = list(loader)
 
         self.assertEqual(len(batches), 4)
-        self.assertEqual(
-            tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8)
-        )
+        self.assertEqual(tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8))
 
     @unittest.skipIf(
         np is None or Image is None,
@@ -67,20 +65,14 @@ class SpawnDataLoaderTests(unittest.TestCase):
             video_directory = Path(directory) / "gameA" / "0"
             video_directory.mkdir(parents=True)
             for frame_id in range(3):
-                pixels = np.full(
-                    (8, 8, 3), frame_id * 40, dtype=np.uint8
-                )
-                Image.fromarray(pixels).save(
-                    video_directory / f"01{frame_id:05d}.png"
-                )
+                pixels = np.full((8, 8, 3), frame_id * 40, dtype=np.uint8)
+                Image.fromarray(pixels).save(video_directory / f"01{frame_id:05d}.png")
             video = VideoEntry(
                 game="gameA",
                 label=0,
                 video_id="01",
                 frame_ids=np.asarray([0, 1, 2], dtype=np.int32),
-                valid_start_positions={
-                    1: np.asarray([0, 1], dtype=np.int32)
-                },
+                valid_start_positions={1: np.asarray([0, 1], dtype=np.int32)},
                 video_directory=str(video_directory),
             )
             transform = ConsistentPairAugment(
@@ -93,9 +85,7 @@ class SpawnDataLoaderTests(unittest.TestCase):
                     }
                 }
             )
-            dataset = LazyTrainingPairDataset(
-                [video], transform=transform
-            )
+            dataset = LazyTrainingPairDataset([video], transform=transform)
             sampler = VideoBalancedPairBatchSampler(
                 [video],
                 local_batch_size=2,
@@ -115,9 +105,7 @@ class SpawnDataLoaderTests(unittest.TestCase):
             batches = list(loader)
 
             self.assertEqual(len(batches), 1)
-            self.assertEqual(
-                tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8)
-            )
+            self.assertEqual(tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8))
             self.assertEqual(batches[0]["images"].dtype, torch.uint8)
 
 

@@ -63,41 +63,28 @@ class EvaluationScheduleTests(unittest.TestCase):
             checkpoints = Path(directory) / "run" / "checkpoints"
             self.assertTrue(
                 (
-                    checkpoints
-                    / "checkpoint_best_observed_dev_test_selection.pth"
+                    checkpoints / "checkpoint_best_observed_dev_test_selection.pth"
                 ).is_file()
             )
             self.assertTrue(
-                (
-                    checkpoints
-                    / "model_best_observed_dev_test_selection.pth"
-                ).is_file()
+                (checkpoints / "model_best_observed_dev_test_selection.pth").is_file()
             )
             self.assertTrue(
                 (
-                    checkpoints
-                    / "model_best_observed_dev_test_selection.metadata.json"
+                    checkpoints / "model_best_observed_dev_test_selection.metadata.json"
                 ).is_file()
             )
             # Multi-objective checkpoints required by the train/val/test
             # protocol (step2 plan P2).
-            self.assertTrue(
-                (checkpoints / "model_best_selection.pth").is_file()
-            )
-            self.assertTrue(
-                (checkpoints / "model_best_val_loss.pth").is_file()
-            )
-            self.assertTrue(
-                (checkpoints / "model_best_worst_game.pth").is_file()
-            )
+            self.assertTrue((checkpoints / "model_best_selection.pth").is_file())
+            self.assertTrue((checkpoints / "model_best_val_loss.pth").is_file())
+            self.assertTrue((checkpoints / "model_best_worst_game.pth").is_file())
             # Unified evaluation history (step2 plan P1).
             history_path = Path(directory) / "run" / "metrics" / "evaluation.jsonl"
             self.assertTrue(history_path.is_file())
             history = [
                 json.loads(line)
-                for line in history_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                for line in history_path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(history[0]["split"], "validation")
             self.assertEqual(history[0]["scope"], "quick")
@@ -106,16 +93,14 @@ class EvaluationScheduleTests(unittest.TestCase):
             self.assertIn("positive_margin_pass_rate", history[0])
             metric_rows = [
                 json.loads(line)
-                for line in (
-                    Path(directory) / "run" / "train_metrics.jsonl"
-                ).read_text(encoding="utf-8").splitlines()
+                for line in (Path(directory) / "run" / "train_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             self.assertEqual(len(metric_rows), 1)
             interval = metric_rows[0]
             self.assertEqual(interval["step"], 2)
-            self.assertGreater(
-                interval["interval_samples_per_second"], 0
-            )
+            self.assertGreater(interval["interval_samples_per_second"], 0)
             self.assertGreater(interval["interval_step_time"], 0)
             self.assertGreaterEqual(interval["data_wait_ratio"], 0)
             self.assertLessEqual(interval["data_wait_ratio"], 1)

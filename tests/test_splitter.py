@@ -103,9 +103,7 @@ class SplitterCoreTests(unittest.TestCase):
 
     def test_pair_ratio_approaches_target(self) -> None:
         frames = _dataset(videos_per_game_label=12, frames_per_video=20)
-        assignment = split_source_videos(
-            frames, val_ratio=0.2, seed=7, target_delta=2
-        )
+        assignment = split_source_videos(frames, val_ratio=0.2, seed=7, target_delta=2)
         summary = split_summary(
             frames,
             assignment,
@@ -134,17 +132,13 @@ class SplitterCoreTests(unittest.TestCase):
             seed=1,
             small_stratum_policy="warn",
         )
-        self.assertEqual(
-            assignment[source_video_uid("only_game", "01")], "train"
-        )
+        self.assertEqual(assignment[source_video_uid("only_game", "01")], "train")
 
 
 class SplitManifestTests(unittest.TestCase):
     def test_write_load_roundtrip(self) -> None:
         frames = _dataset()
-        assignment = split_source_videos(
-            frames, val_ratio=0.2, seed=5, target_delta=2
-        )
+        assignment = split_source_videos(frames, val_ratio=0.2, seed=5, target_delta=2)
         fingerprint = compute_dataset_fingerprint(frames)
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "split_manifest.parquet"
@@ -159,9 +153,7 @@ class SplitManifestTests(unittest.TestCase):
         self.assertEqual(loaded["assignment"], assignment)
         self.assertEqual(loaded["dataset_fingerprint"], fingerprint)
         self.assertEqual(loaded["split_seed"], 5)
-        self.assertEqual(
-            loaded["split_algorithm_version"], SPLIT_ALGORITHM_VERSION
-        )
+        self.assertEqual(loaded["split_algorithm_version"], SPLIT_ALGORITHM_VERSION)
 
     def test_resolve_reuses_matching_manifest(self) -> None:
         frames = _dataset()
@@ -207,9 +199,7 @@ class SplitManifestTests(unittest.TestCase):
 
     def test_split_summary_shape(self) -> None:
         frames = _dataset()
-        assignment = split_source_videos(
-            frames, val_ratio=0.2, seed=3, target_delta=2
-        )
+        assignment = split_source_videos(frames, val_ratio=0.2, seed=3, target_delta=2)
         summary = split_summary(
             frames,
             assignment,

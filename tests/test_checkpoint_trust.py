@@ -57,9 +57,7 @@ class CheckpointTrustTests(unittest.TestCase):
                 },
                 path,
             )
-            with self.assertRaisesRegex(
-                RuntimeError, "cls_training_checkpoint"
-            ):
+            with self.assertRaisesRegex(RuntimeError, "cls_training_checkpoint"):
                 restore_training_checkpoint(path, model)
 
     def test_internal_checkpoint_with_marker_restores(self) -> None:

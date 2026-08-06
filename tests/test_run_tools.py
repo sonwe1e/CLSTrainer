@@ -18,9 +18,7 @@ except ImportError:
 
 def _cli(*args: str, expect_code: int = 0) -> tuple[int, str]:
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get(
-        "PYTHONPATH", ""
-    )
+    env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     completed = subprocess.run(
         [sys.executable, "-m", "game_cls.cli", *args],
         cwd=REPO_ROOT,
@@ -30,9 +28,7 @@ def _cli(*args: str, expect_code: int = 0) -> tuple[int, str]:
         timeout=600,
     )
     if expect_code is not None:
-        assert completed.returncode == expect_code, (
-            completed.stdout + completed.stderr
-        )
+        assert completed.returncode == expect_code, completed.stdout + completed.stderr
     return completed.returncode, completed.stdout + completed.stderr
 
 
@@ -95,18 +91,14 @@ class RunToolsTests(unittest.TestCase):
                 "checkpoint.save_last_every_steps=0",
             )
             self.assertIn("Training finished", fork_output)
-            run_b = [
-                path for path in _run_dirs(root) if path != run_a
-            ][0]
+            run_b = [path for path in _run_dirs(root) if path != run_a][0]
             manifest_a = json.loads(
                 (run_a / "manifest.json").read_text(encoding="utf-8")
             )
             manifest_b = json.loads(
                 (run_b / "manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                manifest_b.get("parent_run_id"), manifest_a.get("run_id")
-            )
+            self.assertEqual(manifest_b.get("parent_run_id"), manifest_a.get("run_id"))
             self.assertEqual(manifest_b.get("forked_from"), str(run_a))
             config_b = json.loads(
                 (run_b / "resolved_config.json").read_text(encoding="utf-8")
@@ -199,9 +191,7 @@ class RunToolsTests(unittest.TestCase):
             self.assertEqual(code, 0, output)
             self.assertIn("resume-extend", output)
             self.assertIn("Training finished", output)
-            status = json.loads(
-                (run_a / "status.json").read_text(encoding="utf-8")
-            )
+            status = json.loads((run_a / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "SUCCEEDED")
             self.assertEqual(status["step"], 4)
 

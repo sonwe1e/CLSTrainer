@@ -22,8 +22,7 @@ def _videos(count: int = 8, starts: int = 3) -> list[VideoEntry]:
                 label=index % 2,
                 frame_ids=np.arange(starts + 2, dtype=np.int64) + index * 100,
                 valid_start_positions={
-                    delta: np.arange(starts, dtype=np.int64)
-                    for delta in (1, 2, 3)
+                    delta: np.arange(starts, dtype=np.int64) for delta in (1, 2, 3)
                 },
             )
         )
@@ -68,9 +67,7 @@ class DedupLevelTests(unittest.TestCase):
         )
         same_video_in_batch = False
         for batch in sampler:
-            identities = {
-                (r.video_index, r.delta, r.start_position) for r in batch
-            }
+            identities = {(r.video_index, r.delta, r.start_position) for r in batch}
             # Within one batch every pair identity is unique...
             self.assertEqual(len(identities), len(batch))
             # ...but the same video may legitimately appear again with a

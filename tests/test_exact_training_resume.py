@@ -71,9 +71,9 @@ class ExactTrainingResumeTests(unittest.TestCase):
                 self.assertTrue(torch.equal(full_state[key], resumed_state[key]), key)
             metric_steps = [
                 json.loads(line)["step"]
-                for line in (
-                    root / "resumed" / "train_metrics.jsonl"
-                ).read_text(encoding="utf-8").splitlines()
+                for line in (root / "resumed" / "train_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             self.assertEqual(metric_steps, [2, 4])
 

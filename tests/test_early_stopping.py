@@ -91,13 +91,9 @@ class EarlyStoppingTests(unittest.TestCase):
                 "model_best_worst_game.pth",
                 "model_last.pth",
             ):
-                self.assertTrue(
-                    (checkpoints / name).is_file(), f"missing {name}"
-                )
+                self.assertTrue((checkpoints / name).is_file(), f"missing {name}")
             status = Path(directory) / "run" / "status.json"
-            payload = __import__("json").loads(
-                status.read_text(encoding="utf-8")
-            )
+            payload = __import__("json").loads(status.read_text(encoding="utf-8"))
             self.assertTrue(payload.get("early_stopped"))
             self.assertEqual(payload.get("early_stopped_step"), 40)
 
@@ -163,9 +159,9 @@ class EarlyStoppingTests(unittest.TestCase):
             ):
                 result = run_training(config)
             summary = __import__("json").loads(
-                (
-                    Path(directory) / "run" / "training_summary.json"
-                ).read_text(encoding="utf-8")
+                (Path(directory) / "run" / "training_summary.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertTrue(summary["restored_best"])
             self.assertEqual(

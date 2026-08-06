@@ -40,15 +40,11 @@ class EvaluationHistoryTests(unittest.TestCase):
                 }
             )
             run_training(config)
-            history_path = (
-                Path(directory) / "run" / "metrics" / "evaluation.jsonl"
-            )
+            history_path = Path(directory) / "run" / "metrics" / "evaluation.jsonl"
             self.assertTrue(history_path.is_file())
             history = [
                 json.loads(line)
-                for line in history_path.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                for line in history_path.read_text(encoding="utf-8").splitlines()
             ]
             kinds = [row["kind"] for row in history]
             self.assertIn("train_probe", kinds)
@@ -57,9 +53,7 @@ class EvaluationHistoryTests(unittest.TestCase):
             full_rows = [row for row in history if row["kind"] == "val_full"]
             self.assertTrue(probe_rows)
             self.assertTrue(full_rows)
-            self.assertTrue(
-                all(row["split"] == "train_probe" for row in probe_rows)
-            )
+            self.assertTrue(all(row["split"] == "train_probe" for row in probe_rows))
             self.assertTrue(
                 all(
                     row["split"] == "validation" and row["scope"] == "full"
@@ -67,11 +61,7 @@ class EvaluationHistoryTests(unittest.TestCase):
                 )
             )
             # Step 50 runs both probe and full: the gap must be recorded.
-            gap_rows = [
-                row
-                for row in full_rows
-                if "generalization_ce_gap" in row
-            ]
+            gap_rows = [row for row in full_rows if "generalization_ce_gap" in row]
             self.assertTrue(gap_rows, "no generalization_ce_gap recorded")
             self.assertIn("generalization_score_gap", gap_rows[0])
             # Margin statistics from the evaluator.
@@ -111,9 +101,9 @@ class EvaluationHistoryTests(unittest.TestCase):
             run_training(config)
             rows = [
                 json.loads(line)
-                for line in (
-                    Path(directory) / "run" / "train_metrics.jsonl"
-                ).read_text(encoding="utf-8").splitlines()
+                for line in (Path(directory) / "run" / "train_metrics.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
             self.assertEqual(len(rows), 2)
             for row in rows:

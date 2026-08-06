@@ -63,9 +63,7 @@ class TorchThresholdLossTests(unittest.TestCase):
     def test_negative_tail_ohem_picks_hardest(self) -> None:
         from game_cls.losses.threshold_loss import negative_tail_ohem_loss
 
-        logits = torch.tensor(
-            [[0.0, 0.0], [0.0, 10.0], [0.0, 4.5], [0.0, 8.0]]
-        )
+        logits = torch.tensor([[0.0, 0.0], [0.0, 10.0], [0.0, 4.5], [0.0, 8.0]])
         targets = torch.tensor([0, 0, 1, 0])  # margins: 0.0, 10.0, 4.5(pos), 8.0
         full = negative_tail_ohem_loss(logits, targets)
         top1 = negative_tail_ohem_loss(logits, targets, hard_negative_k=1)
@@ -75,11 +73,8 @@ class TorchThresholdLossTests(unittest.TestCase):
         self.assertGreater(top1.item(), full.item())
         margin = logits[:, 1] - logits[:, 0]
         neg_margin = margin[targets < 0.5]
-        neg_loss = (
-            0.5
-            * torch.nn.functional.softplus(
-                (neg_margin - math.log(99) + 0.2) / 0.5
-            )
+        neg_loss = 0.5 * torch.nn.functional.softplus(
+            (neg_margin - math.log(99) + 0.2) / 0.5
         )
         self.assertAlmostEqual(top1.item(), neg_loss.max().item())
 
@@ -216,14 +211,12 @@ class TorchThresholdLossTests(unittest.TestCase):
         self.assertAlmostEqual(total.item(), total_default.item())
         self.assertEqual(components["negative_tail_loss"].item(), 0.0)
         self.assertEqual(components["rank_loss"].item(), 0.0)
-        self.assertEqual(
-            set(comp_default), set(components)
-        )
+        self.assertEqual(set(comp_default), set(components))
         # Hand-replicated legacy baseline: ce + weight * margin loss.
         weight = threshold_weight_at_step(50, 100, 0.2, 0.10, 0.20)
-        expected = F.cross_entropy(logits.float(), targets) + weight * threshold_margin_loss(
-            logits, targets
-        )
+        expected = F.cross_entropy(
+            logits.float(), targets
+        ) + weight * threshold_margin_loss(logits, targets)
         self.assertAlmostEqual(total_default.item(), expected.item())
 
     def test_combined_loss_enabling_terms_changes_total(self) -> None:
@@ -252,9 +245,7 @@ class TorchThresholdLossTests(unittest.TestCase):
         self.assertGreater(comp_on["negative_tail_loss"].item(), 0.0)
         self.assertGreater(comp_on["rank_loss"].item(), 0.0)
         expected = (
-            total_off
-            + 0.5 * comp_on["negative_tail_loss"]
-            + 0.5 * comp_on["rank_loss"]
+            total_off + 0.5 * comp_on["negative_tail_loss"] + 0.5 * comp_on["rank_loss"]
         )
         self.assertAlmostEqual(total_on.item(), expected.item())
         # Enabling the terms raises the total for this adversarial batch.

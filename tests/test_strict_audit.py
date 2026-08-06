@@ -95,9 +95,7 @@ class StrictAuditTests(unittest.TestCase):
                 "path": "/data/game_A/0/random_dir",
             }
         ]
-        validate_audit(
-            audit, image_spec=SPEC, duplicate_policy=POLICY
-        )
+        validate_audit(audit, image_spec=SPEC, duplicate_policy=POLICY)
 
     def test_rejects_errors_missing_class_and_test_pairs(self) -> None:
         audit = valid_audit()
@@ -108,13 +106,9 @@ class StrictAuditTests(unittest.TestCase):
                 "path": "/data/bad.png",
             }
         ]
-        audit["splits"]["train"]["games_missing_labels"] = {
-            "game_A": [1]
-        }
+        audit["splits"]["train"]["games_missing_labels"] = {"game_A": [1]}
         audit["splits"]["test"]["valid_pairs"]["2"] = 0
-        with self.assertRaisesRegex(
-            RuntimeError, "Strict dataset audit failed"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "Strict dataset audit failed"):
             validate_audit(audit)
 
     def test_video_key_overlap_is_always_fatal(self) -> None:
@@ -123,9 +117,7 @@ class StrictAuditTests(unittest.TestCase):
         audit["leakage"]["video_keys_across_splits"] = [
             {"game": "game_A", "label": 1, "video_id": "01"}
         ]
-        with self.assertRaisesRegex(
-            RuntimeError, "share source video keys"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "share source video keys"):
             validate_audit(audit, require_content_hash=True)
 
     def test_source_video_uid_overlap_is_fatal(self) -> None:
@@ -147,9 +139,7 @@ class StrictAuditTests(unittest.TestCase):
 
     def test_rejects_insufficient_game_label_delta_coverage(self) -> None:
         audit = valid_audit()
-        audit["splits"]["train"][
-            "valid_pairs_by_game_label_delta"
-        ][4]["count"] = 0
+        audit["splits"]["train"]["valid_pairs_by_game_label_delta"][4]["count"] = 0
         with self.assertRaisesRegex(RuntimeError, "label=1/delta=2"):
             validate_audit(
                 audit,
@@ -219,9 +209,7 @@ class StrictAuditTests(unittest.TestCase):
         )
         audit = valid_audit()
         audit["duplicates"] = duplicates
-        with self.assertRaisesRegex(
-            RuntimeError, "duplicate conflict"
-        ):
+        with self.assertRaisesRegex(RuntimeError, "duplicate conflict"):
             validate_audit(audit, require_content_hash=True)
 
     def test_same_basename_with_different_content_is_info_only(self) -> None:

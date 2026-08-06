@@ -34,9 +34,7 @@ class PackedBackendTests(unittest.TestCase):
             rows = []
             expected = []
             for index in range(5):
-                array = np.full(
-                    (208, 448, 3), index * 40, dtype=np.uint8
-                )
+                array = np.full((208, 448, 3), index * 40, dtype=np.uint8)
                 array[:, :, 1] += 5
                 path = root / f"image_{index}.png"
                 Image.fromarray(array).save(path)
@@ -49,9 +47,7 @@ class PackedBackendTests(unittest.TestCase):
                         "frame_id": index,
                     }
                 )
-                expected.append(torch.from_numpy(
-                    array.transpose(2, 0, 1).copy()
-                ))
+                expected.append(torch.from_numpy(array.transpose(2, 0, 1).copy()))
             frame_index = root / "frames.parquet"
             pq.write_table(pa.Table.from_pylist(rows), frame_index)
             image_spec = ImageSpec(width=448, height=208, channels=3)
@@ -70,14 +66,10 @@ class PackedBackendTests(unittest.TestCase):
                 self.assertTrue(torch.equal(backend(location), tensor))
                 self.assertLessEqual(backend.open_shard_count, 1)
             reordered = backend.get_many([4, 0, 3, 1])
-            self.assertEqual(
-                tuple(reordered.shape), (4, 3, 208, 448)
-            )
+            self.assertEqual(tuple(reordered.shape), (4, 3, 208, 448))
             for actual, location in zip(reordered, [4, 0, 3, 1], strict=False):
                 self.assertTrue(torch.equal(actual, expected[location]))
-            self.assertEqual(
-                len(list((root / "packed").glob("shard_*.bin"))), 3
-            )
+            self.assertEqual(len(list((root / "packed").glob("shard_*.bin"))), 3)
             self.assertTrue(
                 (root / "packed" / "packed_video_entries.parquet").is_file()
             )
@@ -87,18 +79,14 @@ class PackedBackendTests(unittest.TestCase):
             )
             dataset = build_eval_dataset(videos, 2, decoder=backend)
             sample = dataset[0]
-            self.assertEqual(
-                tuple(sample["images"].shape), (2, 3, 208, 448)
-            )
+            self.assertEqual(tuple(sample["images"].shape), (2, 3, 208, 448))
             batch_samples = dataset.__getitems__([0, 1])
             self.assertEqual(len(batch_samples), 2)
             self.assertEqual(
                 tuple(batch_samples[0]["images"].shape),
                 (2, 3, 208, 448),
             )
-            train_dataset = LazyTrainingPairDataset(
-                videos, decoder=backend
-            )
+            train_dataset = LazyTrainingPairDataset(videos, decoder=backend)
             train_samples = train_dataset.__getitems__(
                 [
                     PairRequest(0, 2, 0, augmentation_seed=1),
@@ -110,30 +98,20 @@ class PackedBackendTests(unittest.TestCase):
                 tuple(train_samples[0]["images"].shape),
                 (2, 3, 208, 448),
             )
-            self.assertTrue(
-                sample["meta"]["image0_path"].startswith("packed://frame/")
-            )
-            manifest_path = (
-                root / "packed" / "packed_manifest.json"
-            )
+            self.assertTrue(sample["meta"]["image0_path"].startswith("packed://frame/"))
+            manifest_path = root / "packed" / "packed_manifest.json"
             manifest_text = manifest_path.read_text(encoding="utf-8")
-            self.assertNotIn(
-                str((root / "packed").resolve()), manifest_text
-            )
+            self.assertNotIn(str((root / "packed").resolve()), manifest_text)
             import json
 
             manifest = json.loads(manifest_text)
             self.assertEqual(manifest["width"], 448)
             self.assertEqual(manifest["height"], 208)
             self.assertEqual(manifest["channels"], 3)
-            with self.assertRaisesRegex(
-                ValueError, "does not match configured shape"
-            ):
+            with self.assertRaisesRegex(ValueError, "does not match configured shape"):
                 PackedUint8Backend(
                     packed_index,
-                    image_spec=ImageSpec(
-                        width=208, height=448, channels=3
-                    ),
+                    image_spec=ImageSpec(width=208, height=448, channels=3),
                 )
             backend.close()
 
@@ -153,9 +131,7 @@ class PackedBackendTests(unittest.TestCase):
             root = Path(directory)
             rows = []
             for frame_id in range(3):
-                array = np.full(
-                    (8, 8, 3), frame_id * 50, dtype=np.uint8
-                )
+                array = np.full((8, 8, 3), frame_id * 50, dtype=np.uint8)
                 path = root / f"01{frame_id:05d}.png"
                 Image.fromarray(array).save(path)
                 rows.append(
@@ -198,9 +174,7 @@ class PackedBackendTests(unittest.TestCase):
             batches = list(loader)
 
             self.assertEqual(len(batches), 1)
-            self.assertEqual(
-                tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8)
-            )
+            self.assertEqual(tuple(batches[0]["images"].shape), (2, 2, 3, 8, 8))
             # Spawn pickling removes parent-owned maps. The worker opens and
             # closes its own maps without mutating the parent backend.
             self.assertEqual(backend.open_shard_count, 0)

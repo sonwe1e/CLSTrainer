@@ -90,9 +90,7 @@ class TopKCheckpointTests(unittest.TestCase):
             registry = result["evaluation_state"]["topk_registry"]
             # Sorted best-first: step 40 (0.9), step 20 (0.5); step 60 (0.4)
             # must have been evicted.
-            self.assertEqual(
-                [entry["step"] for entry in registry], [40, 20]
-            )
+            self.assertEqual([entry["step"] for entry in registry], [40, 20])
             self.assertEqual(registry[0]["value"], 0.9)
             self.assertEqual(registry[1]["value"], 0.5)
 
@@ -106,9 +104,7 @@ class TopKCheckpointTests(unittest.TestCase):
                     (checkpoints / f"checkpoint_topk_{step:08d}.pth").is_file()
                 )
             # The evicted checkpoint must be gone.
-            self.assertFalse(
-                (checkpoints / "model_topk_00000060.pth").exists()
-            )
+            self.assertFalse((checkpoints / "model_topk_00000060.pth").exists())
             # Registry persisted next to the checkpoints.
             registry_file = checkpoints / "topk_registry.json"
             self.assertTrue(registry_file.is_file())
@@ -119,9 +115,9 @@ class TopKCheckpointTests(unittest.TestCase):
             )
             # Summary payload carries the list for run show / summary.md.
             summary = json.loads(
-                (
-                    Path(directory) / "run" / "training_summary.json"
-                ).read_text(encoding="utf-8")
+                (Path(directory) / "run" / "training_summary.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(
                 [entry["step"] for entry in summary["topk_checkpoints"]],
@@ -173,19 +169,11 @@ class TopKCheckpointTests(unittest.TestCase):
             registry = result["evaluation_state"]["topk_registry"]
             # Lowest CE first: step 40 (0.6), then step 60 (0.8); step 20 (1.0)
             # evicted.
-            self.assertEqual(
-                [entry["step"] for entry in registry], [40, 60]
-            )
+            self.assertEqual([entry["step"] for entry in registry], [40, 60])
             checkpoints = Path(directory) / "run" / "checkpoints"
-            self.assertTrue(
-                (checkpoints / "model_topk_00000040.pth").is_file()
-            )
-            self.assertTrue(
-                (checkpoints / "model_topk_00000060.pth").is_file()
-            )
-            self.assertFalse(
-                (checkpoints / "model_topk_00000020.pth").exists()
-            )
+            self.assertTrue((checkpoints / "model_topk_00000040.pth").is_file())
+            self.assertTrue((checkpoints / "model_topk_00000060.pth").is_file())
+            self.assertFalse((checkpoints / "model_topk_00000020.pth").exists())
 
     def test_disabled_topk_writes_no_topk_files(self) -> None:
         from game_cls.engine.trainer import run_training
@@ -212,9 +200,7 @@ class TopKCheckpointTests(unittest.TestCase):
                 result = run_training(config)
             self.assertEqual(result["evaluation_state"]["topk_registry"], [])
             checkpoints = Path(directory) / "run" / "checkpoints"
-            self.assertFalse(
-                list(checkpoints.glob("model_topk_*.pth"))
-            )
+            self.assertFalse(list(checkpoints.glob("model_topk_*.pth")))
 
 
 if __name__ == "__main__":

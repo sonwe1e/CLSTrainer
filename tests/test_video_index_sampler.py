@@ -9,9 +9,7 @@ from game_cls.data.video_index import build_video_entries
 from game_cls.data.video_sampler import VideoBalancedPairBatchSampler
 
 
-def frame(
-    game: str, label: int, video_id: str, frame_id: int
-) -> FrameRecord:
+def frame(game: str, label: int, video_id: str, frame_id: int) -> FrameRecord:
     return FrameRecord(
         sample_id=f"{game}:{label}:{video_id}:{frame_id}",
         split="train",
@@ -54,10 +52,7 @@ class VideoIndexSamplerTests(unittest.TestCase):
             len(requests),
         )
         self.assertTrue(
-            all(
-                len(key) == 3
-                for key in sampler.last_epoch_game_label_delta_counts
-            )
+            all(len(key) == 3 for key in sampler.last_epoch_game_label_delta_counts)
         )
 
     def test_resume_start_step_matches_uninterrupted_sequence(self) -> None:
@@ -85,13 +80,15 @@ class VideoIndexSamplerTests(unittest.TestCase):
         keys0 = set(
             zip(
                 rank0.video_indices.tolist(),
-                rank0.start_positions.tolist(), strict=False,
+                rank0.start_positions.tolist(),
+                strict=False,
             )
         )
         keys1 = set(
             zip(
                 rank1.video_indices.tolist(),
-                rank1.start_positions.tolist(), strict=False,
+                rank1.start_positions.tolist(),
+                strict=False,
             )
         )
         self.assertTrue(keys0.isdisjoint(keys1))

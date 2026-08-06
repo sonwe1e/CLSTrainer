@@ -77,9 +77,7 @@ class EvaluationContractTests(unittest.TestCase):
         )
         fallback = evaluate(
             model,
-            DataLoader(
-                Dataset(), batch_size=2, collate_fn=pair_collate
-            ),
+            DataLoader(Dataset(), batch_size=2, collate_fn=pair_collate),
             torch.device("cpu"),
             amp=True,
             amp_dtype="bfloat16",

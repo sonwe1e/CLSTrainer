@@ -60,13 +60,9 @@ class ResumeIdentityTests(unittest.TestCase):
             manifest1 = json.loads(
                 (run_dir / "manifest.json").read_text(encoding="utf-8")
             )
-            status1 = json.loads(
-                (run_dir / "status.json").read_text(encoding="utf-8")
-            )
+            status1 = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
             initial_config = json.loads(
-                (run_dir / "resolved_config.initial.json").read_text(
-                    encoding="utf-8"
-                )
+                (run_dir / "resolved_config.initial.json").read_text(encoding="utf-8")
             )
 
             # Second run resumes into the SAME directory, as
@@ -100,15 +96,11 @@ class ResumeIdentityTests(unittest.TestCase):
                 ),
                 initial_config,
             )
-            self.assertEqual(
-                initial_config["experiment"]["run_mode"], "unique"
-            )
+            self.assertEqual(initial_config["experiment"]["run_mode"], "unique")
 
             # status.json keeps the original `started` and records
             # `resumed_at` instead of overwriting it.
-            status2 = json.loads(
-                (run_dir / "status.json").read_text(encoding="utf-8")
-            )
+            status2 = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status2["started"], status1["started"])
             self.assertTrue(status2.get("resumed_at"))
             self.assertEqual(status2["state"], "SUCCEEDED")
@@ -165,9 +157,7 @@ class ResumeIdentityTests(unittest.TestCase):
             self.assertTrue((run_dir / "resolved_config.initial.json").is_file())
             self.assertTrue((run_dir / "manifest.json").is_file())
             self.assertTrue((run_dir / "resume_events.jsonl").is_file())
-            status = json.loads(
-                (run_dir / "status.json").read_text(encoding="utf-8")
-            )
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "SUCCEEDED")
 
     def test_resume_type_extends_when_max_steps_grows(self) -> None:

@@ -51,9 +51,7 @@ class SchemaStrictnessTests(unittest.TestCase):
     def test_enum_violation_is_rejected(self) -> None:
         config = load_config("configs/cuda_debug.yaml")
         config["checkpoint"]["periodic_state_mode"] = "sometimes"
-        with self.assertRaisesRegex(
-            ConfigSchemaError, "periodic_state_mode"
-        ):
+        with self.assertRaisesRegex(ConfigSchemaError, "periodic_state_mode"):
             finalize_config(config)
 
     def test_all_shipped_configs_validate(self) -> None:
@@ -71,9 +69,7 @@ class SchemaStrictnessTests(unittest.TestCase):
 class OverrideStrictnessTests(unittest.TestCase):
     def test_typo_override_is_rejected_with_suggestion(self) -> None:
         with self.assertRaises(ConfigSchemaError) as ctx:
-            load_config(
-                "configs/cuda_debug.yaml", ["optimzier.learning_rate=0.0001"]
-            )
+            load_config("configs/cuda_debug.yaml", ["optimzier.learning_rate=0.0001"])
         message = str(ctx.exception)
         self.assertIn("optimzier.learning_rate", message)
         self.assertIn("optimizer.learning_rate", message)
@@ -85,9 +81,7 @@ class OverrideStrictnessTests(unittest.TestCase):
             load_config("configs/cuda_debug.yaml", ["optimizer.name=SGD"])
 
     def test_valid_override_applies(self) -> None:
-        config = load_config(
-            "configs/cuda_debug.yaml", ["train.max_steps=7"]
-        )
+        config = load_config("configs/cuda_debug.yaml", ["train.max_steps=7"])
         self.assertEqual(config["train"]["max_steps"], 7)
 
     def test_schema_known_path_missing_from_file_is_created(self) -> None:
@@ -130,9 +124,7 @@ class SemanticValidationTests(unittest.TestCase):
 
     def test_all_zero_probabilities_are_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigSchemaError, "all zero"):
-            self._load(
-                **{"sampler.class_probability": "{0: 0.0, 1: 0.0}"}
-            )
+            self._load(**{"sampler.class_probability": "{0: 0.0, 1: 0.0}"})
 
     def test_warmup_exceeding_budget_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigSchemaError, "warmup_steps"):
@@ -197,9 +189,7 @@ class DecisionThresholdTests(unittest.TestCase):
 class SourceTrackingTests(unittest.TestCase):
     def test_sources_track_base_and_child_files(self) -> None:
         _, sources = load_config_with_sources("configs/npu_1p.yaml")
-        self.assertTrue(
-            sources["device.accelerator"].endswith("npu_production.yaml")
-        )
+        self.assertTrue(sources["device.accelerator"].endswith("npu_production.yaml"))
         # npu_1p.yaml does not override device.accelerator, so the origin
         # must remain the base file; experiment.output_dir is defined there
         # as well.
@@ -209,9 +199,7 @@ class SourceTrackingTests(unittest.TestCase):
         _, sources = load_config_with_sources(
             "configs/cuda_debug.yaml", ["train.max_steps=3"]
         )
-        self.assertEqual(
-            sources["train.max_steps"], "override:train.max_steps=3"
-        )
+        self.assertEqual(sources["train.max_steps"], "override:train.max_steps=3")
 
     def test_known_paths_cover_consumed_keys(self) -> None:
         paths = set(known_dotted_paths())

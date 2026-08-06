@@ -125,30 +125,20 @@ class DatasetCliTests(unittest.TestCase):
             self.assertTrue((output_dir / "split_summary.json").is_file())
             self.assertTrue((output_dir / "audit.json").is_file())
             for split in ("train", "val", "test"):
-                self.assertTrue(
-                    (output_dir / f"{split}_frames.parquet").is_file()
-                )
-                self.assertTrue(
-                    (output_dir / f"{split}_videos.parquet").is_file()
-                )
+                self.assertTrue((output_dir / f"{split}_frames.parquet").is_file())
+                self.assertTrue((output_dir / f"{split}_videos.parquet").is_file())
                 self.assertTrue(
                     (output_dir / f"{split}_video_entries.parquet").is_file()
                 )
 
-            train_frames = read_frame_parquet(
-                output_dir / "train_frames.parquet"
-            )
+            train_frames = read_frame_parquet(output_dir / "train_frames.parquet")
             val_frames = read_frame_parquet(output_dir / "val_frames.parquet")
             self.assertTrue(train_frames)
             self.assertTrue(val_frames)
-            self.assertTrue(
-                all(frame.split == "train" for frame in train_frames)
-            )
+            self.assertTrue(all(frame.split == "train" for frame in train_frames))
             self.assertTrue(all(frame.split == "val" for frame in val_frames))
 
-            manifest = load_split_manifest(
-                output_dir / "split_manifest.parquet"
-            )
+            manifest = load_split_manifest(output_dir / "split_manifest.parquet")
             self.assertEqual(manifest["split_seed"], 20260728)
             self.assertEqual(len(manifest["assignment"]), 8)
 
@@ -186,9 +176,7 @@ class DatasetCliTests(unittest.TestCase):
             self.assertEqual(manifest["width"], 448)
             self.assertEqual(manifest["height"], 208)
             self.assertEqual(manifest["channels"], 3)
-            packed_count = len(
-                read_frame_parquet(output_dir / "train_frames.parquet")
-            )
+            packed_count = len(read_frame_parquet(output_dir / "train_frames.parquet"))
             self.assertEqual(manifest["frame_count"], packed_count)
 
     def test_main_dispatch_recognizes_evaluate_and_dataset(self) -> None:

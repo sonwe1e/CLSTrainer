@@ -44,9 +44,7 @@ class RecipeLayerTests(unittest.TestCase):
         self.assertTrue(config["augmentation"]["random_affine"]["enabled"])
 
     def test_profile_switch_via_cli_override(self) -> None:
-        config = load_config(
-            "configs/recipes/example_debug.yaml", ["profile=cuda_1p"]
-        )
+        config = load_config("configs/recipes/example_debug.yaml", ["profile=cuda_1p"])
         self.assertEqual(config["device"]["accelerator"], "cuda")
 
     def test_unknown_preset_lists_available(self) -> None:
@@ -62,9 +60,7 @@ class RecipeLayerTests(unittest.TestCase):
 
     def test_unknown_profile_lists_available(self) -> None:
         with self.assertRaises(ConfigSchemaError) as ctx:
-            load_config(
-                "configs/recipes/example_debug.yaml", ["profile=npu_99p"]
-            )
+            load_config("configs/recipes/example_debug.yaml", ["profile=npu_99p"])
         self.assertIn("Available: cpu_debug", str(ctx.exception))
 
     def test_unknown_preset_group_is_rejected(self) -> None:
@@ -74,9 +70,7 @@ class RecipeLayerTests(unittest.TestCase):
                 "profile: cpu_debug\npresets:\n  optimizer: fast\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(
-                ConfigSchemaError, "unknown preset group"
-            ):
+            with self.assertRaisesRegex(ConfigSchemaError, "unknown preset group"):
                 load_config(recipe)
 
     def test_recipe_rejects_base_key(self) -> None:
@@ -98,9 +92,7 @@ class RecipeLayerTests(unittest.TestCase):
             )
             recipe = Path(directory) / "recipe.yaml"
             recipe.write_text("profile: bad\n", encoding="utf-8")
-            with self.assertRaisesRegex(
-                ConfigSchemaError, "plain config sections"
-            ):
+            with self.assertRaisesRegex(ConfigSchemaError, "plain config sections"):
                 load_config(recipe)
 
     def test_sources_track_every_layer(self) -> None:
@@ -111,13 +103,9 @@ class RecipeLayerTests(unittest.TestCase):
         self.assertTrue(
             sources["decision.threshold"].endswith("dual_frame_binary.yaml")
         )
+        self.assertTrue(sources["device.accelerator"].endswith("cpu_debug.yaml"))
         self.assertTrue(
-            sources["device.accelerator"].endswith("cpu_debug.yaml")
-        )
-        self.assertTrue(
-            sources["augmentation.random_affine.degrees"].endswith(
-                "standard.yaml"
-            )
+            sources["augmentation.random_affine.degrees"].endswith("standard.yaml")
         )
         self.assertEqual(
             sources["presets.augmentation"],
@@ -128,9 +116,7 @@ class RecipeLayerTests(unittest.TestCase):
         config = load_config("configs/recipes/game_cls_production.yaml")
         self.assertEqual(config["device"]["accelerator"], "npu")
         self.assertTrue(config["distributed"]["enabled"])
-        self.assertEqual(
-            config["evaluation"]["selection_metric"], "composite"
-        )
+        self.assertEqual(config["evaluation"]["selection_metric"], "composite")
 
     def test_legacy_configs_still_load(self) -> None:
         config = load_config("configs/npu_1p.yaml")

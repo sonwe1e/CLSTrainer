@@ -22,7 +22,9 @@ class CheckpointTests(unittest.TestCase):
         model = torch.nn.Linear(2, 2)
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
-        original = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        original = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+        }
         with tempfile.TemporaryDirectory() as directory:
             save_checkpoint_pair(
                 directory,
@@ -39,19 +41,15 @@ class CheckpointTests(unittest.TestCase):
             model_path = Path(directory) / "model_last.pth"
             self.assertTrue(model_path.is_file())
             self.assertTrue((Path(directory) / "checkpoint_last.pth").is_file())
-            model_state = torch.load(
-                model_path, map_location="cpu", weights_only=True
-            )
+            model_state = torch.load(model_path, map_location="cpu", weights_only=True)
             self.assertEqual(set(model_state), set(original))
             metadata = json.loads(
-                (
-                    Path(directory) / "model_last.metadata.json"
-                ).read_text(encoding="utf-8")
+                (Path(directory) / "model_last.metadata.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(metadata["global_step"], 17)
-            self.assertEqual(
-                metadata["artifact_role"], "pure_model_state_dict"
-            )
+            self.assertEqual(metadata["artifact_role"], "pure_model_state_dict")
             with torch.no_grad():
                 model.weight.zero_()
             state = restore_training_checkpoint(

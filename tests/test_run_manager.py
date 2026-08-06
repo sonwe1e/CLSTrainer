@@ -65,9 +65,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
                 self.assertTrue((run_dir / "manifest.json").is_file())
                 self.assertTrue((run_dir / "status.json").is_file())
                 self.assertTrue((run_dir / "summary.md").is_file())
-                self.assertTrue(
-                    (run_dir / "resolved_config.json").is_file()
-                )
+                self.assertTrue((run_dir / "resolved_config.json").is_file())
                 status = json.loads(
                     (run_dir / "status.json").read_text(encoding="utf-8")
                 )
@@ -88,9 +86,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
 
             aggregated = _find_index_records(root)
             self.assertEqual(len(aggregated), 2)
-            self.assertEqual(
-                {record["state"] for record in aggregated}, {"SUCCEEDED"}
-            )
+            self.assertEqual({record["state"] for record in aggregated}, {"SUCCEEDED"})
 
     def test_fixed_mode_keeps_legacy_in_place_behavior(self) -> None:
         from game_cls.config import load_config
@@ -122,9 +118,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
                 if date_dir.is_dir()
                 for path in date_dir.iterdir()
             ]
-            status = json.loads(
-                (run_dir / "status.json").read_text(encoding="utf-8")
-            )
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "FAILED")
             self.assertEqual(status["error_type"], "FileNotFoundError")
             self.assertTrue((run_dir / "failure.log").is_file())
@@ -197,8 +191,8 @@ class AllocateRunDirTests(unittest.TestCase):
 class CliWorkflowTests(unittest.TestCase):
     def _run_cli(self, *args: str, expect_failure: bool = False) -> str:
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get(
-            "PYTHONPATH", ""
+        env["PYTHONPATH"] = (
+            str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
         )
         completed = subprocess.run(
             [sys.executable, "-m", "game_cls.cli", *args],
@@ -277,16 +271,12 @@ class CliWorkflowTests(unittest.TestCase):
             ]
             self.assertEqual(len(run_dirs), 1)
             self.assertTrue((run_dirs[0] / "console.log").is_file())
-            console = (run_dirs[0] / "console.log").read_text(
-                encoding="utf-8"
-            )
+            console = (run_dirs[0] / "console.log").read_text(encoding="utf-8")
             self.assertIn("Trainable parameters", console)
             # run list / run show observe the recorded run.
             listing = self._run_cli("run", "list", "--root", str(root))
             self.assertIn("SUCCEEDED", listing)
-            shown = self._run_cli(
-                "run", "show", "latest", "--root", str(root)
-            )
+            shown = self._run_cli("run", "show", "latest", "--root", str(root))
             self.assertIn("state        : SUCCEEDED", shown)
 
 
