@@ -238,6 +238,20 @@ class IndexBundleTests(unittest.TestCase):
             self.assertTrue(video_entries[0]["video_directory"])
             self.assertTrue(audit["duplicates"]["warnings"])
 
+    def test_missing_video_index_raises_actionable_error(self) -> None:
+        """A missing val index must explain how to regenerate it instead of
+        leaking a raw pyarrow FileNotFoundError."""
+        from game_cls.data.video_index import read_video_entries_parquet
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "val_video_entries.parquet"
+            with self.assertRaises(FileNotFoundError) as ctx:
+                read_video_entries_parquet(missing, (2,))
+            message = str(ctx.exception)
+            self.assertIn("Video-level index is missing", message)
+            self.assertIn("--val-root", message)
+            self.assertIn("build_index.py", message)
+
     def test_three_split_bundle_and_source_uid_leakage(self) -> None:
         """A source video spanning train/val/test must be detected."""
         with tempfile.TemporaryDirectory() as directory:

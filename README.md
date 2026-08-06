@@ -1,7 +1,8 @@
 # CLSTrainer
 
 双帧、多游戏二分类训练框架。输入为两张 `[B,3,208,448]` RGB 图像，模型输出
-`[B,2]`，部署判定固定为第二通道 Softmax 概率严格大于 `0.99`。
+`[B,2]`，部署判定使用第二通道概率与业务阈值比较，阈值默认 `0.99`
+（`decision.threshold`，可在配置中覆写，训练损失与评估器共用同一来源）。
 
 希望先了解项目全貌时，可直接在浏览器打开自包含的中文教程
 [`tutorial.html`](tutorial.html)。教程按“项目目的 → 技术架构 → 数据准备 →
@@ -124,7 +125,13 @@ cls-trainer train --config configs/recipes/game_cls_production.yaml \
   presets.dataloader=throughput
 ```
 
-旧的扁平配置(`base:` 继承,如 `configs/npu_production.yaml`)继续可用。
+旧的扁平配置(`base:` 继承)继续可用：`configs/npu_1p.yaml` 与
+`configs/npu_8p.yaml` 以 `base: npu_production.yaml` 继承生产配置后按机器覆写。
+注意 `configs/profiles/` 下也各有一份同名文件（`cpu_debug`/`cuda_1p`/
+`npu_1p`/`npu_8p`）——那是 Recipe 分层用的 profile 层（只含环境差异，不能独立
+训练）；根目录的扁平版才包含完整 data/model/train 配置，可直接
+`cls-trainer train --config configs/npu_1p.yaml`。新项目推荐走
+Recipe + profile/presets 分层。
 
 ## 严格配置校验
 
@@ -188,6 +195,7 @@ runs/dual_frame_game_cls_npu/
 python tools/build_index.py \
   --config configs/npu_production.yaml \
   --train-root /data/train \
+  --val-root /data/val \
   --test-root /data/test \
   --output-dir indexes
 
@@ -197,6 +205,14 @@ python tools/audit_dataset.py \
   --output-dir reports/data_audit \
   --strict
 ```
+
+`--val-root` 必须提供：它同时生成 `val_frames.parquet` 与
+`val_video_entries.parquet`。生产配置（`data.val_index` /
+`data.val_video_index`）在训练时会直接读取这些文件，缺失时训练在创建
+DataLoader 前终止并提示补建索引。注意 `--config` 中的 `data.*_index` 路径
+只是“写到哪/从哪读”，实际扫描目录由 `--train-root` / `--val-root` /
+`--test-root` 决定；`--output-dir` 与配置路径不一致时，请用命令行覆写让
+配置与输出目录对齐（例如 `data.val_index=indexes/val_frames.parquet`）。
 
 索引、审计、packed 和训练共同从 `data.width/height/channels` 创建
 `ImageSpec`。当前生产规格是 `width=448`、`height=208`、`channels=3`，
@@ -217,15 +233,15 @@ python tools/audit_dataset.py \
 合法起点，sampler 在每个 step 懒生成 pair。测试 pair 使用 rank-local NumPy
 紧凑数组，不补齐、不重复。
 
-索引阶段还会生成 `train_video_entries.parquet` 和
+索引阶段还会生成 `train_video_entries.parquet`、`val_video_entries.parquet` 和
 `test_video_entries.parquet`，训练直接按视频行读取，不再让每个 rank 将百万帧
 转换成 Python dict 和 `FrameRecord`。默认同时计算 SHA-256：相同内容但标签
 不同属于 fatal error；同标签的跨 split 或 split 内重复属于 warning；仅文件名
 相同只做 info 汇总。两位 `video_id` 不是全局身份；索引阶段生成跨 label 的
 `source_video_uid`（`game::video_id`）作为泄漏检查单位。同一个源视频横跨
-train/val/test（video key 重叠或 source uid 重叠）以及相同 SHA-256 内容跨
-split，在严格审计中一律是 error；`require_unique_video_keys_across_splits`
-不再需要显式开启，旧的“跨 split 重名仅警告”语义已移除。
+train/val/test（source uid 重叠）以及相同 SHA-256 内容跨 split，在严格审计中
+一律是 error，与策略开关无关；纯 video key 重叠（不同内容恰好同名）受
+`require_unique_video_keys_across_splits` 控制，生产配置已默认开启。
 
 SHA-256 会完整读取每张图片，是一次性但明显的 I/O 成本。百万帧数据推荐按以下
 顺序准备，避免在远程小文件链路上反复扫描：
@@ -269,7 +285,7 @@ bash scripts/smoke_npu_8p.sh
 ```
 
 单卡脚本按“无 worker 基线 → spawn 1 worker → spawn 2 workers + 增强 → quick
-test → full test”的顺序逐级验收；任一阶段失败都会停止，不会把 DataLoader
+validation → full validation”的顺序逐级验收；任一阶段失败都会停止，不会把 DataLoader
 问题误判为模型或算子问题。八卡脚本先固定每 rank 1 个 train worker 和 1 个
 按需启动的 eval worker，运行 100 step 并触发 quick/full 与 checkpoint。必须在
 真实 910B2 环境确认通过后，才能把 CPU/Gloo 测试结论扩展到 HCCL。
@@ -305,7 +321,9 @@ dataloader:
 和 timeout，并分别标记开始等待与首 batch 返回时间、shape、dtype；因此 worker
 异常最长在 180 秒内转为明确的 DataLoader timeout，而不是无限等待。
 
-如 Profiler 确认 PNG 解码仍是瓶颈，可预解码为固定大小 uint8 分片：
+如 Profiler 确认 PNG 解码仍是瓶颈，可预解码为固定大小 uint8 分片。
+三个 split 都要打包（train/val/test 各自独立输出目录，与
+`npu_production_packed.yaml` 中的路径对应）：
 
 ```bash
 python tools/pack_dataset.py \
@@ -315,16 +333,21 @@ python tools/pack_dataset.py \
 
 python tools/pack_dataset.py \
   --config configs/npu_production.yaml \
+  --frame-index indexes/val_frames.parquet \
+  --output-dir /local_nvme/val_packed
+
+python tools/pack_dataset.py \
+  --config configs/npu_production.yaml \
   --frame-index indexes/test_frames.parquet \
   --output-dir /local_nvme/test_packed
 ```
 
-分别打包 train/test，然后把生产配置的 `data.backend` 改为 `packed_uint8`，
-并设置 frame/video 两组 packed index。也可直接以
-`configs/npu_production_packed.yaml` 为模板。新版 packed 索引以连续整数定位
-帧，不再为每个 rank 建立百万项路径字典；shard 路径相对 manifest 保存，运行时
-仅维护最多 `packed_max_open_shards` 个 LRU memmap。该后端避免训练热路径中的
-PNG 解压，数据仍应优先复制到本地 NVMe。
+然后把生产配置的 `data.backend` 改为 `packed_uint8`，并设置 frame/video 两组
+packed index（含 `val_packed_index` / `val_packed_video_index`——漏掉 val 会在
+训练时同样报“索引缺失”）。也可直接以 `configs/npu_production_packed.yaml`
+为模板。新版 packed 索引以连续整数定位帧，不再为每个 rank 建立百万项路径字典；
+shard 路径相对 manifest 保存，运行时仅维护最多 `packed_max_open_shards` 个
+LRU memmap。该后端避免训练热路径中的 PNG 解压，数据仍应优先复制到本地 NVMe。
 
 尺寸、扫描策略或重复数据策略发生变化后，必须更换或删除旧 `indexes`，重新执行
 build、audit 和 train/test packed 打包。审计格式、记录的图片规格或重复策略与
@@ -353,11 +376,11 @@ packed backend 会通过 `get_many()` 将一个 batch 的帧按 shard 分组，�
 只训练 `cls` 时，所有非 `cls` 参数和 buffer 必须 100% 从基础 checkpoint 加载；
 该严格规则固定生效，不提供容易产生误解的关闭开关。
 
-## 评估契约
+## 评估产物与指标
 
-quick test 会从每个 `(game,label,video)` 的 `delta=2` pair 中按时间均匀选取固定
-数量；full test 枚举全部合法 pair。分布式运行时，每个 rank 处理不重复分片，
-混淆矩阵使用 int64、损失使用 float32 all-reduce，兼容 HCCL。full test 默认用
+quick validation 会从每个 `(game,label,video)` 的 `delta=2` pair 中按时间均匀选取固定
+数量；full validation 枚举全部合法 pair。分布式运行时，每个 rank 处理不重复分片，
+混淆矩阵使用 int64、损失使用 float32 all-reduce，兼容 HCCL。full validation 默认用
 固定直方图分布式计算 ROC-AUC/PR-AUC，不再把百万 Python 分数集中到 rank 0；
 错例在 batch 内流式写分片，再由 rank 0 流式合并。评估前向按
 `evaluation.amp/amp_dtype` 使用与部署一致的 BF16/FP16；CE、Brier 和混淆矩阵
@@ -367,7 +390,7 @@ quick test 会从每个 `(game,label,video)` 的 `delta=2` pair 中按时间均�
 样本。Parquet writer 默认累计 `parquet_row_group_size=4096` 条记录再写 row
 group，避免每个 batch 产生一次小写入。
 
-full test 报告包含：
+full validation 报告包含：
 
 ```text
 metrics.json
@@ -381,7 +404,7 @@ errors.html
 previews/*.png
 ```
 
-quick test 仅写 `metrics.json`、受 `quick_save_error_limit` 全局限制的少量
+quick validation 仅写 `metrics.json`、受 `quick_save_error_limit` 全局限制的少量
 FP/FN 与 near-threshold Parquet，不再生成 HTML 和分组 CSV，避免短周期评估
 承担完整报告开销。同一步同时满足 quick/full 周期时只运行 full。
 
@@ -391,8 +414,8 @@ Parquet 仍保存紧凑的 packed frame index，不会为全部错例重复导�
 
 `near_threshold.parquet` 只保存 `0.98 <= p1 <= 0.995` 的样本；更高置信度只记录
 区间计数。指标同时包含 Brier Score、20-bin ECE 和置信度直方图。由于训练采用
-50/50 平衡采样并加入阈值损失，`0.99` 应解释为固定业务分数阈值，而不是天然
-校准后的真实发生概率。
+50/50 平衡采样并加入阈值损失，`decision.threshold`（默认 `0.99`）应解释为
+部署业务判定阈值，而不是天然校准后的真实发生概率。
 
 周期性 full validation 的角色明确标记为 `validation`。训练摘要同时记录 last
 checkpoint 指标、best validation 指标，以及 train probe/quick/full validation

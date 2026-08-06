@@ -18,9 +18,9 @@ python -u tools/train.py --run-mode fixed \
   dataloader.train.pin_memory=false \
   dataloader.eval.pin_memory=false \
   augmentation.enabled=false \
-  evaluation.quick_test_every_steps=0 \
-  evaluation.full_test_every_steps=0 \
-  evaluation.full_test_at_end=false \
+  evaluation.val_quick_every_steps=0 \
+  evaluation.val_full_every_steps=0 \
+  evaluation.val_full_at_end=false \
   checkpoint.save_last_every_steps=0 \
   experiment.output_dir=runs/npu_single_process_baseline
 
@@ -34,9 +34,9 @@ python -u tools/train.py --run-mode fixed \
   dataloader.train.num_workers=1 \
   dataloader.eval.num_workers=0 \
   augmentation.enabled=false \
-  evaluation.quick_test_every_steps=0 \
-  evaluation.full_test_every_steps=0 \
-  evaluation.full_test_at_end=false \
+  evaluation.val_quick_every_steps=0 \
+  evaluation.val_full_every_steps=0 \
+  evaluation.val_full_at_end=false \
   checkpoint.save_last_every_steps=0 \
   experiment.output_dir=runs/npu_spawn_1worker
 
@@ -50,9 +50,9 @@ python -u tools/train.py --run-mode fixed \
   dataloader.train.num_workers=2 \
   dataloader.eval.num_workers=0 \
   augmentation.enabled=true \
-  evaluation.quick_test_every_steps=0 \
-  evaluation.full_test_every_steps=0 \
-  evaluation.full_test_at_end=false \
+  evaluation.val_quick_every_steps=0 \
+  evaluation.val_full_every_steps=0 \
+  evaluation.val_full_at_end=false \
   checkpoint.save_last_every_steps=0 \
   experiment.output_dir=runs/npu_spawn_2workers
 
@@ -65,10 +65,10 @@ python -u tools/train.py --run-mode fixed \
   train.log_every_steps=5 \
   dataloader.train.num_workers=2 \
   dataloader.eval.num_workers=1 \
-  evaluation.quick_test_every_steps=10 \
-  evaluation.quick_test_pairs_per_video=2 \
-  evaluation.full_test_every_steps=0 \
-  evaluation.full_test_at_end=false \
+  evaluation.val_quick_every_steps=10 \
+  evaluation.val_quick_pairs_per_video=2 \
+  evaluation.val_full_every_steps=0 \
+  evaluation.val_full_at_end=false \
   checkpoint.save_last_every_steps=0 \
   experiment.output_dir=runs/npu_spawn_quick_eval
 
@@ -81,8 +81,8 @@ python -u tools/train.py --run-mode fixed \
   train.log_every_steps=5 \
   dataloader.train.num_workers=2 \
   dataloader.eval.num_workers=1 \
-  evaluation.quick_test_every_steps=0 \
-  evaluation.full_test_every_steps=20 \
-  evaluation.full_test_at_end=false \
+  evaluation.val_quick_every_steps=0 \
+  evaluation.val_full_every_steps=20 \
+  evaluation.val_full_at_end=false \
   checkpoint.save_last_every_steps=20 \
   experiment.output_dir=runs/npu_spawn_full_eval

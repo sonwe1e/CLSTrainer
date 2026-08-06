@@ -107,6 +107,18 @@ def build_video_entries(
 def read_video_entries_parquet(
     path: str | Path, deltas: Iterable[int] = (1, 2, 3)
 ) -> list[VideoEntry]:
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Video-level index is missing: {path}. "
+            "Generate the train/val/test split indexes first, e.g. "
+            "'python tools/build_index.py --config configs/<profile>.yaml "
+            "--train-root <train> --val-root <val> --test-root <test> "
+            "--output-dir <index-dir>'. A production config with "
+            "data.val_index / data.val_video_index requires a real "
+            "validation split (--val-root); without one there is no "
+            "independent test set either."
+        )
     try:
         import pyarrow.parquet as pq
     except ImportError as exc:
