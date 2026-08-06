@@ -298,6 +298,56 @@ SCHEMA: dict[str, Any] = {
                 "used; smaller buckets fall back to the other bucket.",
             ),
         },
+        "mining": {
+            "enabled": _k(
+                "bool",
+                "Enable the hard-negative mining workflow (scan-negatives "
+                "and --from-mining annotation).",
+            ),
+            "pool_index": _k(
+                "str",
+                "Frame index of the training-side negative pool to scan.",
+                nullable=True,
+            ),
+            "pool_video_index": _k(
+                "str",
+                "Video-level index of the mining pool.",
+                nullable=True,
+            ),
+            "pool_metadata": _k(
+                "str",
+                "Optional sidecar of the mining pool (subtype_before).",
+                nullable=True,
+            ),
+            "output": _k(
+                "str", "Output hard_negatives.parquet mining manifest path."
+            ),
+            "top_k_per_video": _k(
+                "int",
+                "Max negatives kept per source video (avoids continuous "
+                "frames drowning the manifest).",
+            ),
+            "max_samples": _k("int", "Optional global cap on mined samples.", nullable=True),
+            "score_threshold": _k(
+                "float",
+                "Optional p_positive floor; only negatives at or above it "
+                "are kept.",
+                nullable=True,
+            ),
+            "version": _k("int", "Mining manifest format version."),
+        },
+        "challenge_index": _k(
+            "str",
+            "Fixed challenge-set frame index (never part of train/val/test; "
+            "only consumed by benchmark evaluate).",
+            nullable=True,
+        ),
+        "challenge_video_index": _k(
+            "str", "Challenge-set video-level index.", nullable=True
+        ),
+        "challenge_metadata": _k(
+            "str", "Optional challenge-set metadata sidecar.", nullable=True
+        ),
     },
     "pair": {
         "train_delta_probability": _k(
@@ -786,6 +836,16 @@ SCHEMA: dict[str, Any] = {
         "enabled": _k("bool", "Initialize c10d process groups."),
         "backend": _k("str", "Process group backend, e.g. gloo / nccl / hccl."),
     },
+    "benchmark": {
+        "output_dir": _k(
+            "str", "Directory for benchmark reports and data probes."
+        ),
+        "gate_metrics": _k(
+            "dict",
+            "Release/benchmark gates, e.g. {max_global_fpr: 0.01, "
+            "min_positive_recall: 0.8}. Unmet gates fail the command.",
+        ),
+    },
 }
 
 # Nested leaves of a dict-typed key. ``data.split`` is a documented dict
@@ -1135,6 +1195,18 @@ _DEFAULT_HARD_NEGATIVE: dict[str, Any] = {
     "min_videos_per_subtype_bucket": 1,
 }
 
+_DEFAULT_MINING: dict[str, Any] = {
+    "enabled": False,
+    "pool_index": None,
+    "pool_video_index": None,
+    "pool_metadata": None,
+    "output": "indexes/hard_negatives.parquet",
+    "top_k_per_video": 8,
+    "max_samples": None,
+    "score_threshold": None,
+    "version": 1,
+}
+
 
 def _apply_defaults(config: dict[str, Any]) -> None:
     """Fill documented defaults for required keys a recipe may omit."""
@@ -1176,6 +1248,18 @@ def _apply_defaults(config: dict[str, Any]) -> None:
                     block.setdefault(sub_key, sub_value)
         else:
             hard_negative.setdefault(key, value)
+    mining = data.setdefault("mining", {})
+    if not isinstance(mining, dict):
+        mining = {}
+        data["mining"] = mining
+    for key, value in _DEFAULT_MINING.items():
+        mining.setdefault(key, value)
+    data.setdefault("challenge_index", None)
+    data.setdefault("challenge_video_index", None)
+    data.setdefault("challenge_metadata", None)
+    benchmark = config.setdefault("benchmark", {})
+    benchmark.setdefault("output_dir", "benchmarks")
+    benchmark.setdefault("gate_metrics", {})
     data["split"] = {**default_split, **(data.get("split") or {})}
 
     evaluation = config.setdefault("evaluation", {})

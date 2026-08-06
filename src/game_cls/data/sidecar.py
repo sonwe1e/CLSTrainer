@@ -70,7 +70,7 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
         raise ValueError(
             f"Metadata sidecar {path} is missing required columns: {sorted(missing)}"
         )
-    table = pq.read_table(path)
+    table = pq.read_table(path, memory_map=False)
     result: dict[str, dict[str, Any]] = {}
     for row in table.to_pylist():
         uid = str(row["source_video_uid"])

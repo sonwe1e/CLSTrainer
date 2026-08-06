@@ -236,26 +236,41 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
 
-    source = Path(args.metadata)
-    if source.suffix.lower() == ".parquet":
-        import pyarrow.parquet as pq
+    if args.from_mining:
+        from game_cls.reports.benchmark import read_mining_manifest
 
-        rows = pq.read_table(source).to_pylist()
+        if not args.subtype:
+            print("--from-mining requires --subtype.", file=sys.stderr)
+            return 2
+        mined = read_mining_manifest(args.from_mining)
+        rows = [
+            {"source_video_uid": row["source_video_uid"], "negative_subtype": args.subtype}
+            for row in mined
+        ]
+        if not rows:
+            print(f"No mined negatives in {args.from_mining}", file=sys.stderr)
+            return 2
     else:
-        import csv
+        source = Path(args.metadata)
+        if source.suffix.lower() == ".parquet":
+            import pyarrow.parquet as pq
 
-        with source.open(encoding="utf-8", newline="") as stream:
-            reader = csv.DictReader(stream)
-            rows = [dict(row) for row in reader]
-    if not rows:
-        print(f"No metadata rows in {source}", file=sys.stderr)
-        return 2
-    if "source_video_uid" not in rows[0]:
-        print(
-            "Metadata input must contain a source_video_uid column.",
-            file=sys.stderr,
-        )
-        return 2
+            rows = pq.read_table(source).to_pylist()
+        else:
+            import csv
+
+            with source.open(encoding="utf-8", newline="") as stream:
+                reader = csv.DictReader(stream)
+                rows = [dict(row) for row in reader]
+        if not rows:
+            print(f"No metadata rows in {source}", file=sys.stderr)
+            return 2
+        if "source_video_uid" not in rows[0]:
+            print(
+                "Metadata input must contain a source_video_uid column.",
+                file=sys.stderr,
+            )
+            return 2
 
     components = _build_real_data_components(config, rank=0, world_size=1)
     entries = (

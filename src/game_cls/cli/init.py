@@ -36,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
         "init",
         "evaluate",
         "dataset",
+        "benchmark",
     }
     if not argv or argv[0] not in known:
         # cls-trainer --config x.yaml k=v  =>  cls-trainer train --config ...

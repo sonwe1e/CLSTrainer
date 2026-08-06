@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import argparse
 
+from game_cls.cli.benchmark import (
+    cmd_benchmark_evaluate,
+    cmd_benchmark_scan_negatives,
+)
 from game_cls.cli.common import DEFAULT_RUNS_ROOT
 from game_cls.cli.config_tools import (
     cmd_config_reference,
@@ -267,7 +271,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output sidecar parquet path (default: data.metadata_sidecar).",
     )
+    annotate.add_argument(
+        "--from-mining",
+        default=None,
+        help="Instead of --metadata, import mined negatives from a "
+        "hard_negatives.parquet manifest.",
+    )
+    annotate.add_argument(
+        "--subtype",
+        default=None,
+        help="negative_subtype assigned to mined videos (requires "
+        "--from-mining).",
+    )
     annotate.add_argument("overrides", nargs="*", metavar="key=value")
     annotate.set_defaults(func=cmd_dataset_annotate)
+
+    benchmark = subparsers.add_parser(
+        "benchmark", help="Hard-negative mining and challenge-set benchmarking."
+    )
+    benchmark_sub = benchmark.add_subparsers(dest="benchmark_command", required=True)
+    scan = benchmark_sub.add_parser(
+        "scan-negatives",
+        help="Score a negative pool with a checkpoint and write the mining "
+        "manifest.",
+    )
+    scan.add_argument("--config")
+    scan.add_argument("--run", required=True)
+    scan.add_argument(
+        "--checkpoint",
+        default="best_selection",
+        help="Checkpoint alias/path (default: best_selection).",
+    )
+    scan.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    scan.add_argument("--pool-index", default=None)
+    scan.add_argument("--pool-video-index", default=None)
+    scan.add_argument("--output", default=None)
+    scan.set_defaults(func=cmd_benchmark_scan_negatives)
+    bench_eval = benchmark_sub.add_parser(
+        "evaluate",
+        help="Evaluate a checkpoint on the fixed challenge set and check "
+        "benchmark.gate_metrics.",
+    )
+    bench_eval.add_argument("--config")
+    bench_eval.add_argument("--run", required=True)
+    bench_eval.add_argument(
+        "--checkpoint",
+        default="best_selection",
+        help="Checkpoint alias/path (default: best_selection).",
+    )
+    bench_eval.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    bench_eval.set_defaults(func=cmd_benchmark_evaluate)
 
     return parser
