@@ -54,7 +54,11 @@ def write_mining_manifest(rows: list[dict[str, Any]], path: str | Path) -> None:
         )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(normalized), path, compression="zstd")
+    # Write to a temp sibling then atomically replace, which also releases
+    # the file handle on Windows (avoids PermissionError on temp-dir cleanup).
+    temp = path.with_suffix(f".tmp{path.suffix}")
+    pq.write_table(pa.Table.from_pylist(normalized), temp, compression="zstd")
+    temp.replace(path)
 
 
 def read_mining_manifest(path: str | Path) -> list[dict[str, Any]]:

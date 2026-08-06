@@ -849,6 +849,21 @@ SCHEMA: dict[str, Any] = {
             "min_positive_recall: 0.8}. Unmet gates fail the command.",
         ),
     },
+    "export": {
+        "format": _k(
+            "str",
+            "Default export format (weights|onnx).",
+            choices=("weights", "onnx"),
+        ),
+        "output_dir": _k("str", "Directory for exported artifacts."),
+        "onnx_opset": _k("int", "ONNX opset version for --format onnx."),
+        "verify_samples": _k(
+            "int", "Random sample tensors used to verify ONNX vs PyTorch."
+        ),
+        "include_threshold": _k(
+            "bool", "Embed decision.threshold in the exported manifest."
+        ),
+    },
 }
 
 # Nested leaves of a dict-typed key. ``data.split`` is a documented dict
@@ -1263,6 +1278,12 @@ def _apply_defaults(config: dict[str, Any]) -> None:
     benchmark = config.setdefault("benchmark", {})
     benchmark.setdefault("output_dir", "benchmarks")
     benchmark.setdefault("gate_metrics", {})
+    export_cfg = config.setdefault("export", {})
+    export_cfg.setdefault("format", "weights")
+    export_cfg.setdefault("output_dir", "exports")
+    export_cfg.setdefault("onnx_opset", 17)
+    export_cfg.setdefault("verify_samples", 8)
+    export_cfg.setdefault("include_threshold", True)
     data["split"] = {**default_split, **(data.get("split") or {})}
 
     evaluation = config.setdefault("evaluation", {})

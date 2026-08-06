@@ -41,6 +41,7 @@ from game_cls.cli.dataset import (
 )
 from game_cls.cli.doctor import cmd_doctor
 from game_cls.cli.evaluate import cmd_evaluate
+from game_cls.cli.export import cmd_export
 from game_cls.cli.init_cmd import cmd_init
 from game_cls.cli.run_tools import (
     cmd_run_compare,
@@ -156,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", help="Load and validate a config without training."
     )
     validate.add_argument("--config", required=True)
+    validate.add_argument(
+        "--release",
+        action="store_true",
+        help="Release gate: require a non-null minimum_worst_game_f1 and a "
+        "non-empty benchmark.gate_metrics.",
+    )
     validate.add_argument("overrides", nargs="*", metavar="key=value")
     validate.set_defaults(func=cmd_config_validate)
     reference = config_sub.add_parser(
@@ -285,6 +292,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     annotate.add_argument("overrides", nargs="*", metavar="key=value")
     annotate.set_defaults(func=cmd_dataset_annotate)
+
+    export = subparsers.add_parser(
+        "export",
+        help="Export a checkpoint as a deployment artifact (weights|onnx).",
+    )
+    export.add_argument("--config")
+    export.add_argument("--run", required=True)
+    export.add_argument(
+        "--checkpoint",
+        default="best_selection",
+        help="Checkpoint alias/path (default: best_selection).",
+    )
+    export.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    export.add_argument(
+        "--format",
+        choices=("weights", "onnx"),
+        default="weights",
+        help="weights: pure state dict + manifest (default). onnx: traced "
+        "[B,2] graph verified against the PyTorch reference.",
+    )
+    export.add_argument("--out", default="exports")
+    export.set_defaults(func=cmd_export)
 
     benchmark = subparsers.add_parser(
         "benchmark", help="Hard-negative mining and challenge-set benchmarking."

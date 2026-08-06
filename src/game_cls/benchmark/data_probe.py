@@ -40,9 +40,7 @@ def run_data_probe(
             "prefetch_factor": prefetch,
         }
         if workers == 0:
-            probe_config["dataloader"]["train"].pop(
-                "multiprocessing_context", None
-            )
+            probe_config["dataloader"]["train"].pop("multiprocessing_context", None)
         else:
             probe_config["dataloader"]["train"].setdefault(
                 "multiprocessing_context",

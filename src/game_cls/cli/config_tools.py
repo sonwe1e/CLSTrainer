@@ -93,6 +93,27 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     print(f"  total steps       : {total_steps}")
     print(f"  local batch size  : {train_cfg['local_batch_size']}")
     print(f"  output dir        : {config['experiment']['output_dir']}")
+    if getattr(args, "release", False):
+        # Release gate (step5 P6): a releasable config must not run blind —
+        # it needs a worst-game F1 baseline and a benchmark gate.
+        evaluation_cfg = config["evaluation"]
+        problems = []
+        if evaluation_cfg.get("minimum_worst_game_f1") is None:
+            problems.append(
+                "evaluation.minimum_worst_game_f1 is null; set it once a "
+                "baseline exists (the release gate refuses empty runs)."
+            )
+        if not (config.get("benchmark") or {}).get("gate_metrics"):
+            problems.append(
+                "benchmark.gate_metrics is empty; the release gate needs at "
+                "least one acceptance metric."
+            )
+        if problems:
+            print("Release gate FAILED:", file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+            return 2
+        print("  release gate      : PASS")
     return 0
 
 
