@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .image_spec import ImageSpec
@@ -17,6 +17,7 @@ from .records import (
     read_png_metadata,
     summarize_videos,
 )
+from .splitter import resolve_split, write_split_summary
 
 AUDIT_FORMAT_VERSION = 3
 
@@ -709,6 +710,142 @@ def write_index_bundle(
         duplicate_policy,
     )
     audit["policies"]["scan_policy"] = scan_policy.to_dict()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "audit.json").write_text(
+        json.dumps(audit, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return audit
+
+
+def write_split_bundle(
+    train_all_root: str | Path,
+    test_root: str | Path,
+    output_dir: str | Path,
+    image_spec: ImageSpec,
+    scan_policy: ScanPolicy,
+    duplicate_policy: DuplicatePolicy,
+    *,
+    split_config: dict,
+    filename_pattern: str = DEFAULT_FILENAME_PATTERN,
+    compute_content_hash: bool = True,
+) -> dict:
+    """Scan train_all once, auto-split it into train/val by source video,
+    combine with the independently scanned test set, and write the full
+    per-split index triplet plus the split manifest, summary and audit."""
+    if split_config.get("mode") != "from_train":
+        raise ValueError(
+            "data.split.mode must be 'from_train' when writing a split "
+            f"bundle, got {split_config.get('mode')!r}"
+        )
+    if (
+        split_config.get("group_key", "source_video_uid")
+        != "source_video_uid"
+    ):
+        raise ValueError("data.split.group_key must be 'source_video_uid'")
+    if (
+        split_config.get("balance_by", "legal_pair_count")
+        != "legal_pair_count"
+    ):
+        raise ValueError(
+            "data.split.balance_by must be 'legal_pair_count'"
+        )
+    output_dir = Path(output_dir)
+    train_all = scan_split(
+        train_all_root,
+        "train",
+        image_spec,
+        filename_pattern=filename_pattern,
+        scan_policy=scan_policy,
+        compute_content_hash=compute_content_hash,
+    )
+    test = scan_split(
+        test_root,
+        "test",
+        image_spec,
+        filename_pattern=filename_pattern,
+        scan_policy=scan_policy,
+        compute_content_hash=compute_content_hash,
+    )
+
+    val_ratio = split_config["val_ratio"]
+    seed = split_config["seed"]
+    target_delta = int(split_config.get("target_delta", 2))
+    on_new_groups = split_config.get("on_new_groups", "error")
+    small_stratum_policy = split_config.get("small_stratum_policy", "error")
+    manifest_path = Path(
+        split_config.get("manifest", "indexes/split_manifest.parquet")
+    )
+    if not manifest_path.is_absolute():
+        manifest_path = output_dir / manifest_path
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    assignment, summary = resolve_split(
+        train_all.frames,
+        val_ratio=val_ratio,
+        seed=seed,
+        target_delta=target_delta,
+        manifest_path=manifest_path,
+        on_new_groups=on_new_groups,
+        small_stratum_policy=small_stratum_policy,
+    )
+
+    train_frames: list[FrameRecord] = []
+    val_frames: list[FrameRecord] = []
+    for frame in train_all.frames:
+        uid = source_video_uid(frame.game, frame.video_id)
+        if assignment[uid] == "val":
+            val_frames.append(
+                replace(
+                    frame,
+                    split="val",
+                    sample_id=(
+                        f"val:{frame.game}:{frame.label}:{frame.video_id}:"
+                        f"{frame.frame_id:05d}"
+                    ),
+                )
+            )
+        else:
+            train_frames.append(frame)
+
+    frames_by_split: dict[str, list[FrameRecord]] = {
+        "train": train_frames,
+        "val": val_frames,
+        "test": test.frames,
+    }
+    findings_by_split: dict[str, ScanFindings] = {
+        # One physical scan covers both train and val; the same findings
+        # legitimately apply to the two logical splits.
+        "train": train_all.findings,
+        "val": train_all.findings,
+        "test": test.findings,
+    }
+
+    for split, frames in frames_by_split.items():
+        write_parquet(frames, output_dir / f"{split}_frames.parquet")
+        write_parquet(
+            summarize_videos(frames),
+            output_dir / f"{split}_videos.parquet",
+        )
+        from .video_index import (
+            build_video_entries,
+            write_video_entries_parquet,
+        )
+
+        write_video_entries_parquet(
+            build_video_entries(frames),
+            output_dir / f"{split}_video_entries.parquet",
+        )
+
+    audit = make_audit(
+        frames_by_split,
+        findings_by_split,
+        image_spec,
+        duplicate_policy,
+    )
+    audit["policies"]["scan_policy"] = scan_policy.to_dict()
+    write_split_summary(summary, output_dir / "split_summary.json")
+    audit["split"] = {**summary, "manifest": str(manifest_path)}
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "audit.json").write_text(
         json.dumps(audit, ensure_ascii=False, indent=2),

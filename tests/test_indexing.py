@@ -12,7 +12,18 @@ except ImportError:
 
 from game_cls.data.image_spec import ImageSpec
 from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
-from game_cls.data.indexing import scan_split, write_index_bundle
+from game_cls.data.indexing import (
+    read_frame_parquet,
+    scan_split,
+    validate_audit,
+    write_index_bundle,
+    write_split_bundle,
+)
+from game_cls.data.splitter import (
+    SPLIT_ALGORITHM_VERSION,
+    load_split_manifest,
+    source_video_uid,
+)
 
 
 def write_png_header(
@@ -26,6 +37,32 @@ def write_png_header(
         + struct.pack(">II", width, height)
         + bytes([8, 2])
     )
+
+
+def write_unique_png(path: Path, width: int = 448, height: int = 208) -> None:
+    """A scan-valid PNG whose file bytes are unique across the dataset.
+
+    The 26-byte header carries the configured dimensions, and a
+    per-path suffix makes the SHA-256 content hash unique. Without the
+    suffix every temp frame would be byte-identical and the content
+    duplicate audit would flag cross-label/cross-split collisions.
+    """
+    write_png_header(path, width, height)
+    with path.open("ab") as stream:
+        stream.write(str(path.resolve()).encode("utf-8"))
+
+
+def write_video_frames(
+    root: Path,
+    game: str,
+    label: int,
+    video_id: str,
+    frame_ids: list[int],
+) -> None:
+    for frame_id in frame_ids:
+        write_unique_png(
+            root / game / str(label) / f"{video_id}{frame_id:05d}.png"
+        )
 
 
 def scan_policy(**overrides) -> ScanPolicy:
@@ -293,6 +330,169 @@ class IndexBundleTests(unittest.TestCase):
                     image_spec=ImageSpec(width=448, height=208, channels=3),
                     duplicate_policy=DuplicatePolicy(),
                     require_content_hash=False,
+                )
+
+
+@unittest.skipIf(
+    pq is None, "pyarrow is not installed in the current interpreter"
+)
+class SplitBundleTests(unittest.TestCase):
+    """write_split_bundle: derive train/val from a single train_all root."""
+
+    def _data_config(self) -> dict:
+        return {
+            "width": 448,
+            "height": 208,
+            "channels": 3,
+            "frame_extensions": [".png"],
+            "ignore_directory_prefixes": ["_", "."],
+            "ignore_directory_names": [
+                "__pycache__",
+                "cache",
+                "caches",
+                "tmp",
+                "temp",
+            ],
+            "ignore_file_globs": ["*.tmp", "*.part", "*.log"],
+            "unexpected_nested_directory_severity": "warning",
+        }
+
+    def _split_config(self) -> dict:
+        return {
+            "mode": "from_train",
+            "val_ratio": 0.2,
+            "seed": 20260728,
+            "group_key": "source_video_uid",
+            "stratify_by": ["game", "label"],
+            "balance_by": "legal_pair_count",
+            "target_delta": 2,
+            "manifest": "split_manifest.parquet",
+            "on_new_groups": "error",
+            "small_stratum_policy": "error",
+        }
+
+    def _write_roots(self, root: Path) -> None:
+        # video ids must be unique per game (source_video_uid is
+        # label-independent), so a per-game counter spans both labels.
+        train_all = root / "train_all"
+        for game in ("game_a", "game_b", "game_c"):
+            for video in range(8):
+                label = video % 2
+                write_video_frames(
+                    train_all,
+                    game,
+                    label,
+                    f"{video + 1:02d}",
+                    list(range(1, 13)),
+                )
+        test_root = root / "test"
+        for label in (0, 1):
+            write_video_frames(
+                test_root, "game_d", label, "01", [1, 2, 3]
+            )
+
+    def test_write_split_bundle_produces_full_artifacts(self) -> None:
+        data_config = self._data_config()
+        image_spec = ImageSpec.from_config(data_config)
+        scan_policy = ScanPolicy.from_config(data_config)
+        duplicate_policy = DuplicatePolicy.from_config(data_config)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_roots(root)
+            output = root / "indexes"
+            audit = write_split_bundle(
+                root / "train_all",
+                root / "test",
+                output,
+                image_spec,
+                scan_policy,
+                duplicate_policy,
+                split_config=self._split_config(),
+            )
+
+            for split in ("train", "val", "test"):
+                self.assertTrue(
+                    (output / f"{split}_frames.parquet").is_file(),
+                    f"missing {split}_frames.parquet",
+                )
+                self.assertTrue(
+                    (output / f"{split}_videos.parquet").is_file()
+                )
+                self.assertTrue(
+                    (output / f"{split}_video_entries.parquet").is_file()
+                )
+            self.assertTrue((output / "split_manifest.parquet").is_file())
+            self.assertTrue((output / "split_summary.json").is_file())
+            self.assertTrue((output / "audit.json").is_file())
+
+            # Every source video lives in exactly one split: no uid may span
+            # any pair of train/val/test.
+            for pair_key, uids in audit["leakage"][
+                "source_video_uid_overlap"
+            ].items():
+                self.assertEqual(
+                    uids,
+                    [],
+                    f"source videos span the {pair_key} splits: {uids}",
+                )
+
+            # The manifest assignment agrees with the emitted frame rows and
+            # every frame carries its split's label.
+            manifest = load_split_manifest(output / "split_manifest.parquet")
+            self.assertEqual(manifest["split_seed"], 20260728)
+            self.assertEqual(
+                manifest["split_algorithm_version"], SPLIT_ALGORITHM_VERSION
+            )
+            for split in ("train", "val"):
+                frames = read_frame_parquet(
+                    output / f"{split}_frames.parquet"
+                )
+                self.assertTrue(frames, f"{split} has no frames")
+                for frame in frames:
+                    self.assertEqual(frame.split, split)
+                    self.assertEqual(
+                        manifest["assignment"][
+                            source_video_uid(frame.game, frame.video_id)
+                        ],
+                        split,
+                    )
+
+            # Both derived splits and the independent test split carry legal
+            # delta=2 pairs, and the strict audit gate passes with the exact
+            # policies that built the bundle.
+            self.assertGreater(
+                audit["splits"]["val"]["valid_pairs"]["2"], 0
+            )
+            self.assertGreater(
+                audit["splits"]["test"]["valid_pairs"]["2"], 0
+            )
+            self.assertIn("split", audit)
+            self.assertEqual(audit["split"]["split_algorithm_version"], 1)
+            self.assertFalse(audit["split"]["manifest_reused"])
+            validate_audit(
+                audit,
+                image_spec=image_spec,
+                scan_policy=scan_policy,
+                duplicate_policy=duplicate_policy,
+                require_test_delta=2,
+            )
+
+    def test_write_split_bundle_rejects_bad_split_config(self) -> None:
+        data_config = self._data_config()
+        image_spec = ImageSpec.from_config(data_config)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_roots(root)
+            with self.assertRaisesRegex(ValueError, "mode must be 'from_train'"):
+                write_split_bundle(
+                    root / "train_all",
+                    root / "test",
+                    root / "indexes",
+                    image_spec,
+                    ScanPolicy.from_config(data_config),
+                    DuplicatePolicy.from_config(data_config),
+                    split_config={**self._split_config(), "mode": "off"},
                 )
 
 

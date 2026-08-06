@@ -552,7 +552,11 @@ def _new_interval_accumulator(device) -> dict:
         "loss_sum": torch.zeros((), dtype=torch.float32, device=device),
         "ce_sum": torch.zeros((), dtype=torch.float32, device=device),
         "threshold_sum": torch.zeros((), dtype=torch.float32, device=device),
-        "threshold_weight_sum": 0.0,
+        "threshold_weight_sum": torch.zeros(
+            (), dtype=torch.float32, device=device
+        ),
+        "tail_sum": torch.zeros((), dtype=torch.float32, device=device),
+        "rank_sum": torch.zeros((), dtype=torch.float32, device=device),
         "counts": torch.zeros(4, dtype=torch.int64, device=device),
         "samples": 0,
     }
@@ -567,6 +571,9 @@ def _reduce_interval_accumulator(accum: dict, device) -> dict:
             accum["loss_sum"],
             accum["ce_sum"],
             accum["threshold_sum"],
+            accum["threshold_weight_sum"],
+            accum["tail_sum"],
+            accum["rank_sum"],
         )
     )
     samples = torch.tensor(
@@ -580,7 +587,14 @@ def _reduce_interval_accumulator(accum: dict, device) -> dict:
         dist.all_reduce(samples)
         dist.all_reduce(counts)
     sample_count = float(samples.item())
-    loss_sum, ce_sum, threshold_sum = floating.tolist()
+    (
+        loss_sum,
+        ce_sum,
+        threshold_sum,
+        threshold_weight_sum,
+        tail_sum,
+        rank_sum,
+    ) = floating.tolist()
     tp, fp, fn, tn = counts.tolist()
     positive_total = tp + fn
     negative_total = fp + tn
@@ -589,8 +603,9 @@ def _reduce_interval_accumulator(accum: dict, device) -> dict:
         "interval_loss": loss_sum / denominator,
         "interval_ce": ce_sum / denominator,
         "interval_threshold_loss": threshold_sum / denominator,
-        "interval_threshold_weight": accum["threshold_weight_sum"]
-        / denominator,
+        "interval_threshold_weight": threshold_weight_sum / denominator,
+        "interval_negative_tail_loss": tail_sum / denominator,
+        "interval_rank_loss": rank_sum / denominator,
         "interval_accuracy": (tp + tn) / max(sample_count, 1.0)
         if sample_count
         else 0.0,
@@ -1523,6 +1538,20 @@ def _save_all_ranks(
         )
 
 
+def _selection_mode(evaluation_config: dict) -> str:
+    """Resolve the selection strategy, defaulting to the legacy behavior.
+
+    When ``selection_mode`` is absent, a ``composite`` ``selection_metric``
+    implies composite selection; anything else stays plain metric selection.
+    """
+    mode = evaluation_config.get("selection_mode")
+    if mode is not None:
+        return str(mode)
+    if evaluation_config.get("selection_metric") == "composite":
+        return "composite"
+    return "metric"
+
+
 def _selection_score(metrics: dict, evaluation_config: dict) -> tuple[float, bool]:
     metric_name = evaluation_config.get(
         "selection_metric", "global_f1_at_decision_threshold"
@@ -1567,7 +1596,127 @@ def _selection_score(metrics: dict, evaluation_config: dict) -> tuple[float, boo
     return score, eligible
 
 
+def _selection_eligible(metrics: dict, evaluation_config: dict) -> bool:
+    """Return whether ``metrics`` passes the configured selection gates.
+
+    metric/composite: the existing ``minimum_worst_game_f1`` gate.
+
+    constrained: every non-null FPR/recall gate must pass
+    (``global_fpr <= max_global_fpr``, ``worst_game_fpr <=
+    max_worst_game_fpr``, ``global_positive_recall >= min_positive_recall``),
+    with ``minimum_worst_game_f1`` still applied as an extra gate when set.
+    """
+    if _selection_mode(evaluation_config) == "constrained":
+        eligible = True
+        max_global_fpr = evaluation_config.get("max_global_fpr")
+        if eligible and max_global_fpr is not None:
+            global_fpr = _metric_value(
+                metrics, "global_fpr_at_decision_threshold"
+            )
+            eligible = (
+                global_fpr is not None
+                and float(global_fpr) <= float(max_global_fpr)
+            )
+        max_worst_game_fpr = evaluation_config.get("max_worst_game_fpr")
+        if eligible and max_worst_game_fpr is not None:
+            worst_game_fpr = _metric_value(
+                metrics, "worst_game_fpr_at_decision_threshold"
+            )
+            eligible = (
+                worst_game_fpr is not None
+                and float(worst_game_fpr) <= float(max_worst_game_fpr)
+            )
+        min_positive_recall = evaluation_config.get("min_positive_recall")
+        if eligible and min_positive_recall is not None:
+            recall = _metric_value(
+                metrics, "global_positive_recall_at_decision_threshold"
+            )
+            eligible = (
+                recall is not None
+                and float(recall) >= float(min_positive_recall)
+            )
+        minimum_worst = evaluation_config.get("minimum_worst_game_f1")
+        if eligible and minimum_worst is not None:
+            worst_f1 = float(
+                _metric_value(
+                    metrics, "worst_game_f1_at_decision_threshold"
+                )
+                or 0.0
+            )
+            eligible = worst_f1 >= float(minimum_worst)
+        return eligible
+    # metric / composite: keep the existing minimum_worst_game_f1 gate.
+    return bool(_selection_score(metrics, evaluation_config)[1])
+
+
+def _selection_rank_key(
+    metrics: dict, evaluation_config: dict
+) -> float | tuple[float, ...]:
+    """Return the ordering key used to compare selection candidates.
+
+    metric/composite: the existing scalar selection score (float).
+
+    constrained: ``(global_positive_recall, worst_game_positive_recall,
+    -negative_score_p999)``; tuples compare lexicographically so selection
+    maximizes recall, then worst-game recall, then minimizes negative
+    score p99.9.
+    """
+    if _selection_mode(evaluation_config) == "constrained":
+        return (
+            float(
+                _metric_value(
+                    metrics,
+                    "global_positive_recall_at_decision_threshold",
+                )
+                or 0.0
+            ),
+            float(
+                _metric_value(
+                    metrics,
+                    "worst_game_positive_recall_at_decision_threshold",
+                )
+                or 0.0
+            ),
+            -float(_metric_value(metrics, "negative_score_p999") or 0.0),
+        )
+    return float(_selection_score(metrics, evaluation_config)[0])
+
+
 def _annotate_selection(metrics: dict, evaluation_config: dict) -> dict:
+    metrics["selection_mode"] = _selection_mode(evaluation_config)
+    metrics["selection_eligible"] = _selection_eligible(
+        metrics, evaluation_config
+    )
+    if _selection_mode(evaluation_config) == "constrained":
+        primary = _metric_value(
+            metrics, "global_positive_recall_at_decision_threshold"
+        )
+        metrics["selection_score"] = float(primary or 0.0)
+        metrics["selection_metric"] = (
+            "global_positive_recall_at_decision_threshold"
+        )
+        metrics["selection_constraints"] = {
+            "global_fpr": _metric_value(
+                metrics, "global_fpr_at_decision_threshold"
+            ),
+            "worst_game_fpr": _metric_value(
+                metrics, "worst_game_fpr_at_decision_threshold"
+            ),
+            "global_positive_recall": _metric_value(
+                metrics, "global_positive_recall_at_decision_threshold"
+            ),
+            "max_global_fpr": evaluation_config.get("max_global_fpr"),
+            "max_worst_game_fpr": evaluation_config.get(
+                "max_worst_game_fpr"
+            ),
+            "min_positive_recall": evaluation_config.get(
+                "min_positive_recall"
+            ),
+            "negative_score_p999": _metric_value(
+                metrics, "negative_score_p999"
+            ),
+        }
+        return metrics
     score, eligible = _selection_score(metrics, evaluation_config)
     metrics["selection_metric"] = evaluation_config.get(
         "selection_metric", "global_f1_at_decision_threshold"
@@ -1583,17 +1732,22 @@ def _annotate_selection(metrics: dict, evaluation_config: dict) -> dict:
 def _is_better_model(
     candidate: dict, incumbent: dict, evaluation_config: dict
 ) -> bool:
-    candidate_score, candidate_eligible = _selection_score(
-        candidate, evaluation_config
-    )
-    if not candidate_eligible:
+    """Return whether ``candidate`` beats ``incumbent`` under selection.
+
+    The candidate must be eligible; an empty incumbent is always beaten.
+    Otherwise the two rank keys are compared (scalar float for
+    metric/composite, lexicographic tuple for constrained), so both keys
+    share a type for a fixed mode.
+    """
+    if not _selection_eligible(candidate, evaluation_config):
         return False
     if not incumbent:
         return True
-    incumbent_score, incumbent_eligible = _selection_score(
-        incumbent, evaluation_config
-    )
-    return not incumbent_eligible or candidate_score > incumbent_score
+    if not _selection_eligible(incumbent, evaluation_config):
+        return True
+    candidate_key = _selection_rank_key(candidate, evaluation_config)
+    incumbent_key = _selection_rank_key(incumbent, evaluation_config)
+    return candidate_key > incumbent_key
 
 
 def _save_best_enabled(checkpoint_config: dict) -> bool:
@@ -1680,6 +1834,12 @@ def _run_evaluation(
         ),
         threshold_temperature=float(
             loss_cfg.get("threshold_temperature", 0.50)
+        ),
+        max_fpr_for_recall=float(
+            config["evaluation"].get("max_fpr_for_recall", 0.01)
+        ),
+        tail_calibration_enabled=bool(
+            config["evaluation"].get("tail_calibration_enabled", True)
         ),
     )
     distributed_barrier()
@@ -2207,18 +2367,34 @@ def run_training(
                         ).to(torch.int64)
                     )
                 interval_accum["loss_sum"].add_(
-                    loss.detach().double().mul_(batch_samples)
+                    loss.detach()
+                    .to(interval_accum["loss_sum"].dtype)
+                    .mul_(batch_samples)
                 )
                 interval_accum["ce_sum"].add_(
-                    components["cross_entropy"].double().mul_(batch_samples)
+                    components["cross_entropy"]
+                    .to(interval_accum["ce_sum"].dtype)
+                    .mul_(batch_samples)
                 )
                 interval_accum["threshold_sum"].add_(
-                    components["threshold_loss"].double().mul_(
-                        batch_samples
-                    )
+                    components["threshold_loss"]
+                    .to(interval_accum["threshold_sum"].dtype)
+                    .mul_(batch_samples)
                 )
-                interval_accum["threshold_weight_sum"] += (
+                interval_accum["threshold_weight_sum"].add_(
                     float(components["threshold_weight"]) * batch_samples
+                )
+                interval_accum["tail_sum"].add_(
+                    torch.as_tensor(
+                        components.get("negative_tail_loss", 0.0)
+                    )
+                    .to(interval_accum["tail_sum"].dtype)
+                    .mul_(batch_samples)
+                )
+                interval_accum["rank_sum"].add_(
+                    torch.as_tensor(components.get("rank_loss", 0.0))
+                    .to(interval_accum["rank_sum"].dtype)
+                    .mul_(batch_samples)
                 )
                 interval_accum["samples"] += batch_samples
 
@@ -2626,6 +2802,12 @@ def run_training(
                             "interval_threshold_weight": interval_metrics[
                                 "interval_threshold_weight"
                             ],
+                            "interval_negative_tail_loss": interval_metrics[
+                                "interval_negative_tail_loss"
+                            ],
+                            "interval_rank_loss": interval_metrics[
+                                "interval_rank_loss"
+                            ],
                             "interval_accuracy": interval_metrics[
                                 "interval_accuracy"
                             ],
@@ -2682,6 +2864,10 @@ def run_training(
                             f"{interval_metrics['interval_threshold_loss']:.6f} "
                             f"threshold_weight="
                             f"{interval_metrics['interval_threshold_weight']:.4f} "
+                            f"negative_tail_loss="
+                            f"{interval_metrics['interval_negative_tail_loss']:.6f} "
+                            f"rank_loss="
+                            f"{interval_metrics['interval_rank_loss']:.6f} "
                             f"accuracy="
                             f"{interval_metrics['interval_accuracy']:.4f} "
                             f"interval_samples/s="

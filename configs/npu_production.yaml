@@ -9,6 +9,18 @@ device:
   amp_dtype: bfloat16
 
 data:
+  # Optional: derive the validation split from a single source root instead
+  # of pre-built val_frames.parquet. Uncomment to enable, then run
+  #   cls-trainer dataset prepare --config configs/npu_production.yaml --train-root <train_all> --test-root <test>
+  # or set prepare_if_missing: true to auto-derive before training.
+  # source_root: /data/train_all
+  # test_root: /data/test
+  # prepare_if_missing: true
+  # split:
+  #   mode: from_train
+  #   val_ratio: 0.10
+  #   seed: 20260728
+  prepare_if_missing: false
   synthetic: false
   strict_audit: true
   require_content_hash_audit: true
@@ -171,6 +183,15 @@ evaluation:
     macro_game_f1: 0.40
     worst_game_f1: 0.20
   minimum_worst_game_f1: null
+  # Low-FPR constrained selection (step4 §三.3): gate candidates on FPR and
+  # positive recall, then rank by recall -> worst-game recall -> negative
+  # score p99.9. The decision threshold stays decision.threshold (0.99).
+  selection_mode: constrained
+  max_global_fpr: 0.01
+  max_worst_game_fpr: 0.02
+  min_positive_recall: 0.8
+  max_fpr_for_recall: 0.01
+  tail_calibration_enabled: true
 
 early_stopping:
   enabled: true

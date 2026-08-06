@@ -198,6 +198,27 @@ SCHEMA: dict[str, Any] = {
             "Auto-generated notes describing legacy split aliasing "
             "(set by finalize_config; do not configure manually).",
         ),
+        "source_root": _k(
+            "str",
+            "Single root scanned for both train and validation "
+            "(split.mode=from_train).",
+            nullable=True,
+        ),
+        "test_root": _k(
+            "str",
+            "Independent test root used with split.mode=from_train.",
+            nullable=True,
+        ),
+        "prepare_if_missing": _k(
+            "bool",
+            "Auto-run dataset prepare before training when split indexes "
+            "are missing.",
+        ),
+        "split": _k(
+            "dict",
+            "Source-video-level train/validation split configuration "
+            "(step4 §二).",
+        ),
         "minimum_pairs_per_game_label_delta": _k(
             "dict",
             "Minimum legal pairs per (game,label) for each delta, "
@@ -289,6 +310,46 @@ SCHEMA: dict[str, Any] = {
             "ratio": _k("list", "Erased aspect ratio range."),
             "value": _k("any", "Fill value; 'random' for noise."),
         },
+        "random_perspective": {
+            "enabled": _k("bool", "Enable random perspective warp."),
+            "probability": _k("float", "Per-pair probability."),
+            "distortion_scale": _k(
+                "float", "Perspective distortion strength, typically <= 1."
+            ),
+        },
+        "random_resized_crop": {
+            "enabled": _k("bool", "Enable random resized crop."),
+            "probability": _k("float", "Per-pair probability."),
+            "scale": _k("list", "Crop area fraction range [min, max]."),
+            "ratio": _k("list", "Crop aspect-ratio range [min, max]."),
+            "size": _k("list", "Output size [height, width]."),
+        },
+        "gamma": {
+            "enabled": _k("bool", "Enable gamma correction."),
+            "probability": _k("float", "Per-pair probability."),
+            "gamma_range": _k("list", "Gamma range [min, max]."),
+        },
+        "exposure": {
+            "enabled": _k("bool", "Enable exposure adjustment."),
+            "probability": _k("float", "Per-pair probability."),
+            "factor_range": _k("list", "Exposure factor range [min, max]."),
+        },
+        "blur": {
+            "enabled": _k("bool", "Enable Gaussian blur."),
+            "probability": _k("float", "Per-pair probability."),
+            "kernel_size": _k("int", "Odd Gaussian blur kernel size."),
+            "sigma_range": _k("list", "Gaussian sigma range [min, max]."),
+        },
+        "noise": {
+            "enabled": _k("bool", "Enable Gaussian noise injection."),
+            "probability": _k("float", "Per-pair probability."),
+            "noise_std": _k("float", "Additive noise standard deviation."),
+        },
+        "jpeg_compression": {
+            "enabled": _k("bool", "Enable JPEG re-encode artifact injection."),
+            "probability": _k("float", "Per-pair probability."),
+            "quality_range": _k("list", "JPEG quality range [min, max]."),
+        },
     },
     "model": {
         "factory": _k(
@@ -379,6 +440,26 @@ SCHEMA: dict[str, Any] = {
             "float",
             "Cross-entropy label smoothing. 0.0 keeps legacy behavior; "
             "keep small while the deployment threshold is fixed at 0.99.",
+        ),
+        "negative_tail_loss_weight": _k(
+            "float",
+            "Weight of the negative-tail OHEM component; 0 disables.",
+        ),
+        "negative_tail_hard_negative_k": _k(
+            "int",
+            "Top-k hardest negatives for the tail OHEM; null uses all "
+            "negatives.",
+            nullable=True,
+        ),
+        "rank_loss_weight": _k(
+            "float",
+            "Weight of the positive-vs-hard-negative pairwise ranking "
+            "component; 0 disables.",
+        ),
+        "rank_margin": _k(
+            "float",
+            "Required logit margin between a positive and a hard negative "
+            "in the ranking loss.",
         ),
     },
     "optimizer": {
@@ -540,6 +621,37 @@ SCHEMA: dict[str, Any] = {
             "below this gate.",
             nullable=True,
         ),
+        "selection_mode": _k(
+            "str",
+            "Model-selection strategy: metric (single metric), composite "
+            "(weighted F1), or constrained (FPR/recall gates then "
+            "recall/worst-recall/p99.9 ranking).",
+            choices=("metric", "composite", "constrained"),
+        ),
+        "max_global_fpr": _k(
+            "float",
+            "Constrained selection: reject candidates whose global FPR at "
+            "the decision threshold exceeds this (null disables the gate).",
+            nullable=True,
+        ),
+        "max_worst_game_fpr": _k(
+            "float",
+            "Constrained selection: reject candidates whose worst-game FPR "
+            "exceeds this (null disables).",
+            nullable=True,
+        ),
+        "min_positive_recall": _k(
+            "float",
+            "Constrained selection: require global positive recall at or "
+            "above this (null disables).",
+            nullable=True,
+        ),
+        "max_fpr_for_recall": _k(
+            "float", "FPR bound for recall_at_max_fpr and low-FPR partial AUC."
+        ),
+        "tail_calibration_enabled": _k(
+            "bool", "Compute ece_tail_95_100 in evaluation."
+        ),
     },
     "early_stopping": {
         "enabled": _k(
@@ -644,6 +756,68 @@ SCHEMA: dict[str, Any] = {
     },
 }
 
+# Nested leaves of a dict-typed key. ``data.split`` is a documented dict
+# block; its children live here so check_override_path, validate_config and
+# describe_reference treat them exactly like nested-dict sections.
+_SPLIT_KEYS: dict[str, Any] = {
+    "mode": _k(
+        "str",
+        "Split derivation mode: 'off' keeps the legacy three-root index "
+        "layout; 'from_train' scans source_root once and derives train/val "
+        "by source video.",
+        choices=("off", "from_train"),
+    ),
+    "val_ratio": _k(
+        "float",
+        "Fraction of source-video legal pairs moved to validation; "
+        "strictly between 0 and 1 when mode is from_train.",
+    ),
+    "seed": _k(
+        "int",
+        "Deterministic split seed; the same seed and data produce a "
+        "byte-identical manifest.",
+    ),
+    "group_key": _k(
+        "str", "Split unit identity; must be 'source_video_uid'."
+    ),
+    "stratify_by": _k(
+        "list", "Stratum fields for balancing, e.g. ['game', 'label']."
+    ),
+    "balance_by": _k(
+        "str", "Balancing statistic; must be 'legal_pair_count'."
+    ),
+    "target_delta": _k(
+        "int", "Frame delta whose pair count drives balancing (1, 2 or 3)."
+    ),
+    "manifest": _k(
+        "str",
+        "Split manifest parquet path, relative to the index output dir "
+        "(default: split_manifest.parquet).",
+    ),
+    "on_new_groups": _k(
+        "str",
+        "Behavior when the dataset fingerprint changes: 'error' refuses to "
+        "silently re-shuffle, 'extend' keeps existing assignments.",
+        choices=("error", "extend"),
+    ),
+    "small_stratum_policy": _k(
+        "str",
+        "Behavior for strata with fewer than two source videos: 'error' "
+        "rejects, 'warn' keeps the lone video in train.",
+        choices=("error", "warn"),
+    ),
+}
+
+# Dotted paths whose Key is a dict but still validate nested leaves.
+_NESTED_KEY_SCHEMAS: dict[str, dict[str, Any]] = {
+    "data.split": _SPLIT_KEYS,
+}
+
+
+def _nested_key_schema(dotted: str) -> dict[str, Any] | None:
+    """Sub-key schema of a dict-typed leaf, if one is registered."""
+    return _NESTED_KEY_SCHEMAS.get(dotted)
+
 # Keys that used to exist but have no consumer anymore. They raise a
 # migration hint instead of being silently accepted ("looks effective but
 # is not" is worse than an error).
@@ -736,6 +910,10 @@ def _walk(
                 f"{dotted}: must be one of {sorted(map(str, spec.choices))}, "
                 f"got {value!r}."
             )
+            continue
+        nested = _nested_key_schema(dotted)
+        if nested is not None and isinstance(value, dict):
+            _walk(value, nested, dotted, problems)
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -774,6 +952,9 @@ def known_dotted_paths() -> list[str]:
                 walk(spec, dotted)
             else:
                 paths.append(dotted)
+                nested = _nested_key_schema(dotted)
+                if nested is not None:
+                    walk(nested, dotted)
 
     walk(SCHEMA, "")
     return sorted(paths)
@@ -842,6 +1023,89 @@ def resolve_decision_threshold(config: dict[str, Any]) -> float:
     return threshold
 
 
+# Documented defaults for the augmentation block. An absent block still
+# yields the full dict so consumers can read every key unconditionally; every
+# transform defaults to disabled so existing configs stay bit-identical (the
+# consumer skips disabled transforms). ``_apply_defaults`` fills each key with
+# ``setdefault``, so user-supplied values always win.
+_DEFAULT_AUGMENTATION: dict[str, Any] = {
+    "enabled": False,
+    "random_affine": {
+        "enabled": False,
+        "probability": 0.0,
+        "degrees": 0.0,
+        "translate": [0.0, 0.0],
+        "scale": [1.0, 1.0],
+        "shear": [0.0, 0.0],
+        "interpolation": "bilinear",
+        "fill": 0,
+    },
+    "color_jitter": {
+        "enabled": False,
+        "probability": 0.0,
+        "brightness": 0.0,
+        "contrast": 0.0,
+        "saturation": 0.0,
+        "hue": 0.0,
+    },
+    "random_erasing": {
+        "enabled": False,
+        "probability": 0.0,
+        "scale": [0.02, 0.33],
+        "ratio": [0.3, 3.3],
+        "value": 0,
+    },
+    "random_perspective": {
+        "enabled": False,
+        "probability": 0.0,
+        "distortion_scale": 0.2,
+    },
+    "random_resized_crop": {
+        "enabled": False,
+        "probability": 0.0,
+        "scale": [0.9, 1.0],
+        "ratio": [0.9, 1.1],
+        "size": [208, 448],
+    },
+    "gamma": {
+        "enabled": False,
+        "probability": 0.0,
+        "gamma_range": [0.8, 1.2],
+    },
+    "exposure": {
+        "enabled": False,
+        "probability": 0.0,
+        "factor_range": [0.85, 1.15],
+    },
+    "blur": {
+        "enabled": False,
+        "probability": 0.0,
+        "kernel_size": 3,
+        "sigma_range": [0.1, 1.0],
+    },
+    "noise": {
+        "enabled": False,
+        "probability": 0.0,
+        "noise_std": 0.02,
+    },
+    "jpeg_compression": {
+        "enabled": False,
+        "probability": 0.0,
+        "quality_range": [60, 95],
+    },
+}
+
+# Defaults for the new loss keys. Every new weight defaults to 0.0 so existing
+# configs (which never set them) keep their exact training curves; rank_margin
+# and the null tail-k are the documented neutral values.
+_DEFAULT_LOSS_NEW_KEYS: dict[str, Any] = {
+    "negative_tail_loss_weight": 0.0,
+    "negative_tail_hard_negative_k": None,
+    "rank_loss_weight": 0.0,
+    "rank_margin": 0.2,
+}
+
+
 def _apply_defaults(config: dict[str, Any]) -> None:
     """Fill documented defaults for required keys a recipe may omit."""
     experiment = config.setdefault("experiment", {})
@@ -849,6 +1113,59 @@ def _apply_defaults(config: dict[str, Any]) -> None:
         experiment["seed"] = 20260728
     if "name" not in experiment:
         experiment["name"] = "run"
+
+    # An absent data.split block still yields the full dict so consumers can
+    # rely on the documented defaults (split.mode=off keeps the legacy
+    # three-root index layout).
+    default_split = {
+        "mode": "off",
+        "val_ratio": 0.10,
+        "seed": 20260728,
+        "group_key": "source_video_uid",
+        "stratify_by": ["game", "label"],
+        "balance_by": "legal_pair_count",
+        "target_delta": 2,
+        "manifest": "split_manifest.parquet",
+        "on_new_groups": "error",
+        "small_stratum_policy": "error",
+    }
+    data = config.setdefault("data", {})
+    data.setdefault("source_root", None)
+    data.setdefault("test_root", None)
+    data.setdefault("prepare_if_missing", False)
+    data["split"] = {**default_split, **(data.get("split") or {})}
+
+    evaluation = config.setdefault("evaluation", {})
+    evaluation.setdefault("selection_mode", "metric")
+    evaluation.setdefault("max_global_fpr", None)
+    evaluation.setdefault("max_worst_game_fpr", None)
+    evaluation.setdefault("min_positive_recall", None)
+    evaluation.setdefault("max_fpr_for_recall", 0.01)
+    evaluation.setdefault("tail_calibration_enabled", True)
+
+    # An absent augmentation block still yields the full dict with every
+    # transform disabled; an absent loss block still yields the new feature
+    # weights at 0.0. setdefault never overwrites user-supplied values, so
+    # existing configs are unchanged.
+    augmentation = config.setdefault("augmentation", {})
+    if not isinstance(augmentation, dict):
+        augmentation = {}
+        config["augmentation"] = augmentation
+    for key, value in _DEFAULT_AUGMENTATION.items():
+        if isinstance(value, dict):
+            block = augmentation.setdefault(key, {})
+            if isinstance(block, dict):
+                for sub_key, sub_value in value.items():
+                    block.setdefault(sub_key, sub_value)
+        else:
+            augmentation.setdefault(key, value)
+
+    loss = config.setdefault("loss", {})
+    if not isinstance(loss, dict):
+        loss = {}
+        config["loss"] = loss
+    for key, value in _DEFAULT_LOSS_NEW_KEYS.items():
+        loss.setdefault(key, value)
 
 
 # Legacy evaluation cadence keys are silently migrated so old configs keep
@@ -983,6 +1300,91 @@ def semantic_validate(config: dict[str, Any]) -> None:
                 value >= 0,
                 f"loss.{key} must be non-negative (got {value}).",
             )
+    # Stage 4 loss extensions: new weights are non-negative, the rank margin
+    # is non-negative and the optional hard-negative tail cap is positive when
+    # set (null means "use all negatives").
+    for key in ("negative_tail_loss_weight", "rank_loss_weight"):
+        value = loss_cfg.get(key)
+        if isinstance(value, (int, float)):
+            require(
+                value >= 0,
+                f"loss.{key} must be non-negative (got {value}).",
+            )
+    rank_margin = loss_cfg.get("rank_margin")
+    if isinstance(rank_margin, (int, float)):
+        require(
+            rank_margin >= 0,
+            f"loss.rank_margin must be non-negative (got {rank_margin}).",
+        )
+    tail_k = loss_cfg.get("negative_tail_hard_negative_k")
+    if isinstance(tail_k, int):
+        require(
+            tail_k > 0,
+            f"loss.negative_tail_hard_negative_k must be positive when set "
+            f"(got {tail_k}); null uses all negatives.",
+        )
+
+    # Stage 4 augmentation extensions: per-transform probability in [0, 1] and
+    # documented ranges as 2-element numeric lists with lower <= upper. Only
+    # clearly invalid values are rejected; size is an output shape, so it only
+    # has to be a 2-element int list (no ordering constraint).
+    _AUGMENTATION_RANGES: dict[str, tuple[str, ...]] = {
+        "random_perspective": (),
+        "random_resized_crop": ("scale", "ratio"),
+        "gamma": ("gamma_range",),
+        "exposure": ("factor_range",),
+        "blur": ("sigma_range",),
+        "noise": (),
+        "jpeg_compression": ("quality_range",),
+    }
+    augmentation_cfg = config.get("augmentation") or {}
+    for name, range_keys in _AUGMENTATION_RANGES.items():
+        block = augmentation_cfg.get(name)
+        if not isinstance(block, dict):
+            continue
+        probability = block.get("probability")
+        if isinstance(probability, (int, float)):
+            require(
+                0.0 <= float(probability) <= 1.0,
+                f"augmentation.{name}.probability must be in [0, 1] "
+                f"(got {probability}).",
+            )
+        for range_key in range_keys:
+            value = block.get(range_key)
+            if (
+                isinstance(value, list)
+                and len(value) == 2
+                and all(
+                    isinstance(item, (int, float))
+                    and not isinstance(item, bool)
+                    for item in value
+                )
+            ):
+                require(
+                    float(value[0]) <= float(value[1]),
+                    f"augmentation.{name}.{range_key} must have lower <= "
+                    f"upper (got {value}).",
+                )
+            elif value is not None:
+                require(
+                    False,
+                    f"augmentation.{name}.{range_key} must be a 2-element "
+                    f"numeric list (got {value!r}).",
+                )
+        size = block.get("size")
+        if size is not None and (
+            not isinstance(size, list)
+            or len(size) != 2
+            or not all(
+                isinstance(item, int) and not isinstance(item, bool)
+                for item in size
+            )
+        ):
+            require(
+                False,
+                f"augmentation.{name}.size must be a 2-element int list "
+                f"(got {size!r}).",
+            )
 
     evaluation_cfg = config.get("evaluation") or {}
     for key in (
@@ -1011,6 +1413,20 @@ def semantic_validate(config: dict[str, Any]) -> None:
             sum(float(value) for value in weights.values()) > 0,
             "evaluation.selection_weights must sum to a positive value.",
         )
+
+    # Low-FPR evaluation protocol: FPR/recall bounds must be true
+    # probabilities in (0, 1). Every gate is optional (null disables it), so
+    # a constrained selection with all gates disabled degrades to pure recall
+    # ranking and remains legal.
+    for key in ("max_fpr_for_recall", "max_global_fpr", "max_worst_game_fpr",
+                "min_positive_recall"):
+        value = evaluation_cfg.get(key)
+        if value is not None and isinstance(value, (int, float)):
+            require(
+                0.0 < float(value) < 1.0,
+                f"evaluation.{key} must be strictly between 0 and 1 "
+                f"(got {value}).",
+            )
 
     # Probability vectors: non-negative and (approximately) sum to one.
     for key in ("class_probability", "delta_probability"):
@@ -1043,6 +1459,26 @@ def semantic_validate(config: dict[str, Any]) -> None:
             f"train.warmup_steps ({warmup}) must not exceed "
             f"train.max_steps ({max_steps}).",
         )
+
+    # Auto split: from_train only makes sense with a usable val_ratio and a
+    # supported target_delta. source_root is deliberately NOT required here:
+    # the split indexes may already exist (prepare_if_missing=false).
+    split_cfg = (config.get("data") or {}).get("split") or {}
+    if split_cfg.get("mode") == "from_train":
+        val_ratio = split_cfg.get("val_ratio")
+        if isinstance(val_ratio, (int, float)):
+            require(
+                0.0 < float(val_ratio) < 1.0,
+                f"data.split.val_ratio must be strictly between 0 and 1 "
+                f"(got {val_ratio}).",
+            )
+        target_delta = split_cfg.get("target_delta")
+        if isinstance(target_delta, (int, float)):
+            require(
+                int(target_delta) in (1, 2, 3),
+                f"data.split.target_delta must be 1, 2 or 3 "
+                f"(got {target_delta}).",
+            )
 
     if problems:
         raise ConfigSchemaError(problems)
@@ -1083,6 +1519,9 @@ def describe_reference() -> list[dict[str, Any]]:
                     "description": spec.description,
                 }
             )
+            nested = _nested_key_schema(dotted)
+            if nested is not None:
+                walk(nested, dotted)
 
     walk(SCHEMA, "")
     return rows

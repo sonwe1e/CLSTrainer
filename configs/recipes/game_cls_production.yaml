@@ -24,6 +24,18 @@ model:
   checkpoint_path: REPLACE_ME/path/to/base_model.pt
 
 data:
+  # Optional: derive the validation split from a single source root instead
+  # of pre-built val_frames.parquet. Uncomment to enable, then run
+  #   cls-trainer dataset prepare --config configs/recipes/game_cls_production.yaml --train-root <train_all> --test-root <test>
+  # or set prepare_if_missing: true to auto-derive before training.
+  # source_root: /data/train_all
+  # test_root: /data/test
+  # prepare_if_missing: true
+  # split:
+  #   mode: from_train
+  #   val_ratio: 0.10
+  #   seed: 20260728
+  prepare_if_missing: false
   synthetic: false
   require_content_hash_audit: true
   require_unique_video_keys_across_splits: true
@@ -75,6 +87,17 @@ train:
   local_batch_size: 64
   gradient_clip_norm: 5.0
   log_every_steps: 50
+
+# Low-FPR constrained selection (step4 §三.3), overriding the composite
+# selection of the evaluation/production preset. The decision threshold
+# stays decision.threshold (0.99); metrics use neutral names.
+evaluation:
+  selection_mode: constrained
+  max_global_fpr: 0.01
+  max_worst_game_fpr: 0.02
+  min_positive_recall: 0.8
+  max_fpr_for_recall: 0.01
+  tail_calibration_enabled: true
 
 checkpoint:
   save_last_every_steps: 1000

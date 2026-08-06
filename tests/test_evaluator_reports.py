@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,6 +62,23 @@ class EvaluatorReportTests(unittest.TestCase):
                 "errors.html",
             ):
                 self.assertTrue((output / name).is_file(), name)
+            persisted = json.loads(
+                (output / "metrics.json").read_text(encoding="utf-8")
+            )
+            for key in (
+                "global_fpr_at_decision_threshold",
+                "global_specificity_at_decision_threshold",
+                "global_positive_recall_at_decision_threshold",
+                "worst_game_fpr_at_decision_threshold",
+                "worst_game_positive_recall_at_decision_threshold",
+                "negative_score_p99",
+                "negative_score_p999",
+                "negative_score_max",
+                "recall_at_max_fpr",
+                "low_fpr_partial_auc",
+                "ece_tail_95_100",
+            ):
+                self.assertIn(key, persisted, key)
 
     def test_packed_preview_export_and_buffered_row_groups(self) -> None:
         import pyarrow.parquet as pq

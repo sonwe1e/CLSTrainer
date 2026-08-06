@@ -23,3 +23,18 @@ augmentation:
     scale: [0.005, 0.03]
     ratio: [0.3, 3.3]
     value: 0
+  random_resized_crop:
+    enabled: true
+    probability: 0.20
+    scale: [0.9, 1.0]
+    ratio: [0.9, 1.1]
+    size: [208, 448]
+  gamma:
+    enabled: true
+    probability: 0.20
+    gamma_range: [0.9, 1.1]
+  blur:
+    enabled: true
+    probability: 0.10
+    kernel_size: 3
+    sigma_range: [0.5, 1.5]

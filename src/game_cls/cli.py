@@ -499,6 +499,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     if args.dry_run:
         return _dry_run_report(config, config_source)
 
+    _maybe_prepare_split(config)
+
     checkpoint_path = config["model"].get("checkpoint_path")
     checkpoint_hash = None
     rank = int(os.environ.get("RANK", 0))
@@ -1218,6 +1220,12 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             threshold_temperature=float(
                 loss_cfg.get("threshold_temperature", 0.50)
             ),
+            max_fpr_for_recall=float(
+                evaluation_cfg.get("max_fpr_for_recall", 0.01)
+            ),
+            tail_calibration_enabled=bool(
+                evaluation_cfg.get("tail_calibration_enabled", True)
+            ),
         )
         distributed_barrier()
         if rank == 0:
@@ -1341,6 +1349,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         check(False, "config file", str(exc))
         return 1
+
+    accelerator = str(config["device"].get("accelerator", "auto"))
+    if accelerator == "npu":
+        from game_cls.runtime.npu_checks import probe_npu_environment
+
+        for label, (ok, detail) in probe_npu_environment().items():
+            check(ok, label, detail)
+    else:
+        check(
+            None,
+            "NPU device-operator probes",
+            f"accelerator={accelerator}; run doctor with an npu config "
+            "to probe bincount/scatter_add_/nonzero/index_select/GradScaler",
+        )
 
     data_cfg = config["data"]
     if data_cfg.get("synthetic"):
@@ -1498,6 +1520,201 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("")
     print("FAIL" if failures else "PASS", f"({failures} failing checks)")
     return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------
+# dataset prepare / audit / pack
+# ---------------------------------------------------------------------------
+
+
+def _run_split_prepare(
+    config: dict[str, Any],
+    train_all_root: str | Path,
+    test_root: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Derive train/val from train_all_root and write the split bundle.
+
+    Thin wrapper around ``indexing.write_split_bundle``; the first argument
+    is the physical ``source_root`` (train_all) whose frames are logically
+    re-partitioned into train/val.
+    """
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+    from game_cls.data.indexing import write_split_bundle
+
+    data_config = config["data"]
+    split = dict(data_config.get("split") or {})
+    if output_dir is None:
+        # Match tools/build_index.py's default index output dir; the split
+        # manifest is then written at output_dir/manifest (e.g.
+        # indexes/split_manifest.parquet).
+        output_dir = Path("indexes")
+    return write_split_bundle(
+        train_all_root,
+        test_root,
+        output_dir,
+        ImageSpec.from_config(data_config),
+        ScanPolicy.from_config(data_config),
+        DuplicatePolicy.from_config(data_config),
+        split_config=split,
+        compute_content_hash=True,
+    )
+
+
+def _maybe_prepare_split(config: dict[str, Any]) -> None:
+    """Build the validation split on demand when ``prepare_if_missing``."""
+    data_config = config["data"]
+    if not data_config.get("prepare_if_missing"):
+        return
+    split = data_config.get("split") or {}
+    if split.get("mode") != "from_train":
+        return
+    val_index = data_config.get("val_index")
+    if val_index and Path(val_index).is_file():
+        return  # the validation split already exists
+    source_root = data_config.get("source_root")
+    test_root = data_config.get("test_root")
+    if not source_root or not test_root:
+        raise SystemExit(
+            "data.prepare_if_missing requires data.source_root and "
+            "data.test_root to derive the validation split; set both, or "
+            "run 'cls-trainer dataset prepare' separately first."
+        )
+    _run_split_prepare(config, source_root, test_root)
+
+
+def cmd_dataset_prepare(args: argparse.Namespace) -> int:
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+
+    try:
+        config = load_config(args.config, args.overrides)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    data_config = config["data"]
+    split = data_config.get("split") or {}
+    if split.get("mode") != "from_train":
+        print(
+            "dataset prepare requires data.split.mode == 'from_train'; "
+            f"got {split.get('mode')!r}. Configure data.split (mode, "
+            "val_ratio, seed) to derive a validation split.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.val_ratio is not None:
+        split["val_ratio"] = args.val_ratio
+    audit = _run_split_prepare(
+        config,
+        args.train_root,
+        args.test_root,
+        output_dir=args.output_dir,
+    )
+    summary = audit.get("split") or audit
+    print("=== dataset prepare finished ===")
+    print(f"split mode        : {split.get('mode')}")
+    print(f"val ratio target  : {split.get('val_ratio')}")
+    print(
+        "val ratio achieved (delta=2): "
+        f"{summary.get('val_ratio_achieved_delta2')}"
+    )
+    print(f"source videos     : {summary.get('source_video_count')}")
+    print(f"manifest          : {split.get('manifest')}")
+    return 0
+
+
+def cmd_dataset_audit(args: argparse.Namespace) -> int:
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+    from game_cls.data.indexing import audit_warning_messages, validate_audit
+
+    try:
+        config = load_config(args.config, args.overrides)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    data_config = config["data"]
+    source = Path(args.index_dir) / "audit.json"
+    if not source.is_file():
+        print(f"audit report not found: {source}", file=sys.stderr)
+        return 2
+    audit = json.loads(source.read_text(encoding="utf-8"))
+    for split, report in audit["splits"].items():
+        findings = report.get("findings", {})
+        print(
+            f"{split}: frames={report['frame_count']} videos={report['video_count']} "
+            f"errors={len(findings.get('errors', []))} "
+            f"warnings={len(findings.get('warnings', []))} "
+            f"ignored={sum(findings.get('ignored', {}).get('counts', {}).values())}"
+        )
+    for warning in audit_warning_messages(audit):
+        print(f"[WARNING] {warning}")
+    if args.strict:
+        validate_audit(
+            audit,
+            image_spec=ImageSpec.from_config(data_config),
+            scan_policy=ScanPolicy.from_config(data_config),
+            duplicate_policy=DuplicatePolicy.from_config(data_config),
+            require_test_delta=int(config["pair"]["test_delta"]),
+            require_content_hash=bool(
+                data_config.get("require_content_hash_audit", False)
+            ),
+            require_unique_video_keys=bool(
+                data_config.get(
+                    "require_unique_video_keys_across_splits", False
+                )
+            ),
+            minimum_pairs_per_game_label_delta={
+                int(key): int(value)
+                for key, value in data_config.get(
+                    "minimum_pairs_per_game_label_delta", {}
+                ).items()
+            },
+        )
+        print("Strict dataset audit passed.")
+    return 0
+
+
+def cmd_dataset_pack(args: argparse.Namespace) -> int:
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.packed_backend import pack_frame_index
+
+    try:
+        config = load_config(args.config, args.overrides)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    index_path = pack_frame_index(
+        args.frame_index,
+        args.output_dir,
+        image_spec=ImageSpec.from_config(config["data"]),
+        images_per_shard=args.images_per_shard,
+    )
+    print(
+        json.dumps(
+            {
+                "packed_frame_index": str(index_path),
+                "packed_video_index": str(
+                    index_path.with_name("packed_video_entries.parquet")
+                ),
+                "manifest": str(
+                    index_path.with_name("packed_manifest.json")
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1668,13 +1885,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.set_defaults(func=cmd_init)
 
+    dataset = subparsers.add_parser(
+        "dataset", help="Dataset preparation, audit and packing."
+    )
+    dataset_sub = dataset.add_subparsers(
+        dest="dataset_command", required=True
+    )
+    prepare = dataset_sub.add_parser(
+        "prepare",
+        help="Derive a source-video-level validation split from train_root.",
+    )
+    prepare.add_argument("--config", required=True)
+    prepare.add_argument("--train-root", required=True)
+    prepare.add_argument("--test-root", required=True)
+    prepare.add_argument("--output-dir", default="indexes")
+    prepare.add_argument(
+        "--val-ratio",
+        type=float,
+        help="Override data.split.val_ratio for this preparation.",
+    )
+    prepare.add_argument("overrides", nargs="*", metavar="key=value")
+    prepare.set_defaults(func=cmd_dataset_prepare)
+    audit = dataset_sub.add_parser(
+        "audit", help="Validate an index audit report."
+    )
+    audit.add_argument("--config", required=True)
+    audit.add_argument("--index-dir", default="indexes")
+    audit.add_argument(
+        "--strict",
+        action="store_true",
+        help="Run the strict validate_audit gate (mirrors "
+        "tools/audit_dataset.py).",
+    )
+    audit.add_argument("overrides", nargs="*", metavar="key=value")
+    audit.set_defaults(func=cmd_dataset_audit)
+    pack = dataset_sub.add_parser(
+        "pack", help="Pack decoded CHW uint8 frames into memmapped shards."
+    )
+    pack.add_argument("--config", required=True)
+    pack.add_argument("--frame-index", required=True)
+    pack.add_argument("--output-dir", required=True)
+    pack.add_argument("--images-per-shard", type=int, default=4096)
+    pack.add_argument("overrides", nargs="*", metavar="key=value")
+    pack.set_defaults(func=cmd_dataset_pack)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    known = {"train", "config", "run", "doctor", "init"}
+    known = {
+        "train",
+        "config",
+        "run",
+        "doctor",
+        "init",
+        "evaluate",
+        "dataset",
+    }
     if not argv or argv[0] not in known:
         # cls-trainer --config x.yaml k=v  =>  cls-trainer train --config ...
         argv = ["train", *argv]

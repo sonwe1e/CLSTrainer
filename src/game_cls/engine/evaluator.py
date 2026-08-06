@@ -282,6 +282,123 @@ def _histogram_margin_percentiles(
     return results
 
 
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _histogram_max_margin(histogram, bins: int) -> float | None:
+    """Margin at the center of the highest non-empty probability bin."""
+    for bin_index in range(len(histogram) - 1, -1, -1):
+        if histogram[bin_index]:
+            probability = min(
+                max((bin_index + 0.5) / bins, 1e-6), 1.0 - 1e-6
+            )
+            return math.log(probability / (1.0 - probability))
+    return None
+
+
+def _low_fpr_histogram_metrics(
+    positive_histogram,
+    negative_histogram,
+    max_fpr_for_recall: float,
+) -> tuple[float, float]:
+    """Recall at an FPR bound plus normalized low-FPR partial AUC.
+
+    Both margin histograms are already reduced, so the sweep is rank-local
+    and adds no data movement. Thresholds sweep from strictest (highest
+    probability) to most permissive, accumulating FPR and recall per bin.
+
+    The partial AUC is NORMALIZED by ``max_fpr_for_recall`` so a model that
+    reaches full recall before the FPR bound scores exactly 1.0 regardless of
+    the configured bound (a threshold-independent metric).
+    """
+    positives = sum(positive_histogram)
+    negatives = sum(negative_histogram)
+    if not positives or not negatives or max_fpr_for_recall <= 0.0:
+        return 0.0, 0.0
+    cumulative_tp = 0
+    cumulative_fp = 0
+    previous_fpr = 0.0
+    previous_recall = 0.0
+    recall_at_bound = 0.0
+    partial_auc = 0.0
+    for positive, negative in zip(
+        reversed(positive_histogram),
+        reversed(negative_histogram),
+        strict=False,
+    ):
+        cumulative_tp += positive
+        cumulative_fp += negative
+        fpr = cumulative_fp / negatives
+        recall = cumulative_tp / positives
+        if fpr >= max_fpr_for_recall:
+            fpr_span = fpr - previous_fpr
+            if fpr_span > 0.0:
+                fraction = (max_fpr_for_recall - previous_fpr) / fpr_span
+                recall_at_bound = previous_recall + (
+                    (recall - previous_recall) * fraction
+                )
+                partial_auc += (
+                    0.5
+                    * (previous_recall + recall_at_bound)
+                    * (max_fpr_for_recall - previous_fpr)
+                )
+            else:
+                recall_at_bound = recall
+            break
+        partial_auc += (
+            0.5 * (previous_recall + recall) * (fpr - previous_fpr)
+        )
+        previous_fpr = fpr
+        previous_recall = recall
+    else:
+        # The FPR bound was never crossed; use the most permissive recall
+        # and extend the curve flat across the remaining FPR range so the
+        # normalization stays consistent.
+        recall_at_bound = previous_recall
+        partial_auc += previous_recall * (
+            max_fpr_for_recall - previous_fpr
+        )
+    return recall_at_bound, partial_auc / max_fpr_for_recall
+
+
+def _worst_game_fpr_and_recall(game_counters: dict) -> tuple[float, float]:
+    """Worst-game FPR (max) and positive recall (min) at the threshold."""
+    fpr_values: list[float] = []
+    recall_values: list[float] = []
+    for counts in game_counters.values():
+        tp, fp, fn, tn = counts
+        if fp + tn:
+            fpr_values.append(fp / (fp + tn))
+        if tp + fn:
+            recall_values.append(tp / (tp + fn))
+    worst_fpr = max(fpr_values) if fpr_values else 0.0
+    worst_recall = min(recall_values) if recall_values else 0.0
+    return worst_fpr, worst_recall
+
+
+def _ece_tail(
+    calibration_counts,
+    calibration_probabilities,
+    calibration_targets,
+    tail_lower: float = 0.95,
+) -> float:
+    """ECE restricted to calibration bins overlapping ``[tail_lower, 1.0]``."""
+    num_bins = len(calibration_counts)
+    tail_indices = [
+        index
+        for index in range(num_bins)
+        if (index + 1) / num_bins > tail_lower
+    ]
+    tail_count = sum(calibration_counts[index] for index in tail_indices)
+    return _calibration_metrics(
+        [calibration_counts[index] for index in tail_indices],
+        [calibration_probabilities[index] for index in tail_indices],
+        [calibration_targets[index] for index in tail_indices],
+        tail_count,
+    )
+
+
 def _build_group_dicts(
     group_catalogs: dict,
     game_counts_array,
@@ -335,26 +452,43 @@ def _build_group_dicts(
 
 
 def _all_reduce_group_arrays(
-    dist, sum_arrays, min_array, max_array
+    dist, sum_arrays, min_array, max_array, device
 ) -> None:
-    """Tensor-reduce the per-catalog numpy arrays in place.
+    """Tensor-reduce the per-catalog numpy arrays in place on ``device``.
 
     Counts/sums use addition; the per-video probability min/max use the
-    MIN/MAX reduction ops (arrays are initialized to +/-inf).
+    MIN/MAX reduction ops (arrays are initialized to +/-inf). Reduction
+    happens on the accelerator device so the collective matches the
+    process-group backend (e.g. HCCL on NPU); float64 host arrays are
+    downcast to float32 on-device because NPU rejects float64 device
+    tensors (``k::double``), and int64 counts keep their dtype. Large
+    arrays are reduced in bounded chunks to limit peak device memory.
     """
     import numpy as np
     import torch
 
+    # ~1M rows per chunk bounds peak device memory for huge video catalogs.
+    chunk_rows = 1 << 20
+
+    def _reduce(array: np.ndarray, op=None) -> None:
+        rows = int(array.shape[0]) if array.ndim else 1
+        step = max(1, min(chunk_rows, rows))
+        for start in range(0, rows, step):
+            chunk = array[start : start + step]
+            tensor = torch.from_numpy(np.ascontiguousarray(chunk))
+            if tensor.is_floating_point():
+                tensor = tensor.float()
+            tensor = tensor.to(device)
+            if op is None:
+                dist.all_reduce(tensor)
+            else:
+                dist.all_reduce(tensor, op=op)
+            chunk[...] = tensor.cpu().numpy()
+
     for array in sum_arrays:
-        tensor = torch.from_numpy(np.ascontiguousarray(array))
-        dist.all_reduce(tensor)
-        array[...] = tensor.numpy()
-    min_tensor = torch.from_numpy(np.ascontiguousarray(min_array))
-    dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
-    min_array[...] = min_tensor.numpy()
-    max_tensor = torch.from_numpy(np.ascontiguousarray(max_array))
-    dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
-    max_array[...] = max_tensor.numpy()
+        _reduce(array)
+    _reduce(min_array, dist.ReduceOp.MIN)
+    _reduce(max_array, dist.ReduceOp.MAX)
 
 
 # Exact-AUC distributed evaluation gathers raw score lists to rank 0; cap
@@ -388,7 +522,16 @@ def evaluate(
     cross_entropy_weight: float = 1.0,
     threshold_safety_margin: float = 0.20,
     threshold_temperature: float = 0.50,
+    max_fpr_for_recall: float = 0.01,
+    tail_calibration_enabled: bool = True,
 ) -> EvaluationOutput:
+    """Evaluate a model and return metrics plus grouped rows.
+
+    The trailing keyword parameters consume the evaluation config keys
+    "max_fpr_for_recall" and "tail_calibration_enabled": the former bounds
+    the "recall_at_max_fpr" / "low_fpr_partial_auc" histogram sweep, and the
+    latter gates the "ece_tail_95_100" tail-calibration metric.
+    """
     import numpy as np
     import torch
 
@@ -771,6 +914,7 @@ def evaluate(
                 ),
                 video_probability_min,
                 video_probability_max,
+                device,
             )
             group_game, group_video, group_game_label, group_video_confidence = (
                 _build_group_dicts(
@@ -888,6 +1032,27 @@ def evaluate(
     calibration_probabilities = calibration_probability.cpu().tolist()
     calibration_targets = calibration_target.cpu().tolist()
     metrics = global_binary.to_dict()
+    worst_game_fpr, worst_game_positive_recall = (
+        _worst_game_fpr_and_recall(game_counters)
+    )
+    recall_at_max_fpr, low_fpr_partial_auc = _low_fpr_histogram_metrics(
+        positive_histogram, negative_histogram, max_fpr_for_recall
+    )
+    negative_tail_percentiles = _histogram_margin_percentiles(
+        negative_histogram, auc_histogram_bins, (0.99, 0.999)
+    )
+    negative_score_max = _histogram_max_margin(
+        negative_histogram, auc_histogram_bins
+    )
+    ece_tail_95_100 = (
+        _ece_tail(
+            calibration_counts,
+            calibration_probabilities,
+            calibration_targets,
+        )
+        if tail_calibration_enabled
+        else 0.0
+    )
     cross_entropy_mean = (
         cross_entropy_sum / sample_count if sample_count else 0.0
     )
@@ -950,6 +1115,23 @@ def evaluate(
             "negative_margin_p10": negative_percentiles[0],
             "negative_margin_p50": negative_percentiles[1],
             "negative_margin_p90": negative_percentiles[2],
+            "global_fpr_at_decision_threshold": _safe_ratio(fp, fp + tn),
+            "global_specificity_at_decision_threshold": _safe_ratio(
+                tn, fp + tn
+            ),
+            "global_positive_recall_at_decision_threshold": _safe_ratio(
+                tp, tp + fn
+            ),
+            "worst_game_fpr_at_decision_threshold": worst_game_fpr,
+            "worst_game_positive_recall_at_decision_threshold": (
+                worst_game_positive_recall
+            ),
+            "negative_score_p99": negative_tail_percentiles[0],
+            "negative_score_p999": negative_tail_percentiles[1],
+            "negative_score_max": negative_score_max,
+            "recall_at_max_fpr": recall_at_max_fpr,
+            "low_fpr_partial_auc": low_fpr_partial_auc,
+            "ece_tail_95_100": ece_tail_95_100,
             "confidence_histogram": dict(
                 zip(
                     ["<0.980", "0.980-0.990", "0.990-0.995", "0.995-0.999", ">=0.999"],
