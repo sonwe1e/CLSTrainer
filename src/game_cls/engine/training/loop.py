@@ -19,6 +19,7 @@ from game_cls.engine.distributed import (
     cleanup_distributed,
     distributed_barrier,
     initialize_runtime,
+    is_distributed,
 )
 from game_cls.engine.training.config_validation import (
     _dataloader_option,
@@ -239,10 +240,27 @@ def run_training(
         trainable_rules_cfg = config["model"].get("trainable_rules")
         rules = parse_rules(trainable_rules_cfg) if trainable_rules_cfg else None
         if checkpoint_path:
-            report = load_model_checkpoint(model, checkpoint_path)
-            if not config["data"].get("synthetic", False) and config["model"].get(
-                "require_pretrained_backbone", True
+            # Step5 P5: under DDP only rank 0 touches the base checkpoint
+            # file; the state dict is broadcast so the other ranks skip the
+            # I/O (weights_only=True load, unchanged trust semantics).
+            if world_size > 1 and is_distributed():
+                if rank == 0:
+                    report = load_model_checkpoint(model, checkpoint_path)
+                    state_payload = unwrap_model(model).state_dict()
+                else:
+                    report = None
+                    state_payload = None
+                state_payload = _broadcast_object(state_payload, rank)
+                if rank != 0:
+                    unwrap_model(model).load_state_dict(state_payload, strict=True)
+            else:
+                report = load_model_checkpoint(model, checkpoint_path)
+            if (
+                not config["data"].get("synthetic", False)
+                and config["model"].get("require_pretrained_backbone", True)
+                and rank == 0
             ):
+                assert report is not None
                 if rules is not None:
                     frozen_names = {
                         name
@@ -268,6 +286,7 @@ def run_training(
             else:
                 coverage = None
             if rank == 0:
+                assert report is not None
                 print(f"Loaded {len(report.loaded)} model tensors")
                 if coverage is not None:
                     print(f"Frozen backbone checkpoint coverage: {coverage:.2%}")

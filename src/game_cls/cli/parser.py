@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 
 from game_cls.cli.benchmark import (
+    cmd_benchmark_data,
     cmd_benchmark_evaluate,
     cmd_benchmark_scan_negatives,
 )
@@ -305,6 +306,15 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--pool-video-index", default=None)
     scan.add_argument("--output", default=None)
     scan.set_defaults(func=cmd_benchmark_scan_negatives)
+    bench_data = benchmark_sub.add_parser(
+        "data",
+        help="Probe DataLoader throughput across backends/workers/prefetch.",
+    )
+    bench_data.add_argument("--config", required=True)
+    bench_data.add_argument("--steps", type=int, default=20)
+    bench_data.add_argument("--batch-size", type=int, default=16)
+    bench_data.add_argument("overrides", nargs="*", metavar="key=value")
+    bench_data.set_defaults(func=cmd_benchmark_data)
     bench_eval = benchmark_sub.add_parser(
         "evaluate",
         help="Evaluate a checkpoint on the fixed challenge set and check "

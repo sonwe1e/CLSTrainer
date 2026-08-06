@@ -133,6 +133,47 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
         cleanup_distributed()
 
 
+def cmd_benchmark_data(args: argparse.Namespace) -> int:
+    """Probe DataLoader throughput across backends/workers/prefetch."""
+    import json as json_module
+
+    from game_cls.benchmark.data_probe import run_data_probe
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+
+    try:
+        config = load_config(args.config, args.overrides)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    if config["data"].get("synthetic"):
+        print(
+            "benchmark data measures real I/O; the config uses synthetic "
+            "data. Point --config at a run config with real train indexes.",
+            file=sys.stderr,
+        )
+        return 2
+    results = run_data_probe(config, steps=args.steps, batch_size=args.batch_size)
+    if not results:
+        print(
+            "No probe variant produced data (missing indexes?). Provide a "
+            "config with real train indexes or synthetic data.",
+            file=sys.stderr,
+        )
+        return 2
+    out_dir = Path(config["benchmark"].get("output_dir", "benchmarks"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "data_probe.json"
+    out_path.write_text(
+        json_module.dumps(results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json_module.dumps(results, ensure_ascii=False, indent=2))
+    print(f"report: {out_path}")
+    return 0
+
+
 def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
     """Evaluate a checkpoint on the fixed challenge set and check gates."""
     from game_cls.config import load_config
