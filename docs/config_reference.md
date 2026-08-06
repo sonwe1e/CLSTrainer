@@ -89,6 +89,10 @@ augmentation.random_resized_crop.scale  [list]
     Crop area fraction range [min, max].
 augmentation.random_resized_crop.size  [list]
     Output size [height, width].
+benchmark.gate_metrics  [dict]
+    Release/benchmark gates keyed by the metric name the evaluator emits, each {op: "<="|"<"|">="|">", value: <number>}, e.g. {global_fpr_at_decision_threshold: {op: "<=", value: 0.01}, global_positive_recall_at_decision_threshold: {op: ">=", value: 0.8}}. A bare scalar bound is still accepted and means the metric's natural bound (upper for FPR/ECE/Brier/loss/negative-score, lower for recall/F1/precision/specificity/accuracy); metrics with no documented direction (sample_count, threshold) require the explicit form. Unknown metric names or operators are config errors; unmet gates fail the command.
+benchmark.output_dir  [str]
+    Directory for benchmark reports and data probes.
 checkpoint.full_model_every_steps  [int]
     Cadence for full-weight periodic saves; 0 disables.
 checkpoint.periodic_state_mode  [str] (choices: full|trainable_only)
@@ -105,12 +109,22 @@ checkpoint.save_last_every_steps  [int]
     Periodic resume checkpoint cadence; 0 disables.
 checkpoint.save_topk  [int]
     Keep the top-N full-validation checkpoints ranked by checkpoint.topk_monitor (saved as model_topk_<step>.pth); 0 disables. Enabling it forces a last-checkpoint save after every full validation so the topk snapshot always matches the evaluated weights.
-checkpoint.topk_monitor  [str] (choices: selection_score|cross_entropy|worst_game_f1_at_decision_threshold)
-    Metric that ranks topk checkpoints; lower is better for cross_entropy, higher is better otherwise.
+checkpoint.topk_monitor  [str] (choices: selection_score|selection|cross_entropy|worst_game_f1_at_decision_threshold)
+    `selection_score` (alias `selection`) ranks topk checkpoints by the unified selection contract, the same ordering as best-checkpoint selection; ineligible checkpoints are admitted but ranked strictly below every eligible one. Any other value names one numeric metric: lower is better for `cross_entropy`, higher is better otherwise.
 data.audit_path  [str]
     Path to audit.json produced by audit_dataset.
 data.backend  [str] (choices: png|packed_uint8)
     Frame storage backend.
+data.challenge_index  [str|null]
+    Fixed challenge-set frame index (never part of train/val/test; only consumed by benchmark evaluate).
+data.challenge_metadata  [str|null]
+    Optional challenge-set metadata sidecar.
+data.challenge_packed_index  [str|null]
+    packed_uint8 shard index of the challenge set; required when data.backend=packed_uint8.
+data.challenge_packed_video_index  [str|null]
+    Video-level index of the packed challenge set; falls back to challenge_video_index when unset.
+data.challenge_video_index  [str|null]
+    Challenge-set video-level index.
 data.channels  [int]
     Frame channels (task profile default: 3).
 data.deduplication.level  [str] (choices: none|pair|video)
@@ -127,6 +141,20 @@ data.duplicate_policy.same_label_within_split  [str] (choices: info|warning|erro
     Severity for same-content duplicates within a split.
 data.frame_extensions  [list]
     File extensions accepted as frames during scanning.
+data.hard_negative.enabled  [bool]
+    Mix ordinary and hard negative videos by subtype bucket during sampling (requires metadata_sidecar).
+data.hard_negative.hard_subtypes  [list]
+    Subtype values treated as hard negatives.
+data.hard_negative.max_pairs_per_video  [int|null]
+    Optional cap on how many start positions each video contributes (deterministic first N).
+data.hard_negative.min_videos_per_subtype_bucket  [int]
+    Minimum eligible videos required in a bucket before it is used; smaller buckets fall back to the other bucket.
+data.hard_negative.negative_mix  [dict]
+    Sampling weights per bucket, e.g. {ordinary: 0.5, hard: 0.5}.
+data.hard_negative.ordinary_subtypes  [list]
+    Subtype values treated as ordinary negatives; empty means every subtype not listed in hard_subtypes.
+data.hard_negative.subtype_field  [str]
+    VideoEntry attribute holding the subtype label.
 data.height  [int]
     Frame height in pixels (task profile default: 208).
 data.ignore_directory_names  [list]
@@ -137,8 +165,32 @@ data.ignore_file_globs  [list]
     File globs ignored during scanning.
 data.ignored_example_limit  [int]
     Max example paths kept per ignored-file category.
+data.metadata_sidecar  [str|null]
+    Optional per-video metadata parquet keyed by source_video_uid (negative_subtype, sample_weight). Joined AFTER the split; never part of split/dedup identity (step5 P2).
 data.minimum_pairs_per_game_label_delta  [dict]
     Minimum legal pairs per (game,label) for each delta, e.g. {2: 1}.
+data.mining.enabled  [bool]
+    Enable the hard-negative mining workflow (scan-negatives and --from-mining annotation).
+data.mining.max_samples  [int|null]
+    Optional global cap on mined samples.
+data.mining.output  [str]
+    Output hard_negatives.parquet mining manifest path.
+data.mining.pool_index  [str|null]
+    Frame index of the training-side negative pool to scan.
+data.mining.pool_metadata  [str|null]
+    Optional sidecar of the mining pool (subtype_before).
+data.mining.pool_packed_index  [str|null]
+    packed_uint8 shard index of the mining pool; required when data.backend=packed_uint8.
+data.mining.pool_packed_video_index  [str|null]
+    Video-level index of the packed mining pool; falls back to pool_video_index when unset.
+data.mining.pool_video_index  [str|null]
+    Video-level index of the mining pool.
+data.mining.score_threshold  [float|null]
+    Optional p_positive floor; only negatives at or above it are kept.
+data.mining.top_k_per_video  [int]
+    Max negatives kept per source video (avoids continuous frames drowning the manifest).
+data.mining.version  [int]
+    Mining manifest format version.
 data.packed_max_open_shards  [int]
     LRU limit of simultaneously memmapped packed shards.
 data.prepare_if_missing  [bool]
@@ -162,7 +214,7 @@ data.split.manifest  [str]
 data.split.mode  [str] (choices: off|from_train)
     Split derivation mode: 'off' keeps the legacy three-root index layout; 'from_train' scans source_root once and derives train/val by source video.
 data.split.on_new_groups  [str] (choices: error|extend)
-    Behavior when the dataset fingerprint changes: 'error' refuses to silently re-shuffle, 'extend' keeps existing assignments.
+    Behavior when the dataset fingerprint changes: 'error' refuses to silently re-shuffle, 'extend' keeps every existing assignment and places only the new source videos. A change to seed, val_ratio or target_delta is always an error regardless of this setting.
 data.split.seed  [int]
     Deterministic split seed; the same seed and data produce a byte-identical manifest.
 data.split.small_stratum_policy  [str] (choices: error|warn)
@@ -260,9 +312,9 @@ early_stopping.full_validation_only  [bool]
 early_stopping.min_delta  [float]
     Minimum improvement that counts as an improvement; smaller deltas increment the patience counter.
 early_stopping.mode  [str] (choices: max|min)
-    max: higher monitor values are better; min: lower values.
-early_stopping.monitor  [str] (choices: selection_score|cross_entropy|objective_loss|worst_game_f1_at_decision_threshold|worst_game_f1_tau099)
-    Validation metric watched for improvement.
+    max: higher monitor values are better; min: lower values. Applies only to non-selection monitors (any `monitor` other than `selection_score`/`selection`); `mode: min` combined with a selection monitor is a config error because the selection rank key is always bigger-is-better.
+early_stopping.monitor  [str] (choices: selection_score|selection|cross_entropy|objective_loss|worst_game_f1_at_decision_threshold|worst_game_f1_tau099)
+    Metric or selection contract watched for improvement. `selection_score` (alias `selection`) follows the unified selection contract: improvement is judged by the same ordering as best-checkpoint selection; in constrained mode that is (global_positive_recall, worst_game_positive_recall, -negative_score_p999), with ineligible evaluations counting toward patience rather than resetting it. Any other value names one numeric metric and uses the plain `mode` comparison.
 early_stopping.patience_evaluations  [int]
     Consecutive non-improving full validations tolerated before stopping.
 early_stopping.restore_best  [bool]
@@ -279,6 +331,8 @@ evaluation.full_test_at_end  [bool] (legacy)
     Legacy alias of val_full_at_end; migrated automatically.
 evaluation.full_test_every_steps  [int] (legacy)
     Legacy alias of val_full_every_steps; migrated automatically.
+evaluation.group_by_negative_subtype  [bool]
+    Add a game_label_subtype group catalog to evaluation and compute worst-subtype FPR/recall metrics (requires sidecar metadata with non-null negative_subtype).
 evaluation.html_max_errors_per_group  [int]
     Per-group error cap in the HTML report.
 evaluation.max_fpr_for_recall  [float]
@@ -287,6 +341,8 @@ evaluation.max_global_fpr  [float|null]
     Constrained selection: reject candidates whose global FPR at the decision threshold exceeds this (null disables the gate).
 evaluation.max_worst_game_fpr  [float|null]
     Constrained selection: reject candidates whose worst-game FPR exceeds this (null disables).
+evaluation.max_worst_subtype_fpr  [float|null]
+    Constrained selection: reject candidates whose worst negative-subtype FPR exceeds this (null disables).
 evaluation.min_positive_recall  [float|null]
     Constrained selection: require global positive recall at or above this (null disables).
 evaluation.minimum_worst_game_f1  [float|null]
@@ -331,6 +387,16 @@ experiment.run_mode  [str] (choices: fixed|unique)
     fixed: write directly into output_dir (legacy). unique: allocate an immutable timestamped run directory under output_dir.
 experiment.seed  [int]
     Base RNG seed; each rank adds its rank id.
+export.format  [str] (choices: weights|onnx)
+    Default export format (weights|onnx).
+export.include_threshold  [bool]
+    Embed decision.threshold in the exported manifest.
+export.onnx_opset  [int]
+    ONNX opset version for --format onnx.
+export.output_dir  [str]
+    Directory for exported artifacts.
+export.verify_samples  [int]
+    Random sample tensors used to verify ONNX vs PyTorch.
 loss.cross_entropy_weight  [float]
     Weight of the CE component.
 loss.label_smoothing  [float]
@@ -377,6 +443,8 @@ model.require_pretrained_backbone  [bool]
     Fail unless every non-cls weight is fully loaded from the base checkpoint.
 model.trainable_name_contains  [str]
     Substring selecting trainable parameters (task profile default: cls).
+model.trainable_rules  [dict]
+    Staged partial unfreeze: dict keyed by rule name, each rule {pattern, lr_scale, unfreeze_at_step, priority}. When absent, trainable_name_contains is used (legacy behavior).
 optimizer.learning_rate  [float]
     Peak AdamW learning rate.
 optimizer.weight_decay  [float]

@@ -13,26 +13,29 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 from game_cls.cli.common import _resolve_run_dir
 from game_cls.cli.evaluate import _resolve_checkpoint_state
 
 
-def _build_pool_loader(config, index: str, video_index: str, batch_size: int):
-    from torch.utils.data import DataLoader
+def _reject_multi_process(command: str) -> str | None:
+    """Return an error message when this command was launched under torchrun.
 
-    from game_cls.data.collate import pair_collate
-    from game_cls.data.lazy_pair_dataset import build_eval_dataset
-    from game_cls.data.video_index import read_video_entries_parquet
+    Both benchmark subcommands score the whole pool on one process and write a
+    single report/manifest. Under ``torchrun --nproc_per_node=N`` every rank
+    would redo the identical full scan and then race on the same output path,
+    so refuse instead of producing a corrupted file.
+    """
+    import os
 
-    test_delta = int(config["pair"]["test_delta"])
-    videos = read_video_entries_parquet(video_index, (test_delta,))
-    dataset: Any = build_eval_dataset(videos, test_delta, rank=0, world_size=1)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        collate_fn=pair_collate,
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    if world_size <= 1:
+        return None
+    rank = os.environ.get("RANK", "?")
+    return (
+        f"benchmark {command} is single-process only, but WORLD_SIZE="
+        f"{world_size} (RANK={rank}). Every rank would rescan the entire pool "
+        "and race on the same output file. Run it without torchrun."
     )
 
 
@@ -45,6 +48,7 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
         cleanup_distributed,
         initialize_runtime,
     )
+    from game_cls.engine.training.loaders import build_external_pool_loader
     from game_cls.model.builder import build_model
     from game_cls.reports.benchmark import (
         scan_negative_pool,
@@ -66,9 +70,20 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
         for problem in exc.problems:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
-    mining = config["data"].get("mining") or {}
-    pool_index = mining.get("pool_index") or args.pool_index
-    pool_video_index = mining.get("pool_video_index") or args.pool_video_index
+    guard = _reject_multi_process("scan-negatives")
+    if guard:
+        print(guard, file=sys.stderr)
+        return 2
+    mining = dict(config["data"].get("mining") or {})
+    # CLI overrides win over the resolved config, then flow through the shared
+    # constructor so the packed/sidecar handling applies to them too.
+    if args.pool_index:
+        mining["pool_index"] = args.pool_index
+    if args.pool_video_index:
+        mining["pool_video_index"] = args.pool_video_index
+    config["data"]["mining"] = mining
+    pool_index = mining.get("pool_index")
+    pool_video_index = mining.get("pool_video_index")
     pool_metadata = mining.get("pool_metadata")
     mining_version = int(mining.get("version", 1))
     mining_enabled = bool(mining.get("enabled", False))
@@ -97,12 +112,7 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
                 "note: data.mining.enabled=false; running the scan explicitly.",
                 file=sys.stderr,
             )
-        loader = _build_pool_loader(
-            config,
-            pool_index,
-            pool_video_index,
-            int(config["train"]["local_batch_size"]),
-        )
+        loader, _ = build_external_pool_loader(config, pool="mining")
         rows = scan_negative_pool(
             unwrap_model(model),
             loader,
@@ -185,8 +195,13 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         initialize_runtime,
     )
     from game_cls.engine.evaluator import evaluate
+    from game_cls.engine.training.loaders import build_external_pool_loader
     from game_cls.model.builder import build_model
-    from game_cls.reports.benchmark import check_gates, write_benchmark_report
+    from game_cls.reports.benchmark import (
+        check_gates,
+        validate_gate_metrics,
+        write_benchmark_report,
+    )
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
     config_source = args.config or str(run_dir / "resolved_config.json")
@@ -201,6 +216,20 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         config = load_config(config_source)
     except ConfigSchemaError as exc:
         for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    guard = _reject_multi_process("evaluate")
+    if guard:
+        print(guard, file=sys.stderr)
+        return 2
+    gate_metrics = config["benchmark"].get("gate_metrics") or {}
+    # Check the gate contract BEFORE scoring the challenge set: a typo'd
+    # metric name or an unknown operator must not cost a full evaluation pass
+    # and then surface as "metric absent". load_config already validates a
+    # fresh config, but an older run's resolved_config.json predates that.
+    gate_problems = validate_gate_metrics(gate_metrics)
+    if gate_problems:
+        for problem in gate_problems:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
     challenge_index = config["data"].get("challenge_index")
@@ -226,12 +255,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         model = build_model(config["model"])
         unwrap_model(model).load_state_dict(state_dict, strict=True)
         model.to(device)
-        loader = _build_pool_loader(
-            config,
-            challenge_index,
-            challenge_video_index,
-            int(config["train"]["local_batch_size"]),
-        )
+        loader, _ = build_external_pool_loader(config, pool="challenge")
         evaluation_cfg = config["evaluation"]
         result = evaluate(
             unwrap_model(model),
@@ -272,7 +296,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         )
         distributed_barrier()
         metrics = dict(result.metrics or {})
-        gates = check_gates(metrics, config["benchmark"].get("gate_metrics") or {})
+        gates = check_gates(metrics, gate_metrics)
         report_path = write_benchmark_report(
             Path(config["benchmark"].get("output_dir", "benchmarks")),
             run_id=run_dir.name,
@@ -280,6 +304,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             metrics=metrics,
             gates=gates,
             grouped_metrics=result.grouped_metrics,
+            gate_metrics=gate_metrics,
         )
         print(f"challenge_metadata: {challenge_metadata}", file=sys.stderr)
         unmet = [name for name, passed, _ in gates if not passed]

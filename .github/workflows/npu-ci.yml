@@ -1,56 +1,205 @@
 name: NPU acceptance (self-hosted)
 
-# Real-Ascend gate (step4 P0-4). Requires an internal self-hosted runner
-# tagged [self-hosted, npu] with the CANN + torch + torch_npu environment
-# matching this repo's expected stack. This workflow cannot run on
-# GitHub-hosted runners and is intentionally dispatch-only so it never
-# blocks ordinary CPU PRs.
+# Real-Ascend gate (step4 P0-4, step6 P0-4). Requires an internal
+# self-hosted runner tagged [self-hosted, npu] with the CANN + torch +
+# torch_npu environment matching this repo's expected stack. This workflow
+# cannot run on GitHub-hosted runners.
+#
+# Two tiers, because they answer different questions:
+#
+#   preflight  - synthetic data only. Any Ascend runner can pass it, so a
+#                failure means the NPU stack itself (operators, BF16, HCCL,
+#                DDP, save/resume) is broken. This is the repeatable gate.
+#   production - real indexes and checkpoints. Only a provisioned runner can
+#                pass it, so each job first asserts its prerequisites and
+#                names the missing path instead of dying on a FileNotFound
+#                halfway through training.
+#
+# Dispatch-only for the production tier so it never blocks ordinary CPU PRs;
+# the preflight also runs weekly so the stack cannot rot unnoticed between
+# manual runs.
 
 on:
   workflow_dispatch:
     inputs:
       max_steps:
-        description: "Smoke training steps"
+        description: "Smoke training steps for the production jobs"
         required: false
         default: "100"
+      run_production:
+        description: "Run the data-dependent 1P/8P jobs (needs a provisioned runner)"
+        required: false
+        default: "true"
+  schedule:
+    # Preflight only: run_production is unset on a schedule.
+    - cron: "43 18 * * 0"
+
+concurrency:
+  # One NPU run at a time -- the jobs share the runner's devices, and two
+  # concurrent 8P runs would fight over all eight of them.
+  group: npu-acceptance
+  cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------- preflight
   device-ops:
+    name: preflight / device operators
     runs-on: [self-hosted, npu]
     steps:
       - uses: actions/checkout@v4
       - name: Install package (do not replace torch/torch_npu)
-        run: python -m pip install -e .
+        # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
+        run: python -m pip install -e . --no-deps
+      - name: Report the NPU stack
+        run: |
+          python - <<'PY'
+          import torch, torch_npu
+          print("torch", torch.__version__)
+          print("torch_npu", torch_npu.__version__)
+          print("npu available", torch.npu.is_available())
+          print("device count", torch.npu.device_count())
+          PY
       - name: Device operator probe (bincount/scatter_add_/nonzero/index_select/GradScaler)
         run: python tools/check_npu_ops.py
+      - name: Doctor on the synthetic config
+        run: cls-trainer doctor --config configs/npu_synthetic_smoke.yaml
 
-  npu-1p:
+  preflight-1p:
+    name: preflight / 1P synthetic
     runs-on: [self-hosted, npu]
+    needs: device-ops
     steps:
       - uses: actions/checkout@v4
       - name: Install package (do not replace torch/torch_npu)
-        run: python -m pip install -e .
-      - name: 1P staged smoke (forward/backward/BF16/eval/save+resume)
+        # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
+        run: python -m pip install -e . --no-deps
+      - name: 1P synthetic train + eval + checkpoint
         run: |
-          bash scripts/smoke_npu_1p.sh
+          set -euo pipefail
+          unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
+          export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
+          python -u tools/train.py --run-mode fixed \
+            --config configs/npu_synthetic_smoke.yaml \
+            experiment.output_dir=runs/npu_preflight_1p
+      - name: 1P synthetic resume from the saved checkpoint
+        run: |
+          set -euo pipefail
+          unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
+          export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
+          checkpoint=$(ls -t runs/npu_preflight_1p/*/checkpoints/checkpoint_last.pth | head -1)
+          echo "resuming from ${checkpoint}"
+          python -u tools/train.py --run-mode fixed \
+            --config configs/npu_synthetic_smoke.yaml \
+            train.max_steps=30 \
+            train.steps_per_epoch=30 \
+            train.resume_path="${checkpoint}" \
+            experiment.output_dir=runs/npu_preflight_1p_resume
+      - name: Upload preflight artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-preflight-1p
+          path: |
+            runs/npu_preflight_1p/**/*.json
+            runs/npu_preflight_1p/**/*.log
+            runs/npu_preflight_1p_resume/**/*.json
+            runs/npu_preflight_1p_resume/**/*.log
+          if-no-files-found: warn
+
+  preflight-8p:
+    name: preflight / 8P synthetic HCCL
+    runs-on: [self-hosted, npu]
+    needs: preflight-1p
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install package (do not replace torch/torch_npu)
+        # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
+        run: python -m pip install -e . --no-deps
+      - name: 8P synthetic HCCL (DDP / group metric reduction / checkpoint)
+        run: |
+          set -euo pipefail
+          torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+            tools/train.py --run-mode fixed \
+            --config configs/npu_synthetic_smoke.yaml \
+            distributed.enabled=true \
+            distributed.backend=hccl \
+            train.max_steps=40 \
+            train.steps_per_epoch=40 \
+            experiment.output_dir=runs/npu_preflight_8p
+      - name: Upload preflight artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-preflight-8p
+          path: |
+            runs/npu_preflight_8p/**/*.json
+            runs/npu_preflight_8p/**/*.log
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------- production
+  npu-1p:
+    name: production / 1P
+    runs-on: [self-hosted, npu]
+    needs: preflight-8p
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_production == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install package (do not replace torch/torch_npu)
+        # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
+        run: python -m pip install -e . --no-deps
+      - name: Assert the runner is provisioned
+        # doctor already FAILs on a missing index / audit / checkpoint, so it
+        # names the missing path before any training starts.
+        run: cls-trainer doctor --config configs/npu_1p.yaml
+      - name: 1P staged smoke (forward/backward/BF16/eval/save+resume)
+        run: bash scripts/smoke_npu_1p.sh
       - name: 1P full training smoke
         run: |
           python tools/train.py --config configs/npu_1p.yaml \
             train.max_steps=${{ github.event.inputs.max_steps }} \
             experiment.output_dir=runs/npu_ci_1p
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-ci-1p
+          path: |
+            runs/npu_ci_1p/**/*.json
+            runs/npu_ci_1p/**/*.csv
+            runs/npu_ci_1p/**/*.log
+          if-no-files-found: warn
 
   npu-8p:
+    name: production / 8P
     runs-on: [self-hosted, npu]
+    needs: npu-1p
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_production == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install package (do not replace torch/torch_npu)
-        run: python -m pip install -e .
+        # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
+        run: python -m pip install -e . --no-deps
+      - name: Assert the runner is provisioned
+        run: cls-trainer doctor --config configs/npu_8p.yaml
       - name: 8P HCCL smoke (DDP / group metrics / checkpoint)
-        run: |
-          bash scripts/smoke_npu_8p.sh
+        run: bash scripts/smoke_npu_8p.sh
       - name: 8P full training smoke
         run: |
           torchrun --standalone --nnodes=1 --nproc_per_node=8 \
             tools/train.py --config configs/npu_8p.yaml \
             train.max_steps=${{ github.event.inputs.max_steps }} \
             experiment.output_dir=runs/npu_ci_8p
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-ci-8p
+          path: |
+            runs/npu_ci_8p/**/*.json
+            runs/npu_ci_8p/**/*.csv
+            runs/npu_ci_8p/**/*.log
+          if-no-files-found: warn

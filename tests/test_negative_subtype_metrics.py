@@ -48,10 +48,12 @@ class SubtypeMetricHelpersTests(unittest.TestCase):
 
     def test_subtype_negative_counts(self) -> None:
         counters = {("A", 0, "x"): [1, 2, 3, 4], ("A", 0, "y"): [0, 5, 0, 5]}
-        self.assertEqual(
-            _subtype_negative_counts(counters),
-            {("A", 0, "x"): 6, ("A", 0, "y"): 10},
-        )
+        counts = _subtype_negative_counts(counters)
+        self.assertEqual(counts, {"A::0::x": 6, "A::0::y": 10})
+        # This dict ships inside the metrics payload that gets json.dumps'd.
+        import json
+
+        json.dumps(counts)
 
     def test_build_subtype_group_skips_zero_rows(self) -> None:
         catalogs = {

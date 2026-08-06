@@ -52,9 +52,7 @@ def main() -> None:
                 data_config.get("require_content_hash_audit", False)
             ),
             require_unique_video_keys=bool(
-                data_config.get(
-                    "require_unique_video_keys_across_splits", False
-                )
+                data_config.get("require_unique_video_keys_across_splits", False)
             ),
             minimum_pairs_per_game_label_delta={
                 int(key): int(value)

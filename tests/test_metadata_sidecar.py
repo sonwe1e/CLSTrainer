@@ -13,6 +13,7 @@ from pathlib import Path
 
 from game_cls.data.sidecar import (
     apply_sidecar,
+    check_hard_negative_readiness,
     read_metadata_sidecar,
     validate_sidecar_against_index,
     write_metadata_sidecar,
@@ -86,6 +87,107 @@ class MetadataSidecarTests(unittest.TestCase):
             by_uid = {video.source_video_uid: video for video in applied}
             self.assertEqual(by_uid["A::01"].sample_weight, 0.5)
             self.assertEqual(by_uid["A::02"].sample_weight, 1.0)
+
+
+class HardNegativeReadinessTests(unittest.TestCase):
+    """``read_metadata_sidecar`` treats a missing file as 'no metadata', which
+    is right for an optional sidecar and a trap for hard_negative.enabled: the
+    hard bucket would be empty and training would silently run plain negative
+    sampling. This is the filesystem half of the contract."""
+
+    def _config(self, path, **hard_negative) -> dict:
+        base = {
+            "enabled": True,
+            "subtype_field": "negative_subtype",
+            "hard_subtypes": ["wooden_bridge"],
+            "ordinary_subtypes": [],
+            "negative_mix": {"ordinary": 0.5, "hard": 0.5},
+            "min_videos_per_subtype_bucket": 1,
+        }
+        base.update(hard_negative)
+        return {
+            "data": {
+                "metadata_sidecar": None if path is None else str(path),
+                "hard_negative": base,
+            }
+        }
+
+    def test_disabled_reports_nothing(self) -> None:
+        config = self._config("does/not/exist.parquet", enabled=False)
+        self.assertEqual(check_hard_negative_readiness(config), [])
+
+    def test_missing_sidecar_file_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "not_exists.parquet"
+            problems = check_hard_negative_readiness(self._config(path))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("does not exist", problems[0])
+            self.assertIn("silently degrade", problems[0])
+
+    def test_unset_sidecar_is_reported(self) -> None:
+        problems = check_hard_negative_readiness(self._config(None))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("metadata_sidecar", problems[0])
+
+    def test_sidecar_without_hard_subtype_rows_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meta.parquet"
+            write_metadata_sidecar(
+                [
+                    {"source_video_uid": "A::01", "negative_subtype": "flat_floor"},
+                    {"source_video_uid": "A::02", "negative_subtype": "flat_floor"},
+                ],
+                path,
+            )
+            problems = check_hard_negative_readiness(self._config(path))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("no video whose negative_subtype", problems[0])
+            # The message must name what IS there, so the operator can fix the
+            # config without opening the parquet.
+            self.assertIn("flat_floor", problems[0])
+            self.assertIn("sidecar rows: 2", problems[0])
+
+    def test_ready_sidecar_reports_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meta.parquet"
+            write_metadata_sidecar(
+                [
+                    {"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"},
+                    {"source_video_uid": "A::02", "negative_subtype": "flat_floor"},
+                ],
+                path,
+            )
+            self.assertEqual(check_hard_negative_readiness(self._config(path)), [])
+
+    def test_empty_hard_subtypes_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meta.parquet"
+            write_metadata_sidecar(
+                [{"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"}],
+                path,
+            )
+            problems = check_hard_negative_readiness(
+                self._config(path, hard_subtypes=[])
+            )
+            self.assertEqual(len(problems), 1)
+            self.assertIn("hard_subtypes", problems[0])
+
+    def test_unpopulated_subtype_field_is_reported(self) -> None:
+        # apply_sidecar only ever writes negative_subtype / sample_weight, so
+        # any other field reads None for every video and the hard bucket stays
+        # empty no matter how well the sidecar is populated.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meta.parquet"
+            write_metadata_sidecar(
+                [{"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"}],
+                path,
+            )
+            problems = check_hard_negative_readiness(
+                self._config(path, subtype_field="difficulty")
+            )
+            self.assertEqual(len(problems), 1)
+            self.assertIn("difficulty", problems[0])
+            self.assertIn("never", problems[0])
 
 
 if __name__ == "__main__":

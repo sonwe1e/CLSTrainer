@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -141,6 +143,93 @@ class RunToolsTests(unittest.TestCase):
             )
             self.assertIn("TensorBoard events written", export_output)
             self.assertTrue(list(tb_out.glob("events.out.tfevents.*")))
+
+    def test_compare_and_show_surface_the_selection_contract(self) -> None:
+        """step6: compare must show eligibility, worst-game recall and p99.9.
+
+        Two runs are written by hand with the *same* ``selection_score`` and
+        different eligibility / tie-breakers, so any renderer that only prints
+        the scalar produces two identical rows.
+        """
+        from game_cls.cli import main
+
+        def write_run(run_dir: Path, *, eligible: bool, worst_recall: float) -> None:
+            (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+            (run_dir / "status.json").write_text(
+                json.dumps({"state": "SUCCEEDED", "step": 20}), encoding="utf-8"
+            )
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"run_id": run_dir.name, "run_name": run_dir.name}),
+                encoding="utf-8",
+            )
+            (run_dir / "resolved_config.json").write_text(
+                json.dumps({"evaluation": {"selection_mode": "constrained"}}),
+                encoding="utf-8",
+            )
+            (run_dir / "training_summary.json").write_text(
+                json.dumps(
+                    {
+                        "best_observed_dev_test_metrics": {
+                            "selection_score": 0.91,
+                            "selection_mode": "constrained",
+                            "selection_eligible": eligible,
+                            "global_positive_recall_at_decision_threshold": 0.91,
+                            "worst_game_positive_recall_at_decision_threshold": (
+                                worst_recall
+                            ),
+                            "negative_score_p999": -2.5,
+                            "global_fpr_at_decision_threshold": 0.004,
+                            "worst_game_fpr_at_decision_threshold": 0.011,
+                        },
+                        "topk_checkpoints": [
+                            {
+                                "step": 20,
+                                "value": 0.91,
+                                "eligible": eligible,
+                                "monitor": "selection_score",
+                                "tag": "topk_00000020",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runs_root"
+            run_a = root / "2026-08-06" / "run-a"
+            run_b = root / "2026-08-06" / "run-b"
+            write_run(run_a, eligible=True, worst_recall=0.83)
+            write_run(run_b, eligible=False, worst_recall=0.41)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = main(
+                    ["run", "compare", str(run_a), str(run_b), "--root", str(root)]
+                )
+            self.assertEqual(code, 0)
+            output = buffer.getvalue()
+            self.assertIn("selection_eligible=true", output)
+            self.assertIn("selection_eligible=false", output)
+            self.assertIn("Selection contract", output)
+            self.assertIn(
+                "worst_game_positive_recall_at_decision_threshold=0.8300", output
+            )
+            self.assertIn(
+                "worst_game_positive_recall_at_decision_threshold=0.4100", output
+            )
+            self.assertIn("negative_score_p999=-2.5000", output)
+            self.assertIn("global_fpr_at_decision_threshold=0.0040", output)
+
+            # `run show` flags an ineligible topk entry rather than presenting
+            # it as a deployable checkpoint.
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = main(["run", "show", str(run_b), "--root", str(root)])
+            self.assertEqual(code, 0)
+            shown = buffer.getvalue()
+            self.assertIn("selection    : mode=constrained eligible=false", shown)
+            self.assertIn("(ineligible)", shown)
 
     def test_resume_refuses_critical_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -128,6 +128,187 @@ class HardNegativeSamplerTests(unittest.TestCase):
         self.assertTrue(sampled_negatives)
         self.assertNotIn("missing", sampled_negatives)
 
+    def test_bucket_summary_counts_videos_and_legal_pairs(self) -> None:
+        videos = _videos()
+        sampler = _sampler(
+            videos,
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["wooden_bridge"],
+            ordinary_subtypes=[],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+        )
+        summary = sampler.subtype_bucket_summary()
+        self.assertTrue(summary["enabled"])
+        # One "01" video per game is wooden_bridge -> 3 hard videos; the other
+        # two negatives per game are ordinary -> 6 ordinary videos.
+        self.assertEqual(summary["buckets"]["hard"]["videos"], 3)
+        self.assertEqual(summary["buckets"]["ordinary"]["videos"], 6)
+        # Legal pairs are the eligible start positions summed over deltas
+        # (6 frames -> 5+4+3 = 12 starts per video for deltas 1/2/3).
+        self.assertEqual(summary["buckets"]["hard"]["legal_pairs"], 3 * 12)
+        self.assertEqual(summary["buckets"]["ordinary"]["legal_pairs"], 6 * 12)
+        self.assertEqual(sorted(summary["by_game"]), ["A", "B", "C"])
+        # Per-game counts are DISTINCT videos, not (game, delta) cell sums:
+        # game A has exactly one wooden_bridge video, reachable at 3 deltas.
+        self.assertEqual(summary["by_game"]["A"]["hard"]["videos"], 1)
+        self.assertEqual(summary["by_game"]["A"]["hard"]["legal_pairs"], 12)
+        self.assertEqual(summary["by_game"]["A"]["ordinary"]["videos"], 2)
+        self.assertEqual(summary["excluded_videos"], 0)
+        self.assertEqual(summary["undersized_cells"], [])
+
+    def test_bucket_summary_legal_pairs_follow_max_pairs_per_video(self) -> None:
+        # The cap is applied to the videos the sampler holds, so the reported
+        # pair counts must be the post-cap ones a human can act on.
+        videos = _videos()
+        sampler = _sampler(
+            videos,
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["wooden_bridge"],
+            ordinary_subtypes=[],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+            max_pairs_per_video=1,
+        )
+        summary = sampler.subtype_bucket_summary()
+        self.assertEqual(summary["buckets"]["hard"]["videos"], 3)
+        self.assertEqual(summary["buckets"]["hard"]["legal_pairs"], 3 * 3)
+
+    def test_bucket_summary_reports_empty_hard_bucket(self) -> None:
+        videos = _videos()
+        sampler = _sampler(
+            videos,
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["missing"],
+            ordinary_subtypes=[],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+        )
+        summary = sampler.subtype_bucket_summary()
+        self.assertEqual(summary["buckets"]["hard"]["videos"], 0)
+        self.assertEqual(summary["buckets"]["hard"]["legal_pairs"], 0)
+        # Every (game, delta) hard cell is under the minimum, i.e. every cell
+        # takes the silent fallback -- that must be visible.
+        self.assertTrue(summary["undersized_cells"])
+        self.assertTrue(
+            all(cell["bucket"] == "hard" for cell in summary["undersized_cells"])
+        )
+
+    def test_bucket_summary_counts_videos_excluded_by_ordinary_subtypes(self) -> None:
+        videos = _videos()
+        sampler = _sampler(
+            videos,
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["wooden_bridge"],
+            # Explicit ordinary list drops "03" (untyped) from both buckets.
+            ordinary_subtypes=["flat_floor"],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+        )
+        summary = sampler.subtype_bucket_summary()
+        self.assertEqual(summary["buckets"]["ordinary"]["videos"], 3)
+        self.assertEqual(summary["excluded_videos"], 3)
+
+    def test_bucket_summary_is_disabled_when_the_feature_is(self) -> None:
+        summary = _sampler(_videos(), seed=11).subtype_bucket_summary()
+        self.assertEqual(summary, {"enabled": False})
+
+    def test_startup_refuses_a_globally_empty_hard_bucket(self) -> None:
+        from game_cls.engine.training.loaders import (
+            _require_non_degenerate_hard_negatives,
+        )
+
+        videos = _videos()
+        degenerate = _sampler(
+            videos,
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["missing"],
+            ordinary_subtypes=[],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            _require_non_degenerate_hard_negatives(degenerate.subtype_bucket_summary())
+        message = str(caught.exception)
+        self.assertIn("hard bucket is empty", message)
+        self.assertIn("hard_subtypes", message)
+        healthy = _sampler(
+            videos,
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["wooden_bridge"],
+            ordinary_subtypes=[],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+        )
+        _require_non_degenerate_hard_negatives(healthy.subtype_bucket_summary())
+        # Disabled configs must not be refused.
+        _require_non_degenerate_hard_negatives({"enabled": False})
+
+    def test_startup_log_prints_videos_and_legal_pairs(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        from game_cls.engine.training.loaders import _log_hard_negative_buckets
+
+        sampler = _sampler(
+            _videos(),
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["wooden_bridge"],
+            ordinary_subtypes=["flat_floor"],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=2,
+        )
+        summary = sampler.subtype_bucket_summary()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            _log_hard_negative_buckets(summary, 0)
+        text = buffer.getvalue()
+        self.assertIn("hard=3 videos/36 legal pairs", text)
+        self.assertIn("ordinary=3 videos/36 legal pairs", text)
+        # One video per bucket per game, 12 start positions across 3 deltas.
+        self.assertIn("game A: hard=1 videos/12 legal pairs", text)
+        # min_videos_per_subtype_bucket=2 with 1 video per (game, delta) cell:
+        # every cell borrows, and the excluded untyped negatives are named.
+        self.assertIn("min_videos_per_subtype_bucket=2", text)
+        self.assertIn("borrow from the other bucket", text)
+        self.assertIn("excluded from negative sampling", text)
+
+    def test_startup_log_is_silent_off_rank_zero_and_when_disabled(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        from game_cls.engine.training.loaders import _log_hard_negative_buckets
+
+        sampler = _sampler(
+            _videos(),
+            seed=11,
+            enabled=True,
+            subtype_field="negative_subtype",
+            hard_subtypes=["wooden_bridge"],
+            ordinary_subtypes=[],
+            negative_mix={"ordinary": 0.5, "hard": 0.5},
+            min_videos_per_subtype_bucket=1,
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            _log_hard_negative_buckets(sampler.subtype_bucket_summary(), 1)
+            _log_hard_negative_buckets({"enabled": False}, 0)
+        self.assertEqual(buffer.getvalue(), "")
+
     def test_max_pairs_per_video_caps_start_positions(self) -> None:
         videos = _videos()
         # Videos have 3 delta=2 start positions; the cap keeps only the

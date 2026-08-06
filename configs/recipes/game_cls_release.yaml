@@ -1,0 +1,166 @@
+# Release recipe template: everything the production template leaves off.
+#
+# Adds, on top of configs/recipes/game_cls_production.yaml:
+#   * data.metadata_sidecar + data.hard_negative  (subtype-aware negatives)
+#   * model.trainable_rules                       (staged partial unfreeze)
+#   * benchmark.gate_metrics                      (explicit release gates)
+#
+# Fill the REPLACE_ME fields, then:
+#
+#   cls-trainer config validate --config configs/recipes/game_cls_release.yaml --release
+#   cls-trainer doctor          --config configs/recipes/game_cls_release.yaml
+#   cls-trainer train           --config configs/recipes/game_cls_release.yaml
+#   cls-trainer benchmark evaluate --config configs/recipes/game_cls_release.yaml \
+#       --checkpoint runs/game_cls_release/<run>/model_best_selection.pth
+#   cls-trainer config validate --config configs/recipes/game_cls_release.yaml --release
+#
+# `config validate --release` before training tells you the gate contract is
+# well-formed; the same command after `benchmark evaluate` re-judges the newest
+# report against those gates, so the release decision is not a human reading
+# numbers off a terminal.
+profile: npu_8p
+
+presets:
+  augmentation: standard
+  dataloader: stable
+  evaluation: production
+
+experiment:
+  name: game_cls_release
+  seed: 20260806
+  output_dir: runs/game_cls_release
+
+model:
+  factory: REPLACE_ME_PACKAGE.module:build_model
+  checkpoint_path: REPLACE_ME/path/to/base_model.pt
+  # Staged partial unfreeze: the head trains from step 0, the last backbone
+  # stage joins at 4000 steps with a 10x smaller learning rate. Stages open in
+  # `priority` order when two rules match the same parameter (lowest wins).
+  # Keep unfreeze_at_step well past early_stopping.burn_in_steps so the plateau
+  # detector never fires on a stage boundary.
+  trainable_rules:
+    cls_head:
+      pattern: "cls"
+      lr_scale: 1.0
+      unfreeze_at_step: 0
+      priority: 0
+    backbone_late:
+      pattern: "layer4"
+      lr_scale: 0.1
+      unfreeze_at_step: 4000
+      priority: 1
+
+data:
+  prepare_if_missing: false
+  synthetic: false
+  require_content_hash_audit: true
+  require_unique_video_keys_across_splits: true
+  require_independent_test: true
+  minimum_pairs_per_game_label_delta: {2: 1}
+  audit_path: indexes/audit.json
+  train_video_index: indexes/train_video_entries.parquet
+  val_video_index: indexes/val_video_entries.parquet
+  test_video_index: indexes/test_video_entries.parquet
+  train_index: indexes/train_frames.parquet
+  val_index: indexes/val_frames.parquet
+  test_index: indexes/test_frames.parquet
+  backend: png
+  frame_extensions: [".png"]
+  # Per-video metadata joined AFTER the split (never part of split identity):
+  # source_video_uid -> negative_subtype / sample_weight. Build it with
+  #   cls-trainer dataset annotate --config <this file>
+  # The file must exist and must carry at least one hard_subtypes row before
+  # training starts; hard_negative.enabled refuses to launch otherwise instead
+  # of quietly degrading to plain negative sampling.
+  metadata_sidecar: REPLACE_ME/indexes/video_metadata.parquet
+  hard_negative:
+    enabled: true
+    subtype_field: negative_subtype
+    # REPLACE_ME: the negative_subtype values your sidecar actually contains.
+    # `cls-trainer config validate` lists the subtypes it found when none of
+    # these match.
+    hard_subtypes: ["near_miss", "same_scene"]
+    ordinary_subtypes: []
+    negative_mix: {ordinary: 0.6, hard: 0.4}
+    max_pairs_per_video: 64
+    # Games whose hard bucket holds fewer videos than this fall back to their
+    # ordinary bucket; the startup log names every such cell.
+    min_videos_per_subtype_bucket: 2
+
+  # Challenge set for `benchmark evaluate` (the gates below are judged on it).
+  challenge_index: REPLACE_ME/indexes/challenge_frames.parquet
+  challenge_video_index: REPLACE_ME/indexes/challenge_video_entries.parquet
+
+pair:
+  train_delta_probability: {1: 0.15, 2: 0.70, 3: 0.15}
+
+sampler:
+  game_alpha: 0.25
+  class_probability: {0: 0.5, 1: 0.5}
+  deduplicate_within_global_batch: true
+
+optimizer:
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+scheduler:
+  warmup_steps: 500
+  min_learning_rate: 0.00001
+
+train:
+  epochs: 20
+  steps_per_epoch: 1000
+  max_steps: 20000
+  local_batch_size: 64
+  gradient_clip_norm: 5.0
+  log_every_steps: 50
+
+evaluation:
+  selection_mode: constrained
+  max_global_fpr: 0.01
+  max_worst_game_fpr: 0.02
+  min_positive_recall: 0.8
+  max_fpr_for_recall: 0.01
+  tail_calibration_enabled: true
+  minimum_worst_game_f1: 0.75
+
+checkpoint:
+  save_last_every_steps: 1000
+  save_best_selection: true
+  save_best_val_loss: true
+  save_best_worst_game: true
+  save_topk: 3
+  topk_monitor: selection_score
+  periodic_state_mode: trainable_only
+  full_model_every_steps: 5000
+
+early_stopping:
+  enabled: true
+  full_validation_only: true
+  burn_in_steps: 6000
+  patience_evaluations: 3
+  min_delta: 0.001
+  restore_best: true
+
+# Release gates, one entry per metric name the evaluator emits, each with an
+# explicit comparison operator so nothing depends on guessing a direction from
+# the name. Unknown metric names and unknown operators are config errors, so a
+# typo fails `config validate` instead of reading "metric absent" after a full
+# benchmark pass.
+benchmark:
+  output_dir: benchmarks
+  gate_metrics:
+    # False positives are the business constraint: at most 1% overall, and no
+    # single game worse than 2%.
+    global_fpr_at_decision_threshold: {op: "<=", value: 0.01}
+    worst_game_fpr_at_decision_threshold: {op: "<=", value: 0.02}
+    # Usefulness floor under that constraint.
+    global_positive_recall_at_decision_threshold: {op: ">=", value: 0.80}
+    worst_game_positive_recall_at_decision_threshold: {op: ">=", value: 0.65}
+    worst_game_f1_at_decision_threshold: {op: ">=", value: 0.75}
+    # Calibration: the 0.99 threshold only means something if the tail is
+    # calibrated, and the hardest negatives must stay away from it.
+    ece_tail_95_100: {op: "<=", value: 0.05}
+    negative_score_p999: {op: "<", value: 0.99}
+    # Guard against judging a release on a truncated challenge set.
+    sample_count: {op: ">=", value: 2000}

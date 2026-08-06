@@ -234,6 +234,110 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
     }
 
 
+def _warn_subtype_grouping_unavailable(
+    rank: int,
+    subtype_grouping: bool,
+    max_worst_subtype_fpr: Any,
+    reason: str,
+) -> None:
+    """Warn when subtype grouping was asked for but cannot be produced.
+
+    Without a ``game_label_subtype`` catalog the evaluator reports
+    ``worst_subtype_fpr_at_decision_threshold=None``, and constrained
+    selection treats that as INELIGIBLE -- so a run configured with
+    ``evaluation.max_worst_subtype_fpr`` would silently never select a best
+    checkpoint. Say so at setup instead of at the end of training.
+    """
+    if not subtype_grouping or rank != 0:
+        return
+    message = (
+        "[WARNING] evaluation.group_by_negative_subtype is enabled but no "
+        f"subtype grouping is available: {reason}. Subtype metrics will be "
+        "reported as null."
+    )
+    if max_worst_subtype_fpr is not None:
+        message += (
+            " evaluation.max_worst_subtype_fpr is also set, so constrained "
+            "selection will reject EVERY checkpoint and no best checkpoint "
+            "will be written."
+        )
+    print(message, flush=True)
+
+
+def _log_hard_negative_buckets(summary: dict, rank: int) -> None:
+    """Print per-bucket video and legal-pair counts at startup.
+
+    A human must be able to read "hard bucket has 3 videos, 12 legal pairs"
+    on the first lines of a run instead of discovering weeks later that the
+    bucket was empty and every "hard" negative was an ordinary one.
+    """
+    if rank != 0 or not summary.get("enabled"):
+        return
+    buckets = summary.get("buckets") or {}
+    parts = [
+        f"{bucket}={counts['videos']} videos/{counts['legal_pairs']} legal pairs"
+        for bucket, counts in buckets.items()
+    ]
+    print(
+        "[hard-negative] buckets: "
+        + ", ".join(parts)
+        + f" (negative_mix={summary.get('negative_mix')}, "
+        + f"min_videos_per_subtype_bucket={summary.get('min_videos_per_subtype_bucket')})",
+        flush=True,
+    )
+    for game, rows in sorted((summary.get("by_game") or {}).items()):
+        detail = ", ".join(
+            f"{bucket}={counts['videos']} videos/{counts['legal_pairs']} legal pairs"
+            for bucket, counts in sorted(rows.items())
+        )
+        print(f"[hard-negative]   game {game}: {detail}", flush=True)
+    excluded = int(summary.get("excluded_videos") or 0)
+    if excluded:
+        print(
+            f"[WARNING] [hard-negative] {excluded} negative video(s) match "
+            "neither hard_subtypes nor ordinary_subtypes and are excluded "
+            "from negative sampling entirely.",
+            flush=True,
+        )
+    undersized = summary.get("undersized_cells") or []
+    if undersized:
+        cells = ", ".join(
+            f"{cell['game']}/delta{cell['delta']}/{cell['bucket']}={cell['videos']}"
+            for cell in undersized[:10]
+        )
+        print(
+            f"[WARNING] [hard-negative] {len(undersized)} (game, delta, bucket) "
+            "cell(s) hold fewer videos than "
+            f"min_videos_per_subtype_bucket and will borrow from the other "
+            f"bucket: {cells}{'...' if len(undersized) > 10 else ''}",
+            flush=True,
+        )
+
+
+def _require_non_degenerate_hard_negatives(summary: dict) -> None:
+    """Refuse a hard-negative run whose hard bucket is globally empty.
+
+    The sampler keeps a per-cell fallback so a game with no hard negatives
+    cannot stall training, but a *globally* empty hard bucket means the
+    feature does nothing at all: the config asked for hard-negative mixing
+    and would get plain negative sampling.
+    """
+    if not summary.get("enabled"):
+        return
+    hard = (summary.get("buckets") or {}).get("hard") or {}
+    if int(hard.get("videos", 0)) > 0 and int(hard.get("legal_pairs", 0)) > 0:
+        return
+    raise RuntimeError(
+        "data.hard_negative.enabled=true but the hard bucket is empty "
+        f"({hard.get('videos', 0)} videos, {hard.get('legal_pairs', 0)} legal "
+        "pairs): no video in the train split carries a negative_subtype from "
+        "data.hard_negative.hard_subtypes. Training would silently degrade to "
+        "plain negative sampling. Check data.metadata_sidecar coverage and "
+        "data.hard_negative.hard_subtypes, or set "
+        "data.hard_negative.enabled=false."
+    )
+
+
 def build_eval_loader_for_split(
     config: dict,
     split: str,
@@ -287,6 +391,129 @@ def build_eval_loader_for_split(
     return loader, components
 
 
+def build_external_pool_loader(
+    config: dict,
+    *,
+    pool: str,
+    rank: int = 0,
+    world_size: int = 1,
+    batch_size: int | None = None,
+):
+    """Evaluation DataLoader over an external pool (challenge / mining).
+
+    These pools live outside train/val/test, so they carry their own video
+    index, their own optional metadata sidecar, and -- under
+    ``data.backend=packed_uint8`` -- their own shard index. Building them
+    inline (as the benchmark CLI used to) silently dropped all three: the PNG
+    decoder was used for packed data, and the missing sidecar left
+    ``negative_subtype`` unset so every subtype metric came back null.
+
+    ``pool`` is "challenge" or "mining".
+    """
+    from torch.utils.data import DataLoader
+
+    from game_cls.data.lazy_pair_dataset import build_eval_dataset
+    from game_cls.data.video_index import read_video_entries_parquet
+
+    if pool not in {"challenge", "mining"}:
+        raise ValueError(f"Unsupported external pool: {pool!r}")
+    config = finalize_config(config)
+    data_cfg = config["data"]
+    backend_name = data_cfg.get("backend", "png")
+    packed = backend_name == "packed_uint8"
+    if backend_name not in {"png", "packed_uint8"}:
+        raise ValueError(f"Unsupported data backend: {backend_name}")
+
+    # Spelled-out key names, not f-string joins: the CI consumer guard scans
+    # the source for each schema leaf as a literal, and a key that only exists
+    # as "{prefix}packed_index" would read as orphaned.
+    if pool == "challenge":
+        source: dict = data_cfg
+        section = "data"
+        keys = {
+            "video": "challenge_video_index",
+            "packed_video": "challenge_packed_video_index",
+            "packed": "challenge_packed_index",
+            "metadata": "challenge_metadata",
+        }
+    else:
+        source = data_cfg.get("mining") or {}
+        section = "data.mining"
+        keys = {
+            "video": "pool_video_index",
+            "packed_video": "pool_packed_video_index",
+            "packed": "pool_packed_index",
+            "metadata": "pool_metadata",
+        }
+    path = {name: f"{section}.{key}" for name, key in keys.items()}
+
+    video_index = (source.get(keys["packed_video"]) if packed else None) or source.get(
+        keys["video"]
+    )
+    if not video_index:
+        wanted = (
+            f"{path['packed_video']} or {path['video']}" if packed else path["video"]
+        )
+        raise ValueError(f"{pool} evaluation needs {wanted}.")
+    packed_index = source.get(keys["packed"]) if packed else None
+    if packed and not packed_index:
+        raise ValueError(
+            f"data.backend=packed_uint8 requires {path['packed']}. Without it "
+            "the PNG decoder would be used on packed shards."
+        )
+
+    test_delta = int(config["pair"]["test_delta"])
+    videos = read_video_entries_parquet(video_index, (test_delta,))
+
+    sidecar_path = source.get(keys["metadata"])
+    if sidecar_path:
+        from game_cls.data.sidecar import (
+            apply_sidecar,
+            read_metadata_sidecar,
+            validate_sidecar_against_index,
+        )
+
+        sidecar = read_metadata_sidecar(sidecar_path)
+        validate_sidecar_against_index(sidecar, videos)
+        videos = apply_sidecar(videos, sidecar)
+
+    decoder = None
+    if packed:
+        from game_cls.data.packed_backend import PackedUint8Backend
+
+        decoder = PackedUint8Backend(
+            packed_index,
+            image_spec=ImageSpec.from_config(data_cfg),
+            max_open_shards=int(data_cfg.get("packed_max_open_shards", 16)),
+        )
+
+    subtype_grouping = bool(
+        config["evaluation"].get("group_by_negative_subtype", False)
+    )
+    dataset: Any = build_eval_dataset(
+        videos,
+        test_delta,
+        rank=rank,
+        world_size=world_size,
+        decoder=decoder,
+        group_by_negative_subtype=subtype_grouping,
+    )
+    if subtype_grouping and "game_label_subtype" not in dataset.group_catalogs:
+        _warn_subtype_grouping_unavailable(
+            rank,
+            subtype_grouping,
+            config["evaluation"].get("max_worst_subtype_fpr"),
+            f"no video in the {pool} pool carries a negative_subtype label "
+            f"(check {path['metadata']})",
+        )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(batch_size or config["train"]["local_batch_size"]),
+        **_loader_common(config, role="eval"),
+    )
+    return loader, videos
+
+
 def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
     from torch.utils.data import DataLoader, Subset
 
@@ -301,6 +528,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
     train_common = _loader_common(config, role="train")
     eval_common = _loader_common(config, role="eval")
     subtype_grouping = bool(evaluation_cfg.get("group_by_negative_subtype", False))
+    max_worst_subtype_fpr = evaluation_cfg.get("max_worst_subtype_fpr")
     probe_pairs_per_video = int(evaluation_cfg.get("train_probe_pairs_per_video", 32))
     val_quick_pairs_per_video = int(
         evaluation_cfg.get(
@@ -310,6 +538,12 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
     )
 
     if data_cfg.get("synthetic", False):
+        _warn_subtype_grouping_unavailable(
+            rank,
+            subtype_grouping,
+            max_worst_subtype_fpr,
+            "data.synthetic=true datasets carry no negative-subtype metadata",
+        )
         train_length = max(batch_size * steps_per_epoch * world_size, 128)
         train_dataset: Any = SyntheticPairDataset(
             train_length,
@@ -385,8 +619,20 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         LazyTrainingPairDataset,
         build_eval_dataset,
     )
+    from game_cls.data.sidecar import check_hard_negative_readiness
     from game_cls.data.video_index import video_index_memory_bytes
     from game_cls.data.video_sampler import VideoBalancedPairBatchSampler
+
+    # Filesystem half of the hard-negative contract (the structural half is in
+    # config_schema.semantic_validate, which must stay filesystem-free). Run it
+    # before reading any parquet so a missing sidecar names itself instead of
+    # surfacing later as an empty bucket.
+    readiness = check_hard_negative_readiness(config)
+    if readiness:
+        raise RuntimeError(
+            "Hard-negative sampling is enabled but would silently degrade:\n"
+            + "\n".join(f"  - {problem}" for problem in readiness)
+        )
 
     components = _build_real_data_components(config, rank, world_size)
     train_videos = components["train_videos"]
@@ -425,6 +671,11 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         on_exhaustion=str(dedup_cfg.get("on_exhaustion", "warn_and_relax")),
         hard_negative_cfg=(config.get("data") or {}).get("hard_negative"),
     )
+    # Report the buckets before refusing, so a failed launch still tells the
+    # operator which bucket was empty and how many pairs each side had.
+    bucket_summary = sampler.subtype_bucket_summary()
+    _log_hard_negative_buckets(bucket_summary, rank)
+    _require_non_degenerate_hard_negatives(bucket_summary)
     # The train probe is a fixed, reproducible, augmentation-free subset of
     # the train split evaluated with the exact validation evaluator.
     train_probe_dataset: Any = build_eval_dataset(
@@ -465,6 +716,16 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
         if test_videos is not None
         else None
     )
+    if subtype_grouping and "game_label_subtype" not in getattr(
+        val_full_dataset, "group_catalogs", {}
+    ):
+        _warn_subtype_grouping_unavailable(
+            rank,
+            subtype_grouping,
+            max_worst_subtype_fpr,
+            "no video in the validation split carries a negative_subtype "
+            "label (check data.metadata_sidecar)",
+        )
     global_probe = _distributed_sum_int(len(train_probe_dataset))
     global_quick = _distributed_sum_int(len(val_quick_dataset))
     global_full = _distributed_sum_int(len(val_full_dataset))

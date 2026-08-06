@@ -404,9 +404,17 @@ def _worst_subtype_fpr_and_recall(
 
 
 def _subtype_negative_counts(subtype_counters: dict) -> dict:
-    """Per-subtype negative denominators (fp + tn) for each group."""
+    """Per-subtype negative denominators (fp + tn), keyed JSON-safely.
+
+    The counters are keyed by ``(game, label, negative_subtype)`` tuples, but
+    this dict ships inside the metrics payload that
+    ``write_evaluation_report`` serializes with ``json.dumps`` -- and JSON
+    object keys must be strings. Join with "::" to match the
+    ``source_video_uid`` convention used elsewhere.
+    """
     return {
-        key: int(counts[1]) + int(counts[3]) for key, counts in subtype_counters.items()
+        "::".join(str(part) for part in key): int(counts[1]) + int(counts[3])
+        for key, counts in subtype_counters.items()
     }
 
 
@@ -977,7 +985,11 @@ def evaluate(
             video_confidence = _merge_confidence(
                 [payload[3] for payload in gathered_groups]
             )
-            subtype_counters = {}
+            # The metadata (non-vectorized) accumulation loop never fills the
+            # subtype counters, so there is nothing to merge here; stay
+            # consistent with the non-distributed branch and let the
+            # availability check below report the gap.
+            subtype_counters = group_game_label_subtype
         if exact_scores:
             assert gathered_scores is not None
             margins = [margin for payload in gathered_scores for margin in payload[0]]
@@ -995,7 +1007,9 @@ def evaluate(
         video_counters = group_video
         game_label_counters = group_game_label
         video_confidence = group_video_confidence
-        subtype_counters = {}
+        # Built above from subtype_counts_array on the vectorized path; empty
+        # when the metadata path ran (it has no subtype accumulator).
+        subtype_counters = group_game_label_subtype
         tp, fp, fn, tn = local_counts.tolist()
         (
             cross_entropy_sum,
@@ -1030,6 +1044,21 @@ def evaluate(
     worst_game_fpr, worst_game_positive_recall = _worst_game_fpr_and_recall(
         game_counters
     )
+    # Step6 P0: the subtype metrics collapse to None whenever the counters go
+    # missing, and selection.py treats a None worst-subtype FPR as INELIGIBLE.
+    # A dropped reduction therefore makes constrained selection reject every
+    # checkpoint instead of failing visibly, so assert the invariant: a
+    # published subtype catalog plus scored samples must yield counters.
+    subtype_catalog = (group_catalogs or {}).get("game_label_subtype")
+    subtype_available = bool(subtype_catalog)
+    if subtype_available and int(sample_count) > 0 and not subtype_counters:
+        raise RuntimeError(
+            "Evaluation lost the negative-subtype counters: the dataset "
+            f"published {len(subtype_catalog)} subtype group(s) and "
+            f"{int(sample_count)} sample(s) were scored, but no subtype "
+            "counts survived the reduction. Downstream constrained selection "
+            "would silently reject every checkpoint."
+        )
     (
         worst_subtype_fpr,
         worst_subtype_recall,
@@ -1119,6 +1148,9 @@ def evaluate(
             "worst_subtype_fpr_at_decision_threshold": worst_subtype_fpr,
             "worst_subtype_recall_at_decision_threshold": worst_subtype_recall,
             "subtype_negative_counts": subtype_negative_counts,
+            # Distinguishes "no subtype grouping in this run" from "subtype FPR
+            # really is 0.0" for anything gating on the metrics above.
+            "subtype_grouping_available": subtype_available,
             "negative_score_p99": negative_tail_percentiles[0],
             "negative_score_p999": negative_tail_percentiles[1],
             "negative_score_max": negative_score_max,

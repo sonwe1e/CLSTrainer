@@ -268,11 +268,18 @@ def build_parser() -> argparse.ArgumentParser:
         "(negative_subtype, sample_weight).",
     )
     annotate.add_argument("--config", required=True)
-    annotate.add_argument(
+    # Exactly one input source. --metadata used to be required=True, which
+    # forced a meaningless --metadata alongside every --from-mining run.
+    annotate_source = annotate.add_mutually_exclusive_group(required=True)
+    annotate_source.add_argument(
         "--metadata",
-        required=True,
         help="CSV/parquet of per-video rows: source_video_uid, "
         "negative_subtype, sample_weight, ...",
+    )
+    annotate_source.add_argument(
+        "--from-mining",
+        help="Instead of --metadata, import mined negatives from a "
+        "hard_negatives.parquet manifest.",
     )
     annotate.add_argument(
         "--out",
@@ -280,15 +287,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output sidecar parquet path (default: data.metadata_sidecar).",
     )
     annotate.add_argument(
-        "--from-mining",
-        default=None,
-        help="Instead of --metadata, import mined negatives from a "
-        "hard_negatives.parquet manifest.",
-    )
-    annotate.add_argument(
         "--subtype",
         default=None,
         help="negative_subtype assigned to mined videos (requires --from-mining).",
+    )
+    annotate.add_argument(
+        "--on-subtype-conflict",
+        choices=("refuse", "keep", "overwrite"),
+        default="refuse",
+        help="Existing sidecar row already carries a different "
+        "negative_subtype: refuse the import (default), keep the existing "
+        "annotation, or overwrite it.",
     )
     annotate.add_argument("overrides", nargs="*", metavar="key=value")
     annotate.set_defaults(func=cmd_dataset_annotate)
@@ -305,14 +314,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Checkpoint alias/path (default: best_selection).",
     )
     export.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    # --format/--out default to None on purpose: an argparse default would
+    # shadow export.format / export.output_dir on every plain invocation.
+    # Unset falls back to the config, then to weights/exports.
     export.add_argument(
         "--format",
         choices=("weights", "onnx"),
-        default="weights",
-        help="weights: pure state dict + manifest (default). onnx: traced "
-        "[B,2] graph verified against the PyTorch reference.",
+        default=None,
+        help="Override export.format. weights: pure state dict + manifest "
+        "(default). onnx: traced [B,2] graph verified against the PyTorch "
+        "reference.",
     )
-    export.add_argument("--out", default="exports")
+    export.add_argument(
+        "--out",
+        default=None,
+        help="Override export.output_dir (default: exports).",
+    )
     export.set_defaults(func=cmd_export)
 
     benchmark = subparsers.add_parser(

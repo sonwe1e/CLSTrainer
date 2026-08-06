@@ -319,6 +319,18 @@ SCHEMA: dict[str, Any] = {
                 "Optional sidecar of the mining pool (subtype_before).",
                 nullable=True,
             ),
+            "pool_packed_index": _k(
+                "str",
+                "packed_uint8 shard index of the mining pool; required when "
+                "data.backend=packed_uint8.",
+                nullable=True,
+            ),
+            "pool_packed_video_index": _k(
+                "str",
+                "Video-level index of the packed mining pool; falls back to "
+                "pool_video_index when unset.",
+                nullable=True,
+            ),
             "output": _k("str", "Output hard_negatives.parquet mining manifest path."),
             "top_k_per_video": _k(
                 "int",
@@ -346,6 +358,18 @@ SCHEMA: dict[str, Any] = {
         ),
         "challenge_metadata": _k(
             "str", "Optional challenge-set metadata sidecar.", nullable=True
+        ),
+        "challenge_packed_index": _k(
+            "str",
+            "packed_uint8 shard index of the challenge set; required when "
+            "data.backend=packed_uint8.",
+            nullable=True,
+        ),
+        "challenge_packed_video_index": _k(
+            "str",
+            "Video-level index of the packed challenge set; falls back to "
+            "challenge_video_index when unset.",
+            nullable=True,
         ),
     },
     "pair": {
@@ -756,9 +780,17 @@ SCHEMA: dict[str, Any] = {
         ),
         "monitor": _k(
             "str",
-            "Validation metric watched for improvement.",
+            "Metric or selection contract watched for improvement. "
+            "`selection_score` (alias `selection`) follows the unified "
+            "selection contract: improvement is judged by the same ordering "
+            "as best-checkpoint selection; in constrained mode that is "
+            "(global_positive_recall, worst_game_positive_recall, "
+            "-negative_score_p999), with ineligible evaluations counting "
+            "toward patience rather than resetting it. Any other value names "
+            "one numeric metric and uses the plain `mode` comparison.",
             choices=(
                 "selection_score",
+                "selection",
                 "cross_entropy",
                 "objective_loss",
                 "worst_game_f1_at_decision_threshold",
@@ -767,7 +799,11 @@ SCHEMA: dict[str, Any] = {
         ),
         "mode": _k(
             "str",
-            "max: higher monitor values are better; min: lower values.",
+            "max: higher monitor values are better; min: lower values. "
+            "Applies only to non-selection monitors (any `monitor` other "
+            "than `selection_score`/`selection`); `mode: min` combined with "
+            "a selection monitor is a config error because the selection "
+            "rank key is always bigger-is-better.",
             choices=("max", "min"),
         ),
         "full_validation_only": _k(
@@ -820,10 +856,15 @@ SCHEMA: dict[str, Any] = {
         ),
         "topk_monitor": _k(
             "str",
-            "Metric that ranks topk checkpoints; lower is better for "
-            "cross_entropy, higher is better otherwise.",
+            "`selection_score` (alias `selection`) ranks topk checkpoints "
+            "by the unified selection contract, the same ordering as "
+            "best-checkpoint selection; ineligible checkpoints are admitted "
+            "but ranked strictly below every eligible one. Any other value "
+            "names one numeric metric: lower is better for `cross_entropy`, "
+            "higher is better otherwise.",
             choices=(
                 "selection_score",
+                "selection",
                 "cross_entropy",
                 "worst_game_f1_at_decision_threshold",
             ),
@@ -845,8 +886,16 @@ SCHEMA: dict[str, Any] = {
         "output_dir": _k("str", "Directory for benchmark reports and data probes."),
         "gate_metrics": _k(
             "dict",
-            "Release/benchmark gates, e.g. {max_global_fpr: 0.01, "
-            "min_positive_recall: 0.8}. Unmet gates fail the command.",
+            "Release/benchmark gates keyed by the metric name the evaluator "
+            'emits, each {op: "<="|"<"|">="|">", value: <number>}, e.g. '
+            '{global_fpr_at_decision_threshold: {op: "<=", value: 0.01}, '
+            'global_positive_recall_at_decision_threshold: {op: ">=", '
+            "value: 0.8}}. A bare scalar bound is still accepted and means "
+            "the metric's natural bound (upper for FPR/ECE/Brier/loss/"
+            "negative-score, lower for recall/F1/precision/specificity/"
+            "accuracy); metrics with no documented direction (sample_count, "
+            "threshold) require the explicit form. Unknown metric names or "
+            "operators are config errors; unmet gates fail the command.",
         ),
     },
     "export": {
@@ -901,7 +950,9 @@ _SPLIT_KEYS: dict[str, Any] = {
     "on_new_groups": _k(
         "str",
         "Behavior when the dataset fingerprint changes: 'error' refuses to "
-        "silently re-shuffle, 'extend' keeps existing assignments.",
+        "silently re-shuffle, 'extend' keeps every existing assignment and "
+        "places only the new source videos. A change to seed, val_ratio or "
+        "target_delta is always an error regardless of this setting.",
         choices=("error", "extend"),
     ),
     "small_stratum_policy": _k(
@@ -1218,6 +1269,8 @@ _DEFAULT_MINING: dict[str, Any] = {
     "pool_index": None,
     "pool_video_index": None,
     "pool_metadata": None,
+    "pool_packed_index": None,
+    "pool_packed_video_index": None,
     "output": "indexes/hard_negatives.parquet",
     "top_k_per_video": 8,
     "max_samples": None,
@@ -1275,6 +1328,8 @@ def _apply_defaults(config: dict[str, Any]) -> None:
     data.setdefault("challenge_index", None)
     data.setdefault("challenge_video_index", None)
     data.setdefault("challenge_metadata", None)
+    data.setdefault("challenge_packed_index", None)
+    data.setdefault("challenge_packed_video_index", None)
     benchmark = config.setdefault("benchmark", {})
     benchmark.setdefault("output_dir", "benchmarks")
     benchmark.setdefault("gate_metrics", {})
@@ -1577,6 +1632,18 @@ def semantic_validate(config: dict[str, Any]) -> None:
                 f"evaluation.{key} must be strictly between 0 and 1 (got {value}).",
             )
 
+    # Benchmark gates (step6): metric names must be producible by the
+    # evaluator and comparison operators must be real, so a typo fails here
+    # instead of reading "metric absent" after a full benchmark run. The
+    # import is local: config_schema is loaded very early and must not pull
+    # in the reports package at module import time.
+    from game_cls.reports.benchmark import validate_gate_metrics
+
+    for problem in validate_gate_metrics(
+        (config.get("benchmark") or {}).get("gate_metrics")
+    ):
+        require(False, problem)
+
     # Hard-negative subtype mixing (step5 P2): enabled requires a sidecar,
     # and the per-bucket weights must be positive.
     data_meta = config.get("data") or {}
@@ -1586,6 +1653,18 @@ def semantic_validate(config: dict[str, Any]) -> None:
             bool(data_meta.get("metadata_sidecar")),
             "data.hard_negative.enabled requires data.metadata_sidecar to "
             "point at a per-video metadata parquet.",
+        )
+        # Without hard_subtypes every negative lands in the ordinary bucket
+        # and the hard bucket is empty, so sampling silently degrades to
+        # plain negative sampling. File existence and sidecar content are
+        # checked at startup/`config validate` (see data.sidecar
+        # .check_hard_negative_readiness); this layer stays filesystem-free.
+        require(
+            bool(hard_negative.get("hard_subtypes")),
+            "data.hard_negative.enabled requires a non-empty "
+            "data.hard_negative.hard_subtypes; otherwise no video can ever "
+            "enter the hard bucket and sampling degrades to ordinary "
+            "negatives.",
         )
         negative_mix = hard_negative.get("negative_mix") or {}
         mix_values = [
@@ -1608,10 +1687,20 @@ def semantic_validate(config: dict[str, Any]) -> None:
             "data.hard_negative.min_videos_per_subtype_bucket must be >= 1.",
         )
     if evaluation_cfg.get("group_by_negative_subtype", False):
+        # Subtype labels can arrive from the split sidecar (train/val/test) or
+        # from an external pool's own sidecar (challenge / mining), so accept
+        # any of the three rather than forcing a benchmark-only config to set
+        # a train-side key it never reads.
         require(
-            bool(data_meta.get("metadata_sidecar")),
-            "evaluation.group_by_negative_subtype requires "
-            "data.metadata_sidecar so subtype labels are available.",
+            bool(
+                data_meta.get("metadata_sidecar")
+                or data_meta.get("challenge_metadata")
+                or (data_meta.get("mining") or {}).get("pool_metadata")
+            ),
+            "evaluation.group_by_negative_subtype requires a per-video "
+            "metadata sidecar so subtype labels are available: set "
+            "data.metadata_sidecar, data.challenge_metadata, or "
+            "data.mining.pool_metadata.",
         )
 
     # Probability vectors: non-negative and (approximately) sum to one.
@@ -1662,6 +1751,29 @@ def semantic_validate(config: dict[str, Any]) -> None:
                 int(target_delta) in (1, 2, 3),
                 f"data.split.target_delta must be 1, 2 or 3 (got {target_delta}).",
             )
+
+    # early_stopping.mode: min with a selection monitor is a silent behavior
+    # reversal: the selection rank key is always bigger-is-better (in
+    # constrained mode it is (global_positive_recall, worst_game_positive_recall,
+    # -negative_score_p999)), so mode: min would minimize something that the
+    # contract maximizes, making it a misconfiguration rather than a deliberate
+    # choice. Minimizing a selection score is meaningless and the default is
+    # max, so rejecting it cannot break any legitimate config.
+    _SELECTION_MONITOR_VALUES = frozenset({"selection_score", "selection"})
+    early_cfg = config.get("early_stopping") or {}
+    es_monitor = early_cfg.get("monitor", "selection_score")
+    es_mode = early_cfg.get("mode", "max")
+    if es_monitor in _SELECTION_MONITOR_VALUES and es_mode == "min":
+        require(
+            False,
+            f"early_stopping.mode: min is meaningless with "
+            f"early_stopping.monitor: {es_monitor!r}. The selection rank "
+            "key is always bigger-is-better (in constrained mode that is "
+            "(global_positive_recall, worst_game_positive_recall, "
+            "-negative_score_p999)), so mode: min silently reverses the "
+            "ordering. Set early_stopping.mode: max, or switch to a "
+            "numeric monitor such as cross_entropy.",
+        )
 
     if problems:
         raise ConfigSchemaError(problems)

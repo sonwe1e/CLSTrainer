@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -93,28 +94,124 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     print(f"  total steps       : {total_steps}")
     print(f"  local batch size  : {train_cfg['local_batch_size']}")
     print(f"  output dir        : {config['experiment']['output_dir']}")
+    problems: list[str] = []
+    # Filesystem half of the hard-negative contract: semantic_validate (which
+    # load_config just ran) cannot touch the filesystem, so a config pointing
+    # at a non-existent sidecar reaches this point structurally valid while
+    # training would silently fall back to plain negative sampling.
+    from game_cls.data.sidecar import check_hard_negative_readiness
+
+    problems.extend(check_hard_negative_readiness(config))
+    if problems:
+        print("Config INVALID:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 2
     if getattr(args, "release", False):
-        # Release gate (step5 P6): a releasable config must not run blind —
-        # it needs a worst-game F1 baseline and a benchmark gate.
-        evaluation_cfg = config["evaluation"]
-        problems = []
-        if evaluation_cfg.get("minimum_worst_game_f1") is None:
-            problems.append(
-                "evaluation.minimum_worst_game_f1 is null; set it once a "
-                "baseline exists (the release gate refuses empty runs)."
-            )
-        if not (config.get("benchmark") or {}).get("gate_metrics"):
-            problems.append(
-                "benchmark.gate_metrics is empty; the release gate needs at "
-                "least one acceptance metric."
-            )
-        if problems:
-            print("Release gate FAILED:", file=sys.stderr)
-            for problem in problems:
-                print(f"  - {problem}", file=sys.stderr)
-            return 2
-        print("  release gate      : PASS")
+        return _release_gate(config)
     return 0
+
+
+def _release_gate(config: dict) -> int:
+    """Validate the release contract: baseline, gate spec and real report.
+
+    Beyond "a gate exists", this checks the gate metric names and comparison
+    operators (so a gate cannot be unpassable by construction) and re-judges
+    the newest benchmark report under the configured gates, so a config whose
+    recorded run failed its own gates cannot be called releasable.
+    """
+    from game_cls.reports.benchmark import check_gates, validate_gate_metrics
+
+    problems: list[str] = []
+    notes: list[str] = []
+    evaluation_cfg = config["evaluation"]
+    if evaluation_cfg.get("minimum_worst_game_f1") is None:
+        problems.append(
+            "evaluation.minimum_worst_game_f1 is null; set it once a "
+            "baseline exists (the release gate refuses empty runs)."
+        )
+    benchmark_cfg = config.get("benchmark") or {}
+    gate_metrics = benchmark_cfg.get("gate_metrics") or {}
+    if not gate_metrics:
+        problems.append(
+            "benchmark.gate_metrics is empty; the release gate needs at "
+            "least one acceptance metric."
+        )
+    problems.extend(validate_gate_metrics(gate_metrics))
+    report = _newest_benchmark_report(
+        Path(benchmark_cfg.get("output_dir", "benchmarks"))
+    )
+    if report is None:
+        notes.append(
+            "no benchmark report under "
+            f"{benchmark_cfg.get('output_dir', 'benchmarks')}; gates are "
+            "UNVERIFIED. Run 'cls-trainer benchmark evaluate' before release."
+        )
+    elif not problems:
+        problems.extend(_verify_report_against_gates(report, gate_metrics, check_gates))
+    if problems:
+        print("Release gate FAILED:", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        return 2
+    print("  release gate      : PASS")
+    for note in notes:
+        print(f"  release gate note : {note}")
+    if report is not None:
+        print(f"  benchmark report  : {report}")
+    return 0
+
+
+def _newest_benchmark_report(output_dir: Path) -> Path | None:
+    """Most recently written ``<run>_<alias>/report.json``, if any."""
+    if not output_dir.is_dir():
+        return None
+    reports = sorted(
+        output_dir.glob("*/report.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return reports[0] if reports else None
+
+
+def _verify_report_against_gates(
+    report: Path, gate_metrics: dict, check_gates
+) -> list[str]:
+    """Re-judge a recorded benchmark report under the configured gates.
+
+    Re-checking the recorded scores (rather than trusting the report's own
+    ``passed`` flags) is what catches a report written before the gate
+    contract changed, e.g. one that recorded a specificity gate as passing
+    under the old substring-guessed direction.
+    """
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"benchmark report {report} is unreadable: {exc}"]
+    scores = payload.get("scores") or {}
+    recorded = {entry.get("name") for entry in (payload.get("gates") or [])}
+    problems: list[str] = []
+    missing = sorted(set(map(str, gate_metrics)) - recorded)
+    if missing:
+        problems.append(
+            f"benchmark report {report} predates the current gates and never "
+            f"measured {missing}; re-run 'cls-trainer benchmark evaluate'."
+        )
+    measurable = {
+        name: spec for name, spec in gate_metrics.items() if str(name) in scores
+    }
+    for name, passed, detail in check_gates(scores, measurable):
+        if not passed:
+            problems.append(f"benchmark report {report} fails gate {name}: {detail}")
+    unmeasured = sorted(
+        set(map(str, gate_metrics)) - set(map(str, measurable)) - set(missing)
+    )
+    if unmeasured:
+        problems.append(
+            f"benchmark report {report} recorded no value for {unmeasured}; "
+            "the gate cannot be verified."
+        )
+    return problems
 
 
 def cmd_config_reference(args: argparse.Namespace) -> int:

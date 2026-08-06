@@ -67,24 +67,78 @@ def _run_split_prepare(
     )
 
 
+def _split_bundle_artifacts(data_config: dict[str, Any]) -> dict[str, str]:
+    """Config keys -> paths that a complete split bundle must produce.
+
+    Checking only ``val_index`` was not enough: a prepare that died partway
+    (or a partially copied index directory) leaves val_frames.parquet on disk
+    while the video-entry parquets are missing, and training then fails much
+    later with a confusing read error.
+    """
+    keys = (
+        "train_index",
+        "val_index",
+        "test_index",
+        "train_video_index",
+        "val_video_index",
+        "test_video_index",
+        "audit_path",
+    )
+    artifacts = {key: data_config.get(key) for key in keys}
+    return {key: str(path) for key, path in artifacts.items() if path}
+
+
+def _missing_split_artifacts(data_config: dict[str, Any]) -> list[str]:
+    return [
+        f"data.{key}={path}"
+        for key, path in _split_bundle_artifacts(data_config).items()
+        if not Path(path).is_file()
+    ]
+
+
 def _maybe_prepare_split(config: dict[str, Any]) -> None:
-    """Build the validation split on demand when ``prepare_if_missing``."""
+    """Build the validation split on demand when ``prepare_if_missing``.
+
+    Runs before the distributed runtime exists, so every rank of a torchrun
+    launch reaches this point concurrently. There is no lock and no atomic
+    directory commit, so eight ranks scanning and writing the same index
+    files would interleave partial writes. Rather than invent a locking
+    protocol here, a multi-process launch refuses to prepare and tells the
+    operator to run ``cls-trainer dataset prepare`` once, up front.
+    """
+    import os
+
     data_config = config["data"]
     if not data_config.get("prepare_if_missing"):
         return
     split = data_config.get("split") or {}
     if split.get("mode") != "from_train":
         return
-    val_index = data_config.get("val_index")
-    if val_index and Path(val_index).is_file():
-        return  # the validation split already exists
+    missing = _missing_split_artifacts(data_config)
+    if not missing:
+        return  # the whole split bundle already exists
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+    if world_size > 1:
+        rank = os.environ.get("RANK", "?")
+        raise SystemExit(
+            "data.prepare_if_missing cannot run under a multi-process launch "
+            f"(WORLD_SIZE={world_size}, RANK={rank}): every rank would scan "
+            "the dataset and write the same index files concurrently, with no "
+            "lock and no atomic commit. Prepare once first:\n"
+            "    cls-trainer dataset prepare --config <config> "
+            "--train-root <train_all> --test-root <test>\n"
+            "then relaunch training. Missing artifacts: " + ", ".join(missing)
+        )
+
     source_root = data_config.get("source_root")
     test_root = data_config.get("test_root")
     if not source_root or not test_root:
         raise SystemExit(
             "data.prepare_if_missing requires data.source_root and "
             "data.test_root to derive the validation split; set both, or "
-            "run 'cls-trainer dataset prepare' separately first."
+            "run 'cls-trainer dataset prepare' separately first. Missing "
+            "artifacts: " + ", ".join(missing)
         )
     _run_split_prepare(config, source_root, test_root)
 
@@ -118,12 +172,21 @@ def cmd_dataset_prepare(args: argparse.Namespace) -> int:
         output_dir=args.output_dir,
     )
     summary = audit.get("split") or audit
+    delta = summary.get("target_delta", split.get("target_delta", 2))
+    achieved = summary.get("val_ratio_achieved")
     print("=== dataset prepare finished ===")
     print(f"split mode        : {split.get('mode')}")
     print(f"val ratio target  : {split.get('val_ratio')}")
-    print(f"val ratio achieved (delta=2): {summary.get('val_ratio_achieved_delta2')}")
+    print(f"val ratio achieved (delta={delta}): {achieved}")
     print(f"source videos     : {summary.get('source_video_count')}")
     print(f"manifest          : {split.get('manifest')}")
+    if summary.get("manifest_extended"):
+        print(f"extended with     : {summary.get('added_source_videos')} source videos")
+    if not summary.get("fingerprint_covers_content", True):
+        print(
+            "note              : content hashing was off, so the split "
+            "fingerprint cannot detect a same-size frame edit"
+        )
     return 0
 
 
@@ -214,16 +277,142 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# dataset annotate
+# ---------------------------------------------------------------------------
+
+# Sidecar columns an import may set. Anything else in the input is ignored;
+# write_metadata_sidecar normalizes to the parquet schema anyway.
+_SIDECAR_FIELDS = (
+    "negative_subtype",
+    "scene_type",
+    "capture_domain",
+    "difficulty",
+    "sample_weight",
+)
+
+
+def _annotate_field(row: dict[str, Any], field: str) -> Any:
+    """Value of ``field`` when the input really supplies one, else ``None``.
+
+    A missing key, ``None`` and a blank string (an empty CSV cell) all mean
+    "not specified", so merging keeps whatever the sidecar already held
+    instead of blanking a hand-made annotation.
+    """
+    value = row.get(field)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if field == "sample_weight":
+        return float(value)
+    return str(value)
+
+
+def _mining_rows(mined: list[dict[str, Any]], subtype: str) -> list[dict[str, Any]]:
+    """Collapse mining top-K *pairs* into one row per source video.
+
+    A mining manifest holds up to ``top_k_per_video`` rows per video, but
+    ``source_video_uid`` is the sidecar's primary key, so the rows must be
+    aggregated before they can be written. The representative is the
+    highest-``p_positive`` pair: that score is the video's hardest pair, which
+    is the honest per-video difficulty signal and is exactly how
+    ``scan_negative_pool`` already ranks candidates. Picking the max is also
+    order-independent, so re-reading the same manifest cannot flip the result
+    the way "first row wins" would.
+
+    ``p_positive`` rides along on the representative row (the sidecar schema
+    has no score column, so it is ignored downstream) purely so the selection
+    stays auditable and unit-testable.
+    """
+    best: dict[str, dict[str, Any]] = {}
+    for row in mined:
+        uid = str(row["source_video_uid"])
+        score = float(row.get("p_positive", 0.0))
+        current = best.get(uid)
+        if current is None or score > current["p_positive"]:
+            best[uid] = {
+                "source_video_uid": uid,
+                "negative_subtype": subtype,
+                "p_positive": score,
+            }
+    return [best[uid] for uid in sorted(best)]
+
+
+def _read_metadata_input(source: Path) -> list[dict[str, Any]]:
+    """Read the per-video annotation table (parquet or CSV)."""
+    if source.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+
+        # memory_map=False keeps no Windows file handle on the input, which
+        # matters when the input and the sidecar live in the same temp dir.
+        return pq.read_table(source, memory_map=False).to_pylist()
+    import csv
+
+    with source.open(encoding="utf-8", newline="") as stream:
+        return [dict(row) for row in csv.DictReader(stream)]
+
+
+def _merge_sidecar_rows(
+    existing: dict[str, dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    on_subtype_conflict: str,
+) -> tuple[dict[str, dict[str, Any]], list[tuple[str, str, str]], dict[str, int]]:
+    """Merge an import into the existing sidecar, per field.
+
+    Annotate is additive: importing mined negatives must not destroy the
+    subtypes, weights and scene tags someone entered by hand. Fields the
+    import does not specify are carried over untouched, and a uid that the
+    import never mentions keeps its row.
+    """
+    merged = {uid: dict(meta) for uid, meta in existing.items()}
+    conflicts: list[tuple[str, str, str]] = []
+    stats = {"new": 0, "updated": 0}
+    for row in incoming:
+        uid = str(row["source_video_uid"])
+        before = merged.get(uid)
+        if before is None:
+            new_row = {field: _annotate_field(row, field) for field in _SIDECAR_FIELDS}
+            # A null sample_weight would break both readers, so the column is
+            # always a real float.
+            if new_row["sample_weight"] is None:
+                new_row["sample_weight"] = 1.0
+            merged[uid] = new_row
+            stats["new"] += 1
+            continue
+        after = dict(before)
+        for field in _SIDECAR_FIELDS:
+            value = _annotate_field(row, field)
+            if value is None:
+                continue  # absent in the import: keep the current value
+            if field == "negative_subtype":
+                current = before.get("negative_subtype")
+                if current and current != value:
+                    conflicts.append((uid, str(current), str(value)))
+                    # refuse aborts before anything is written; keep leaves the
+                    # human annotation in place. Only overwrite falls through.
+                    if on_subtype_conflict in ("refuse", "keep"):
+                        continue
+            after[field] = value
+        if after.get("sample_weight") is None:
+            after["sample_weight"] = 1.0
+        if after != before:
+            stats["updated"] += 1
+        merged[uid] = after
+    return merged, conflicts, stats
+
+
 def cmd_dataset_annotate(args: argparse.Namespace) -> int:
     """Import per-video metadata into the sidecar (step5 P2).
 
-    Reads a CSV/parquet keyed by ``source_video_uid``, validates every uid
-    against the configured train/val/test video indexes, and writes the
-    canonical sidecar parquet atomically.
+    Reads a CSV/parquet keyed by ``source_video_uid`` (or a mining manifest
+    via ``--from-mining``), validates every uid against the configured
+    train/val/test video indexes, merges the rows into whatever sidecar
+    already exists and rewrites it atomically.
     """
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
     from game_cls.data.sidecar import (
+        read_metadata_sidecar,
         validate_sidecar_against_index,
         write_metadata_sidecar,
     )
@@ -236,6 +425,7 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
 
+    mining_pairs: int | None = None
     if args.from_mining:
         from game_cls.reports.benchmark import read_mining_manifest
 
@@ -243,28 +433,14 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
             print("--from-mining requires --subtype.", file=sys.stderr)
             return 2
         mined = read_mining_manifest(args.from_mining)
-        rows = [
-            {
-                "source_video_uid": row["source_video_uid"],
-                "negative_subtype": args.subtype,
-            }
-            for row in mined
-        ]
+        mining_pairs = len(mined)
+        rows = _mining_rows(mined, args.subtype)
         if not rows:
             print(f"No mined negatives in {args.from_mining}", file=sys.stderr)
             return 2
     else:
         source = Path(args.metadata)
-        if source.suffix.lower() == ".parquet":
-            import pyarrow.parquet as pq
-
-            rows = pq.read_table(source).to_pylist()
-        else:
-            import csv
-
-            with source.open(encoding="utf-8", newline="") as stream:
-                reader = csv.DictReader(stream)
-                rows = [dict(row) for row in reader]
+        rows = _read_metadata_input(source)
         if not rows:
             print(f"No metadata rows in {source}", file=sys.stderr)
             return 2
@@ -275,41 +451,72 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # Resolve the destination before touching the indexes: data.metadata_sidecar
+    # defaults to null, and Path(None) used to raise a TypeError long before the
+    # friendly message below could be printed.
+    configured_out = config["data"].get("metadata_sidecar")
+    out = args.out or configured_out
+    if not out:
+        print(
+            "No output sidecar path: pass --out or set data.metadata_sidecar.",
+            file=sys.stderr,
+        )
+        return 2
+    out_path = Path(out)
+
     components = _build_real_data_components(config, rank=0, world_size=1)
     entries = (
         components["train_videos"]
         + components["val_videos"]
         + (components["test_videos"] or [])
     )
-    sidecar = {
+    incoming = {
         str(row["source_video_uid"]): {
-            "negative_subtype": row.get("negative_subtype"),
-            "scene_type": row.get("scene_type"),
-            "capture_domain": row.get("capture_domain"),
-            "difficulty": row.get("difficulty"),
-            "sample_weight": float(row.get("sample_weight", 1.0)),
+            field: _annotate_field(row, field) for field in _SIDECAR_FIELDS
         }
         for row in rows
     }
-    validate_sidecar_against_index(sidecar, entries)
+    # Only the imported uids are checked: rows already in the sidecar were
+    # validated when they were written, and failing an operator's import over
+    # a stale pre-existing row they did not touch would be unhelpful.
+    validate_sidecar_against_index(incoming, entries)
 
-    out_path = Path(args.out) if args.out else Path(config["data"]["metadata_sidecar"])
-    if not out_path:
+    merged, conflicts, stats = _merge_sidecar_rows(
+        read_metadata_sidecar(out_path),
+        rows,
+        on_subtype_conflict=args.on_subtype_conflict,
+    )
+    if conflicts and args.on_subtype_conflict == "refuse":
+        preview = ", ".join(
+            f"{uid} ({current} -> {incoming_subtype})"
+            for uid, current, incoming_subtype in conflicts[:10]
+        )
         print(
-            "No output sidecar path: pass --out or set data.metadata_sidecar.",
+            f"Refusing to overwrite {len(conflicts)} existing negative_subtype "
+            f"annotation(s) in {out_path}: {preview}"
+            f"{'...' if len(conflicts) > 10 else ''}\n"
+            "Re-run with --on-subtype-conflict keep (retain the existing "
+            "annotation) or overwrite (take the import).",
             file=sys.stderr,
         )
         return 2
-    fingerprint = write_metadata_sidecar(rows, out_path)
-    print(
-        json.dumps(
-            {
-                "sidecar": str(out_path),
-                "videos": len(sidecar),
-                "metadata_fingerprint": fingerprint,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+
+    sidecar_rows = [
+        {"source_video_uid": uid, **meta} for uid, meta in sorted(merged.items())
+    ]
+    fingerprint = write_metadata_sidecar(sidecar_rows, out_path)
+    payload = {
+        "sidecar": str(out_path),
+        "videos": len(sidecar_rows),
+        "imported": len(incoming),
+        "new": stats["new"],
+        "updated": stats["updated"],
+        "subtype_conflicts": len(conflicts),
+        "on_subtype_conflict": args.on_subtype_conflict,
+        "metadata_fingerprint": fingerprint,
+    }
+    if mining_pairs is not None:
+        # Makes the top-K -> one-row-per-video aggregation visible.
+        payload["mining_pairs"] = mining_pairs
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0

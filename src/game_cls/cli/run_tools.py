@@ -89,6 +89,11 @@ def cmd_run_show(args: argparse.Namespace) -> int:
         best = summary.get("best_observed_dev_test_metrics") or {}
         if isinstance(best.get("selection_score"), (int, float)):
             print(f"best score   : {best['selection_score']:.4f}")
+        if best.get("selection_eligible") is not None:
+            print(
+                f"selection    : mode={best.get('selection_mode', '?')} "
+                f"eligible={str(bool(best['selection_eligible'])).lower()}"
+            )
         topk = summary.get("topk_checkpoints") or []
         if topk:
             print("topk         :")
@@ -97,10 +102,14 @@ def cmd_run_show(args: argparse.Namespace) -> int:
                 value_text = (
                     f"{value:.4f}" if isinstance(value, (int, float)) else "n/a"
                 )
+                # Ineligible entries are kept but ranked last; say so, or the
+                # listing reads like a ranking of deployable checkpoints.
+                eligible = entry.get("eligible")
+                suffix = " (ineligible)" if eligible is False else ""
                 print(
                     f"  step={entry.get('step', '?')} "
                     f"{entry.get('monitor', 'selection_score')}={value_text} "
-                    f"model_{entry.get('tag', '')}.pth"
+                    f"model_{entry.get('tag', '')}.pth{suffix}"
                 )
     for artifact in (
         "summary.md",
@@ -133,11 +142,15 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
         best = summary.get("best_observed_dev_test_metrics") or {}
         score = best.get("selection_score")
         score_text = f"{score:.4f}" if isinstance(score, (int, float)) else "n/a"
+        eligible = best.get("selection_eligible")
+        eligible_text = "n/a" if eligible is None else str(bool(eligible)).lower()
         print(
             f"{label}: {run_dir}\n"
             f"    state={status.get('state', '?')} "
             f"step={status.get('step', '?')} "
-            f"best_selection={score_text}"
+            f"best_selection={score_text} "
+            f"selection_mode={best.get('selection_mode', 'n/a')} "
+            f"selection_eligible={eligible_text}"
         )
 
     headline("A", dir_a, status_a, summary_a)
@@ -162,14 +175,9 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
     for key in only_b:
         print(f"  {key}: only in B ({flat_b[key]!r})")
 
-    def metric_row(name: str, summary: dict) -> str:
-        metrics = summary.get("best_observed_dev_test_metrics") or {}
+    def _row(name: str, metrics: dict, fields: tuple[str, ...]) -> str:
         values = []
-        for metric in (
-            "global_f1_at_decision_threshold",
-            "macro_game_f1_at_decision_threshold",
-            "worst_game_f1_at_decision_threshold",
-        ):
+        for metric in fields:
             value = metrics.get(
                 metric,
                 metrics.get(metric.replace("_at_decision_threshold", "_tau099")),
@@ -181,10 +189,43 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
             )
         return f"  {name:<4s} " + " ".join(values)
 
+    def metric_row(name: str, summary: dict) -> str:
+        metrics = summary.get("best_observed_dev_test_metrics") or {}
+        return _row(
+            name,
+            metrics,
+            (
+                "global_f1_at_decision_threshold",
+                "macro_game_f1_at_decision_threshold",
+                "worst_game_f1_at_decision_threshold",
+            ),
+        )
+
+    # Constrained selection is not a scalar: two runs can share a recall and
+    # still differ on eligibility, worst-game recall or the negative tail, so
+    # compare has to print the gate inputs and both tie-breakers.
+    def selection_row(name: str, summary: dict) -> str:
+        metrics = summary.get("best_observed_dev_test_metrics") or {}
+        return _row(
+            name,
+            metrics,
+            (
+                "global_positive_recall_at_decision_threshold",
+                "worst_game_positive_recall_at_decision_threshold",
+                "negative_score_p999",
+                "global_fpr_at_decision_threshold",
+                "worst_game_fpr_at_decision_threshold",
+            ),
+        )
+
     print("")
     print("Best observed dev-test metrics:")
     print(metric_row("A", summary_a))
     print(metric_row("B", summary_b))
+    print("")
+    print("Selection contract (eligibility gates and rank key):")
+    print(selection_row("A", summary_a))
+    print(selection_row("B", summary_b))
     return 0
 
 

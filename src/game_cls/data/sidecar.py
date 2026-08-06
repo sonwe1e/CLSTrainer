@@ -8,6 +8,11 @@ is unset, no sidecar is loaded and every video keeps the legacy
 ``negative_subtype=None`` / ``sample_weight=1.0`` defaults — training is
 byte-identical to before.
 
+That "missing file reads as no metadata" default is a trap for
+``data.hard_negative.enabled``, so ``check_hard_negative_readiness`` refuses
+the degenerate combination (enabled + missing/unusable sidecar) at
+``config validate`` time and at the training launch.
+
 Schema (parquet columns):
 
     source_video_uid   string (primary key)
@@ -63,16 +68,23 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
     if not path.is_file():
         return {}
     _, pq = _pyarrow()
-    schema_names = set(pq.read_schema(path).names)
+    # Use open() so Python's own reference counting closes the OS handle
+    # when the with-block exits.  Passing a Path to pq.read_schema /
+    # pq.read_table keeps a C++ NativeFile alive until GC fires, which on
+    # Windows blocks TemporaryDirectory cleanup and any atomic replacement
+    # of the sidecar file.
+    with open(path, "rb") as fh:
+        schema_names = set(pq.read_schema(fh).names)
     required = {"source_video_uid"}
     missing = required - schema_names
     if missing:
         raise ValueError(
             f"Metadata sidecar {path} is missing required columns: {sorted(missing)}"
         )
-    table = pq.read_table(path, memory_map=False)
+    with open(path, "rb") as fh:
+        rows = pq.read_table(fh).to_pylist()
     result: dict[str, dict[str, Any]] = {}
-    for row in table.to_pylist():
+    for row in rows:
         uid = str(row["source_video_uid"])
         result[uid] = {
             "negative_subtype": row.get("negative_subtype"),
@@ -83,6 +95,88 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
             "metadata_version": int(row.get("metadata_version", 1)),
         }
     return result
+
+
+def check_hard_negative_readiness(config: dict[str, Any]) -> list[str]:
+    """Return the reasons ``data.hard_negative`` would silently degrade.
+
+    ``read_metadata_sidecar`` treats a missing file as "no metadata", which is
+    the right default for an optional sidecar but is a trap for
+    ``hard_negative.enabled``: every negative would fall into the ordinary
+    bucket and training would quietly run plain negative sampling. The
+    structural half of the contract (sidecar configured, hard_subtypes
+    non-empty, positive mix weights) lives in ``config_schema
+    .semantic_validate`` because that layer must stay filesystem-free; this
+    function is the filesystem half and is called from
+    ``cls-trainer config validate`` and from the training launch.
+
+    Returns an empty list when hard-negative mixing is disabled or ready.
+    """
+    data_cfg = config.get("data") or {}
+    hard_negative = data_cfg.get("hard_negative") or {}
+    if not hard_negative.get("enabled", False):
+        return []
+    problems: list[str] = []
+    sidecar_path = data_cfg.get("metadata_sidecar")
+    if not sidecar_path:
+        # semantic_validate already reports this; keep the list non-empty so a
+        # caller that only runs this check still refuses the config.
+        return [
+            "data.hard_negative.enabled requires data.metadata_sidecar to "
+            "point at a per-video metadata parquet."
+        ]
+    path = Path(sidecar_path)
+    if not path.is_file():
+        return [
+            f"data.metadata_sidecar={sidecar_path} does not exist, but "
+            "data.hard_negative.enabled=true. A missing sidecar reads as "
+            "'no metadata', so every negative would fall into the ordinary "
+            "bucket and training would silently degrade to plain negative "
+            "sampling."
+        ]
+    hard_subtypes = set(hard_negative.get("hard_subtypes") or [])
+    if not hard_subtypes:
+        return [
+            "data.hard_negative.enabled requires a non-empty "
+            "data.hard_negative.hard_subtypes."
+        ]
+    subtype_field = str(hard_negative.get("subtype_field", "negative_subtype"))
+    # apply_sidecar only ever joins negative_subtype/sample_weight onto a
+    # VideoEntry, so any other field would read as None for every video.
+    if subtype_field != "negative_subtype":
+        return [
+            f"data.hard_negative.subtype_field={subtype_field!r} is never "
+            "populated: the sidecar join only sets negative_subtype, so every "
+            "video would read None and the hard bucket would stay empty."
+        ]
+    try:
+        sidecar = read_metadata_sidecar(path)
+    except RuntimeError as exc:
+        # pyarrow missing: say so instead of crashing a config check.
+        return [f"Cannot verify data.metadata_sidecar={sidecar_path}: {exc}"]
+    tagged = sorted(
+        {
+            str(meta.get("negative_subtype"))
+            for meta in sidecar.values()
+            if meta.get("negative_subtype") in hard_subtypes
+        }
+    )
+    if not tagged:
+        present = sorted(
+            {
+                str(meta.get("negative_subtype"))
+                for meta in sidecar.values()
+                if meta.get("negative_subtype")
+            }
+        )
+        problems.append(
+            f"data.metadata_sidecar={sidecar_path} carries no video whose "
+            f"negative_subtype is in data.hard_negative.hard_subtypes="
+            f"{sorted(hard_subtypes)} (sidecar rows: {len(sidecar)}; subtypes "
+            f"present: {present or 'none'}). The hard bucket would be empty "
+            "and sampling would degrade to ordinary negatives."
+        )
+    return problems
 
 
 def validate_sidecar_against_index(

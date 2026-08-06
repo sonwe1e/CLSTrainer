@@ -162,6 +162,81 @@ def _selection_rank_key(
     return float(_selection_score(metrics, evaluation_config)[0])
 
 
+def selection_sort_value(
+    metrics: dict,
+    evaluation_config: dict,
+    *,
+    include_eligibility: bool = True,
+) -> list[float]:
+    """Return the selection rank key as an orderable JSON-serializable list.
+
+    Every consumer that has to order selection candidates (best checkpoint,
+    early stopping, topk, the Run index) must go through this helper so the
+    orderings can never disagree. The scalar rank key of metric/composite
+    mode becomes a one-element list and the constrained tuple becomes a
+    three-element list, so the value survives a round-trip through
+    ``topk_registry.json`` / ``index.jsonl`` and still compares
+    lexicographically (a JSON list decodes back to a list, a tuple would
+    not).
+
+    Bigger is always better, in every mode: the constrained key already
+    stores ``-negative_score_p999`` so its "lower is better" component
+    maximizes like the rest.
+
+    With ``include_eligibility`` (the default) the key is prefixed with
+    ``1.0``/``0.0``, which places every eligible candidate above every
+    ineligible one -- the same precedence ``_is_better_model`` applies. Pass
+    ``include_eligibility=False`` when the caller gates on eligibility
+    itself and needs the bare metric key (early stopping, where the prefix
+    would otherwise absorb ``min_delta``).
+    """
+    key = _selection_rank_key(metrics, evaluation_config)
+    parts = (
+        [float(component) for component in key]
+        if isinstance(key, tuple)
+        else [float(key)]
+    )
+    if include_eligibility:
+        return [
+            1.0 if _selection_eligible(metrics, evaluation_config) else 0.0,
+            *parts,
+        ]
+    return parts
+
+
+def selection_report_fields(metrics: dict, evaluation_config: dict) -> dict:
+    """Return the selection facts a Run has to publish for comparison.
+
+    ``selection_score`` alone cannot explain a constrained decision: two runs
+    can share a recall and still differ on eligibility, worst-game recall or
+    the negative tail. The Run index and ``run compare`` both read these
+    fields, so they live next to the selection rules instead of being spelled
+    out twice.
+    """
+    # The bare key's leading component is the primary objective in every
+    # mode (the scalar score, or global positive recall when constrained).
+    primary = selection_sort_value(
+        metrics, evaluation_config, include_eligibility=False
+    )[0]
+    return {
+        "selection_mode": _selection_mode(evaluation_config),
+        "selection_eligible": _selection_eligible(metrics, evaluation_config),
+        "selection_sort_value": selection_sort_value(metrics, evaluation_config),
+        "selection_score": primary,
+        "global_positive_recall": _metric_value(
+            metrics, "global_positive_recall_at_decision_threshold"
+        ),
+        "worst_game_positive_recall": _metric_value(
+            metrics, "worst_game_positive_recall_at_decision_threshold"
+        ),
+        "negative_score_p999": _metric_value(metrics, "negative_score_p999"),
+        "global_fpr": _metric_value(metrics, "global_fpr_at_decision_threshold"),
+        "worst_game_fpr": _metric_value(
+            metrics, "worst_game_fpr_at_decision_threshold"
+        ),
+    }
+
+
 def _annotate_selection(metrics: dict, evaluation_config: dict) -> dict:
     metrics["selection_mode"] = _selection_mode(evaluation_config)
     metrics["selection_eligible"] = _selection_eligible(metrics, evaluation_config)

@@ -102,8 +102,35 @@ def probe_npu_environment() -> dict[str, tuple[bool | None, str]]:
                 probe(device)
                 results[f"device op: {op}"] = (True, "ok")
             except Exception as exc:  # noqa: BLE001
-                results[f"device op: {op}"] = (False, str(exc)[:200])
+                results[f"device op: {op}"] = (False, _describe_probe_failure(exc))
     return results
+
+
+def _describe_probe_failure(exc: BaseException) -> str:
+    """Render a probe failure without discarding the diagnosis.
+
+    CANN operator errors put the actionable part (``EZ9999``, the operator
+    name, the suggested workaround) well past the first 200 characters, and
+    they arrive wrapped, so the outer message is often just "run failed".
+    Keep the exception type, the full chain, and a generous budget.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).strip()
+        parts.append(
+            f"{type(current).__name__}: {message}"
+            if message
+            else type(current).__name__
+        )
+        current = current.__cause__ or current.__context__
+    detail = " <- caused by ".join(parts)
+    limit = 4000
+    if len(detail) > limit:
+        detail = detail[:limit] + f"... [truncated, {len(detail)} chars total]"
+    return detail
 
 
 def _probe_bincount(device) -> None:
@@ -137,13 +164,44 @@ def _probe_index_select(device) -> None:
 
 
 def _probe_grad_scaler(device) -> None:
+    """Exercise the whole AMP step, not just ``scale()``.
+
+    The old probe called ``scaler.scale(loss).backward()`` on a tensor that
+    never had ``requires_grad``, so autograd refused before the scaler was
+    tested at all -- it reported a failure on every host, including working
+    ones. The parts that actually break on a new CANN build are the
+    inf/nan check inside ``step()`` and the scale bookkeeping in
+    ``update()``, so drive a real parameter through both and confirm the
+    optimizer moved it.
+    """
     import torch
     from torch.amp import GradScaler
 
     scaler = GradScaler(device.type, enabled=True)
-    x = torch.randn(4, 4, device=device)
-    y = (x * x).sum()
-    scaler.scale(y).backward()
+    weight = torch.nn.Parameter(torch.randn(4, 4, device=device))
+    optimizer = torch.optim.SGD([weight], lr=0.1)
+    before = weight.detach().clone()
+
+    loss = (weight * weight).sum()
+    scaler.scale(loss).backward()
+    if weight.grad is None:
+        raise RuntimeError("scaler.scale(loss).backward() produced no gradient")
+    scaler.unscale_(optimizer)
+    if not bool(torch.isfinite(weight.grad).all()):
+        raise RuntimeError("scaler.unscale_ produced non-finite gradients")
+    scaler.step(optimizer)
+    scaler.update()
+
+    scale = float(scaler.get_scale())
+    if not (scale > 0.0 and scale == scale and scale != float("inf")):
+        raise RuntimeError(f"scaler.update() left a non-finite scale: {scale}")
+    if bool(torch.equal(weight.detach(), before)):
+        # A broken inf/nan check silently skips every step, so training
+        # would run to completion without the loss ever moving.
+        raise RuntimeError(
+            "scaler.step() did not apply the update (weights unchanged) -- "
+            "the inf/nan check likely rejects finite gradients"
+        )
 
 
 _DEVICE_OP_PROBES: dict[str, Callable[..., Any]] = {

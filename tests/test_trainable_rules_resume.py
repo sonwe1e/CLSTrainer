@@ -15,6 +15,17 @@ except ImportError:
 
 RULES = {"cls_head": {"pattern": r"^cls\.", "lr_scale": 1.0, "unfreeze_at_step": 0}}
 
+# A staged rule set: the second stage opens at step 4, so any checkpoint saved
+# after that carries MORE optimizer parameter groups than a step-0 optimizer.
+STAGED_RULES = {
+    "cls_head": {"pattern": r"^cls\.", "lr_scale": 1.0, "unfreeze_at_step": 0},
+    "backbone_late": {
+        "pattern": r"^backbone\.0\.",
+        "lr_scale": 0.1,
+        "unfreeze_at_step": 4,
+    },
+}
+
 
 @unittest.skipIf(torch is None, "torch is not installed")
 class TrainableRulesResumeTests(unittest.TestCase):
@@ -72,6 +83,41 @@ class TrainableRulesResumeTests(unittest.TestCase):
             resume_config["train"]["max_steps"] = 18
             result2 = run_training(resume_config)
             self.assertGreaterEqual(int(result2["global_step"]), 18)
+
+    def test_resume_past_unfreeze_boundary_rebuilds_matching_groups(self) -> None:
+        """A checkpoint saved past a boundary has more optimizer groups than a
+        step-0 optimizer. Resume must rebuild the optimizer for the SAVED step
+        before loading, or ``load_state_dict`` raises "loaded state dict has a
+        different number of parameter groups"."""
+        from game_cls.engine.trainer import run_training
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(directory)
+            config["model"]["trainable_rules"] = STAGED_RULES
+            result = run_training(config)
+            run_dir = Path(result["output_dir"])
+            checkpoint_path = run_dir / "checkpoints" / "checkpoint_last.pth"
+            saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            # Saved past step 4, so the late stage is live in both the mask and
+            # the optimizer state.
+            self.assertIn("backbone.0.weight", saved["trainable_state"])
+            groups_at_save = len(saved["optimizer"]["param_groups"])
+            self.assertGreater(groups_at_save, 2)
+
+            resume_config = self._config(directory)
+            resume_config["model"]["trainable_rules"] = STAGED_RULES
+            resume_config["train"]["resume_path"] = str(checkpoint_path)
+            resume_config["train"]["max_steps"] = 18
+            result2 = run_training(resume_config)
+            self.assertGreaterEqual(int(result2["global_step"]), 18)
+            resumed = torch.load(
+                run_dir / "checkpoints" / "checkpoint_last.pth",
+                map_location="cpu",
+                weights_only=False,
+            )
+            # The group layout survived the round trip -- no silent regrouping.
+            self.assertEqual(len(resumed["optimizer"]["param_groups"]), groups_at_save)
+            self.assertIn("backbone.0.weight", resumed["trainable_state"])
 
     def test_changed_rules_block_resume(self) -> None:
         from game_cls.engine.trainer import run_training

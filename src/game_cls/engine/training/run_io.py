@@ -9,7 +9,12 @@ from game_cls.engine.checkpoint import (
     clone_checkpoint_pair,
     remove_checkpoint_pair,
 )
-from game_cls.engine.training.selection import _metric_value
+from game_cls.engine.training.selection import (
+    _metric_value,
+    _selection_eligible,
+    selection_report_fields,
+    selection_sort_value,
+)
 from game_cls.runs import (
     STATE_FAILED,
     STATE_SUCCEEDED,
@@ -21,6 +26,24 @@ from game_cls.runs import (
     write_manifest,
 )
 
+# ``topk_monitor`` values that mean "rank by the selection contract".
+_SELECTION_TOPK_MONITORS = frozenset({"selection_score", "selection"})
+
+
+def _topk_entry_sort_value(entry: dict, *, lower_better: bool) -> list[float]:
+    """Sort key of an existing registry entry, best-first when descending.
+
+    Entries written by the current code carry ``sort_value``. Entries restored
+    from a checkpoint written before that only have the scalar ``value``, so
+    it is lifted into the same shape (negated for lower-is-better monitors,
+    which the rank key never needs because it always maximizes).
+    """
+    sort_value = entry.get("sort_value")
+    if isinstance(sort_value, (list, tuple)):
+        return [float(component) for component in sort_value]
+    value = float(entry.get("value") or 0.0)
+    return [-value] if lower_better else [value]
+
 
 def _maybe_save_topk(
     *,
@@ -29,6 +52,7 @@ def _maybe_save_topk(
     metrics: dict,
     global_step: int,
     evaluation_state: dict,
+    evaluation_cfg: dict | None = None,
 ) -> None:
     """Register the current full-validation checkpoint in the topk list.
 
@@ -36,25 +60,54 @@ def _maybe_save_topk(
     evicts the worst entries beyond ``save_topk``, and persists the
     registry both in ``evaluation_state`` (so resume continues the list)
     and in ``checkpoints/topk_registry.json``.
+
+    ``topk_monitor: selection_score`` (the default) ranks by
+    ``selection_sort_value``, so the topk order is the order
+    ``_is_better_model`` would produce -- in constrained mode that is
+    recall -> worst-game recall -> negative p99.9, not a single scalar. Any
+    other monitor names one numeric metric and keeps the original scalar
+    ordering (lower is better for ``cross_entropy``).
+
+    Ineligible checkpoints are **admitted but ranked strictly below every
+    eligible one** (eligibility is the leading component of the sort key)
+    rather than filtered out. Dropping them would leave the registry empty
+    for the whole early phase of a constrained run, where no candidate meets
+    the FPR gates yet, and those near-miss snapshots are exactly what an
+    operator inspects; ranking them last still guarantees an eligible
+    checkpoint is never evicted in favor of an ineligible one.
     """
     topk = int(checkpoint_cfg.get("save_topk", 0))
     if topk <= 0:
         return
     monitor = str(checkpoint_cfg.get("topk_monitor", "selection_score"))
-    value = _metric_value(metrics, monitor)
-    if not isinstance(value, (int, float)):
-        return
-    value = float(value)
-    lower_better = monitor == "cross_entropy"
+    by_selection = evaluation_cfg is not None and monitor in _SELECTION_TOPK_MONITORS
+    lower_better = not by_selection and monitor == "cross_entropy"
+    eligible = True
+    if by_selection:
+        assert evaluation_cfg is not None  # narrowed by by_selection
+        try:
+            sort_value = selection_sort_value(metrics, evaluation_cfg)
+            eligible = _selection_eligible(metrics, evaluation_cfg)
+        except (KeyError, TypeError, ValueError):
+            # The selection metric is absent from this payload; registering an
+            # unrankable checkpoint would corrupt the order.
+            return
+        # Reported value: the primary objective, so `run show` / summary.md
+        # keep printing one comparable number per entry.
+        value = sort_value[1]
+    else:
+        raw = _metric_value(metrics, monitor)
+        if not isinstance(raw, (int, float)):
+            return
+        value = float(raw)
+        sort_value = [-value] if lower_better else [value]
     registry = list(evaluation_state.get("topk_registry") or [])
     if any(int(entry.get("step", -1)) == int(global_step) for entry in registry):
         return
-    worse_than_new = (
-        (lambda entry: entry["value"] >= value)
-        if lower_better
-        else (lambda entry: entry["value"] <= value)
-    )
-    if len(registry) >= topk and not any(worse_than_new(entry) for entry in registry):
+    if len(registry) >= topk and not any(
+        _topk_entry_sort_value(entry, lower_better=lower_better) <= sort_value
+        for entry in registry
+    ):
         return
     tag = f"topk_{global_step:08d}"
     clone_checkpoint_pair(output_dir / "checkpoints", "last", tag)
@@ -62,12 +115,17 @@ def _maybe_save_topk(
         {
             "step": int(global_step),
             "value": value,
+            "sort_value": sort_value,
+            "eligible": bool(eligible),
             "monitor": monitor,
             "tag": tag,
             "filename": f"model_{tag}.pth",
         }
     )
-    registry.sort(key=lambda entry: entry["value"], reverse=not lower_better)
+    registry.sort(
+        key=lambda entry: _topk_entry_sort_value(entry, lower_better=lower_better),
+        reverse=True,
+    )
     evicted = registry[topk:]
     registry = registry[:topk]
     for entry in evicted:
@@ -272,11 +330,7 @@ def _finalize_run_success(
     except OSError:
         pass
     if run_mode == "unique" or run_id is not None:
-        selection_score = (
-            best_metrics.get("selection_score")
-            if isinstance(best_metrics, dict)
-            else None
-        )
+        selection = _run_index_selection(best_metrics, config.get("evaluation") or {})
         append_run_index(
             runs_root,
             {
@@ -290,9 +344,28 @@ def _finalize_run_success(
                 "duration_seconds": round(duration, 3),
                 "global_step": global_step,
                 "total_steps": total_steps,
-                "selection_score": selection_score,
+                # Kept flat for readers that predate the block below.
+                "selection_score": selection.get("selection_score"),
+                "selection": selection,
             },
         )
+
+
+def _run_index_selection(best_metrics: dict, evaluation_cfg: dict) -> dict:
+    """Selection block appended to the Run index for ``run compare``.
+
+    A lone ``selection_score`` cannot explain a constrained decision, so the
+    index also carries eligibility, the full rank key and the metrics the
+    gates and tie-breakers read. Recording it must never fail a finished run:
+    metrics that do not match the current selection config (an old resumed
+    checkpoint, a partial payload) degrade to the raw ``selection_score``.
+    """
+    if not isinstance(best_metrics, dict) or not best_metrics:
+        return {"selection_score": None}
+    try:
+        return selection_report_fields(best_metrics, evaluation_cfg)
+    except (KeyError, TypeError, ValueError):
+        return {"selection_score": best_metrics.get("selection_score")}
 
 
 # Evaluation kinds and their train/validation/test protocol roles.

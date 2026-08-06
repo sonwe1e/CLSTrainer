@@ -143,6 +143,163 @@ class SemanticValidationTests(unittest.TestCase):
         config = self._load()
         self.assertAlmostEqual(config["decision"]["threshold"], 0.99)
 
+    # --- Defect 3: mode: min with a selection monitor (step6 remediation) ---
+
+    def test_selection_monitor_with_mode_min_is_rejected(self) -> None:
+        """The bad combination must produce a loud error naming both keys."""
+        with self.assertRaises(ConfigSchemaError) as ctx:
+            self._load(
+                **{
+                    "early_stopping.monitor": "selection_score",
+                    "early_stopping.mode": "min",
+                }
+            )
+        message = str(ctx.exception)
+        self.assertIn("early_stopping.monitor", message)
+        self.assertIn("early_stopping.mode", message)
+
+    def test_selection_alias_with_mode_min_is_also_rejected(self) -> None:
+        """The `selection` alias must trigger the same error."""
+        with self.assertRaises(ConfigSchemaError) as ctx:
+            self._load(
+                **{
+                    "early_stopping.monitor": "selection",
+                    "early_stopping.mode": "min",
+                }
+            )
+        message = str(ctx.exception)
+        self.assertIn("early_stopping.monitor", message)
+        self.assertIn("early_stopping.mode", message)
+
+    def test_selection_monitor_with_mode_max_is_accepted(self) -> None:
+        """monitor: selection_score with mode: max is the legitimate default."""
+        # Must not raise; the combination is correct.
+        self._load(
+            **{
+                "early_stopping.monitor": "selection_score",
+                "early_stopping.mode": "max",
+            }
+        )
+
+    def test_non_selection_monitor_with_mode_min_is_accepted(self) -> None:
+        """monitor: cross_entropy with mode: min is a valid numeric config."""
+        self._load(
+            **{
+                "early_stopping.monitor": "cross_entropy",
+                "early_stopping.mode": "min",
+            }
+        )
+
+
+class BenchmarkGateSchemaTests(unittest.TestCase):
+    """A gate whose metric name or operator is wrong must fail at config time,
+    not read 'metric absent' after a full benchmark run."""
+
+    def _with_gates(self, gate_metrics: dict) -> dict:
+        config = load_config("configs/cuda_debug.yaml")
+        config.setdefault("benchmark", {})["gate_metrics"] = gate_metrics
+        return config
+
+    def test_unproducible_metric_name_is_rejected(self) -> None:
+        # These are exactly the keys the schema example used to document.
+        config = self._with_gates({"max_global_fpr": 0.01, "min_positive_recall": 0.8})
+        with self.assertRaises(ConfigSchemaError) as ctx:
+            finalize_config(config)
+        message = str(ctx.exception)
+        self.assertIn("max_global_fpr", message)
+        self.assertIn("could never pass", message)
+
+    def test_unknown_operator_is_rejected(self) -> None:
+        config = self._with_gates(
+            {"global_fpr_at_decision_threshold": {"op": "=<", "value": 0.01}}
+        )
+        with self.assertRaisesRegex(ConfigSchemaError, "not a comparison operator"):
+            finalize_config(config)
+
+    def test_scalar_on_a_non_directional_metric_is_rejected(self) -> None:
+        config = self._with_gates({"sample_count": 2000})
+        with self.assertRaisesRegex(
+            ConfigSchemaError, "no documented better-direction"
+        ):
+            finalize_config(config)
+
+    def test_explicit_and_legacy_scalar_gates_are_accepted(self) -> None:
+        config = self._with_gates(
+            {
+                "global_fpr_at_decision_threshold": 0.01,
+                "global_positive_recall_at_decision_threshold": {
+                    "op": ">=",
+                    "value": 0.8,
+                },
+                "sample_count": {"op": ">=", "value": 2000},
+            }
+        )
+        finalize_config(config)
+
+    def test_release_recipe_validates(self) -> None:
+        config = load_config("configs/recipes/game_cls_release.yaml")
+        self.assertTrue(config["data"]["hard_negative"]["enabled"])
+        self.assertTrue(config["model"]["trainable_rules"])
+        self.assertTrue(config["benchmark"]["gate_metrics"])
+
+
+class HardNegativeSchemaTests(unittest.TestCase):
+    """Structural half of the hard-negative contract. This layer is
+    filesystem-free by design, so it can only check the config itself; the
+    sidecar's existence and content are checked by
+    ``data.sidecar.check_hard_negative_readiness``."""
+
+    def _enabled(self, **overrides) -> dict:
+        config = load_config("configs/cuda_debug.yaml")
+        config["data"]["metadata_sidecar"] = "indexes/video_metadata.parquet"
+        hard_negative = config["data"].setdefault("hard_negative", {})
+        hard_negative.update(
+            {
+                "enabled": True,
+                "subtype_field": "negative_subtype",
+                "hard_subtypes": ["wooden_bridge"],
+                "ordinary_subtypes": [],
+                "negative_mix": {"ordinary": 0.5, "hard": 0.5},
+                "min_videos_per_subtype_bucket": 1,
+            }
+        )
+        hard_negative.update(overrides)
+        return config
+
+    def test_enabled_without_sidecar_is_rejected(self) -> None:
+        config = self._enabled()
+        config["data"]["metadata_sidecar"] = None
+        with self.assertRaisesRegex(ConfigSchemaError, "metadata_sidecar"):
+            finalize_config(config)
+
+    def test_enabled_without_hard_subtypes_is_rejected(self) -> None:
+        # Without hard subtypes every negative lands in the ordinary bucket:
+        # the config asks for hard-negative mixing and gets plain sampling.
+        with self.assertRaises(ConfigSchemaError) as ctx:
+            finalize_config(self._enabled(hard_subtypes=[]))
+        message = str(ctx.exception)
+        self.assertIn("hard_subtypes", message)
+        self.assertIn("degrades to ordinary negatives", message)
+
+    def test_disabled_without_hard_subtypes_is_fine(self) -> None:
+        config = self._enabled(enabled=False, hard_subtypes=[])
+        config["data"]["metadata_sidecar"] = None
+        finalize_config(config)
+
+    def test_enabled_with_hard_subtypes_is_accepted(self) -> None:
+        finalize_config(self._enabled())
+
+    def test_schema_layer_does_not_touch_the_filesystem(self) -> None:
+        # A non-existent sidecar path must still pass this layer, otherwise
+        # `config show` and every shipped-config test would need real parquet
+        # files on disk. The filesystem check lives elsewhere on purpose.
+        config = self._enabled()
+        config["data"]["metadata_sidecar"] = "indexes/definitely_not_here.parquet"
+        finalize_config(config)
+        from game_cls.data.sidecar import check_hard_negative_readiness
+
+        self.assertTrue(check_hard_negative_readiness(config))
+
 
 class DecisionThresholdTests(unittest.TestCase):
     def test_decision_threshold_is_the_single_source(self) -> None:

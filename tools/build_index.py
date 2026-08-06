@@ -36,7 +36,9 @@ def _split_config(data_config: dict) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build frame and video Parquet indexes")
+    parser = argparse.ArgumentParser(
+        description="Build frame and video Parquet indexes"
+    )
     parser.add_argument("--config", required=True)
     parser.add_argument("--train-root", required=True)
     parser.add_argument(

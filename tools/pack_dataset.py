@@ -36,9 +36,7 @@ def main() -> None:
                 "packed_video_index": str(
                     index_path.with_name("packed_video_entries.parquet")
                 ),
-                "manifest": str(
-                    index_path.with_name("packed_manifest.json")
-                ),
+                "manifest": str(index_path.with_name("packed_manifest.json")),
             },
             ensure_ascii=False,
             indent=2,

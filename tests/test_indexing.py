@@ -404,8 +404,18 @@ class SplitBundleTests(unittest.TestCase):
             self.assertGreater(audit["splits"]["val"]["valid_pairs"]["2"], 0)
             self.assertGreater(audit["splits"]["test"]["valid_pairs"]["2"], 0)
             self.assertIn("split", audit)
-            self.assertEqual(audit["split"]["split_algorithm_version"], 1)
+            self.assertEqual(
+                audit["split"]["split_algorithm_version"],
+                SPLIT_ALGORITHM_VERSION,
+            )
             self.assertFalse(audit["split"]["manifest_reused"])
+            # The summary names the ratio after the delta that drove the
+            # balancing, so a delta!=2 split is not misreported.
+            self.assertEqual(audit["split"]["target_delta"], 2)
+            self.assertEqual(
+                audit["split"]["val_ratio_achieved"],
+                audit["split"]["val_ratio_achieved_delta2"],
+            )
             validate_audit(
                 audit,
                 image_spec=image_spec,

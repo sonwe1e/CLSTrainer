@@ -7,12 +7,17 @@ score p99.9 ranking, and the unchanged metric/composite modes.
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from game_cls.engine.trainer import (
     _is_better_model,
     _selection_eligible,
     _selection_rank_key,
+)
+from game_cls.engine.training.selection import (
+    selection_report_fields,
+    selection_sort_value,
 )
 
 
@@ -174,6 +179,89 @@ class ConstrainedRankingTests(unittest.TestCase):
         eligible = _metrics()
         incumbent = _metrics(global_recall=0.5)  # below min_positive_recall
         self.assertTrue(_is_better_model(eligible, incumbent, cfg))
+
+
+class SelectionSortValueTests(unittest.TestCase):
+    """selection_sort_value is the one ordering every consumer must reuse."""
+
+    def test_constrained_key_is_a_json_round_trippable_list(self) -> None:
+        cfg = _constrained_cfg()
+        value = selection_sort_value(_metrics(), cfg)
+        self.assertIsInstance(value, list)
+        # eligibility flag + the three constrained components.
+        self.assertEqual(value, [1.0, 0.9, 0.8, 2.0])
+        # A tuple would decode back as a list and stop comparing; a list
+        # survives the topk registry / run index round-trip unchanged.
+        self.assertEqual(json.loads(json.dumps(value)), value)
+
+    def test_bare_key_drops_the_eligibility_prefix(self) -> None:
+        cfg = _constrained_cfg()
+        self.assertEqual(
+            selection_sort_value(_metrics(), cfg, include_eligibility=False),
+            [0.9, 0.8, 2.0],
+        )
+
+    def test_ineligible_sorts_below_every_eligible_candidate(self) -> None:
+        cfg = _constrained_cfg()
+        # Best scalar recall in the fixture, but the global FPR gate fails.
+        ineligible = selection_sort_value(
+            _metrics(global_fpr=0.9, global_recall=0.99), cfg
+        )
+        eligible = selection_sort_value(_metrics(global_recall=0.81), cfg)
+        self.assertLess(ineligible, eligible)
+        self.assertEqual(ineligible[0], 0.0)
+        self.assertEqual(eligible[0], 1.0)
+
+    def test_order_matches_is_better_model(self) -> None:
+        cfg = _constrained_cfg()
+        # Equal global recall, so the scalar selection_score cannot separate
+        # these two at all; only the worst-game recall / negative-p99.9
+        # tie-breakers can.
+        scalar_winner = _metrics(
+            global_recall=0.9, worst_game_recall=0.60, negative_p999=-1.0
+        )
+        tuple_winner = _metrics(
+            global_recall=0.9, worst_game_recall=0.85, negative_p999=-3.0
+        )
+        self.assertTrue(_is_better_model(tuple_winner, scalar_winner, cfg))
+        self.assertGreater(
+            selection_sort_value(tuple_winner, cfg),
+            selection_sort_value(scalar_winner, cfg),
+        )
+        # The scalar selection_score cannot see the difference at all.
+        self.assertEqual(
+            scalar_winner["global_positive_recall_at_decision_threshold"],
+            tuple_winner["global_positive_recall_at_decision_threshold"],
+        )
+
+    def test_metric_mode_key_is_a_single_component(self) -> None:
+        cfg = {"selection_metric": "global_f1_at_decision_threshold"}
+        candidate = {"global_f1_at_decision_threshold": 0.77}
+        self.assertEqual(selection_sort_value(candidate, cfg), [1.0, 0.77])
+        self.assertEqual(
+            selection_sort_value(candidate, cfg, include_eligibility=False), [0.77]
+        )
+
+    def test_report_fields_expose_eligibility_and_tie_breakers(self) -> None:
+        cfg = _constrained_cfg()
+        fields = selection_report_fields(
+            _metrics(global_recall=0.88, worst_game_recall=0.72, negative_p999=-2.5),
+            cfg,
+        )
+        self.assertEqual(fields["selection_mode"], "constrained")
+        self.assertTrue(fields["selection_eligible"])
+        self.assertAlmostEqual(fields["selection_score"], 0.88)
+        self.assertAlmostEqual(fields["worst_game_positive_recall"], 0.72)
+        self.assertAlmostEqual(fields["negative_score_p999"], -2.5)
+        self.assertEqual(fields["selection_sort_value"], [1.0, 0.88, 0.72, 2.5])
+        # JSON-serializable so it can live in index.jsonl.
+        self.assertEqual(json.loads(json.dumps(fields)), fields)
+
+    def test_report_fields_record_ineligibility(self) -> None:
+        cfg = _constrained_cfg()
+        fields = selection_report_fields(_metrics(global_fpr=0.5), cfg)
+        self.assertFalse(fields["selection_eligible"])
+        self.assertAlmostEqual(fields["global_fpr"], 0.5)
 
 
 class MetricAndCompositeSelectionTests(unittest.TestCase):

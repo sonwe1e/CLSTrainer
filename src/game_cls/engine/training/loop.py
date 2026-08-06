@@ -27,6 +27,7 @@ from game_cls.engine.training.config_validation import (
 )
 from game_cls.engine.training.early_stopping import (
     _early_stopping_defaults,
+    _early_stopping_monitor_label,
     _update_early_stopping,
 )
 from game_cls.engine.training.evaluation import (
@@ -117,6 +118,57 @@ def _rule_frozen_at_zero(rules, parameter_name: str) -> bool:
 
     rule = rule_for(rules, parameter_name)
     return rule is None or rule.unfreeze_at_step > 0
+
+
+def _wrap_distributed(bare_model, device, local_rank: int):
+    """Wrap ``bare_model`` in DDP with this project's fixed options.
+
+    DDP binds its Reducer buckets to the ``requires_grad`` set that exists at
+    construction time. Staged unfreeze therefore has to re-enter this helper
+    at every boundary that changes the trainable set, otherwise the freshly
+    unfrozen parameters sit in no bucket at all and their gradients are never
+    all-reduced -- each rank would silently train its own copy.
+    """
+    from torch.nn.parallel import DistributedDataParallel
+
+    # CPU DDP must NOT pass device_ids (it has no CUDA devices);
+    # only CUDA/NPU rank-to-device binding is valid.
+    ddp_kwargs: dict[str, Any] = {}
+    if device.type in ("cuda", "npu"):
+        ddp_kwargs["device_ids"] = [local_rank]
+    return DistributedDataParallel(
+        bare_model,
+        find_unused_parameters=False,
+        broadcast_buffers=False,
+        gradient_as_bucket_view=True,
+        **ddp_kwargs,
+    )
+
+
+def _prune_unfrozen_from_snapshot(
+    frozen_snapshot: dict | None, bare_model
+) -> dict | None:
+    """Drop parameters that have since been unfrozen from the frozen snapshot.
+
+    ``verify_frozen_parameters`` asserts that every parameter captured while
+    frozen is still bitwise identical at the end of the run. Staged unfreeze
+    legitimately starts training some of those parameters, so their entries
+    have to leave the snapshot at the unfreeze boundary. Parameters that stay
+    frozen keep their ORIGINAL captured value, so the check still covers the
+    whole run for them rather than restarting at each boundary.
+    """
+    if frozen_snapshot is None:
+        return None
+    trainable_now = {
+        name
+        for name, parameter in bare_model.named_parameters()
+        if parameter.requires_grad
+    }
+    return {
+        name: value
+        for name, value in frozen_snapshot.items()
+        if name not in trainable_now
+    }
 
 
 def run_training(
@@ -319,21 +371,14 @@ def run_training(
             )
         _set_train_mode(model, config["model"])
         model.to(device)
+        # ``bare_model`` always refers to the undecorated module. Every
+        # requires_grad / optimizer-group / freeze-snapshot operation must go
+        # through it: DDP prefixes parameter names with "module.", which does
+        # not match the anchored regexes in ``model.trainable_rules`` nor the
+        # unprefixed names stored in checkpoints' ``trainable_state``.
+        bare_model = model
         if world_size > 1:
-            from torch.nn.parallel import DistributedDataParallel
-
-            # CPU DDP must NOT pass device_ids (it has no CUDA devices);
-            # only CUDA/NPU rank-to-device binding is valid.
-            ddp_kwargs: dict[str, Any] = {}
-            if device.type in ("cuda", "npu"):
-                ddp_kwargs["device_ids"] = [local_rank]
-            model = DistributedDataParallel(
-                model,
-                find_unused_parameters=False,
-                broadcast_buffers=False,
-                gradient_as_bucket_view=True,
-                **ddp_kwargs,
-            )
+            model = _wrap_distributed(bare_model, device, local_rank)
         frozen_snapshot = None
         if rank == 0:
             print("Trainable parameters:")
@@ -379,6 +424,15 @@ def run_training(
             train_cfg.get("max_steps")
             or int(train_cfg["epochs"]) * int(train_cfg["steps_per_epoch"])
         )
+        # The trainable name set the CURRENT optimizer/DDP wrapper was built
+        # from. The unfreeze boundary compares against this instead of
+        # recomputing step-1, so a rule with unfreeze_at_step == 0 does not
+        # trigger a pointless rebuild on the first batch.
+        current_trainable: set[str] = {
+            name
+            for name, parameter in bare_model.named_parameters()
+            if parameter.requires_grad
+        }
         if rules is not None:
             from game_cls.model.trainable_rules import (
                 build_optimizer_parameter_groups as build_rule_groups,
@@ -386,7 +440,7 @@ def run_training(
 
             optimizer = torch.optim.AdamW(
                 build_rule_groups(
-                    model,
+                    bare_model,
                     rules,
                     step=0,
                     weight_decay=float(config["optimizer"]["weight_decay"]),
@@ -429,27 +483,69 @@ def run_training(
         }
         resume_path = train_cfg.get("resume_path")
         if resume_path:
-            # Step5 P4 rule-aware resume: peek the saved trainable state so
-            # the restore key-set check sees the SAVED requires_grad mask,
-            # then re-apply the current step's rules and rebuild the
-            # optimizer (transferring per-parameter state for params that
-            # were already trainable).
+            # Step5 P4 rule-aware resume: peek the checkpoint to learn which
+            # step it was saved at, re-apply the rules for THAT step, and
+            # rebuild the optimizer/scheduler BEFORE restoring. The saved
+            # optimizer state has one group per (rule, decay) pair that was
+            # live at save time, so a checkpoint taken past an unfreeze
+            # boundary has more groups than the step-0 optimizer built above;
+            # loading into that optimizer raises "loaded state dict has a
+            # different number of parameter groups".
             if rules is not None:
                 import torch
 
-                peek = torch.load(resume_path, map_location="cpu", weights_only=False)
-                saved_fingerprint = peek.get("trainable_rules_fingerprint")
+                from game_cls.model.trainable_rules import (
+                    apply_trainable_state as apply_rules_at_step,
+                )
+                from game_cls.model.trainable_rules import (
+                    build_optimizer_parameter_groups as build_rule_groups,
+                )
                 from game_cls.model.trainable_rules import rules_fingerprint
 
+                peek = torch.load(resume_path, map_location="cpu", weights_only=False)
+                saved_fingerprint = peek.get("trainable_rules_fingerprint")
                 if saved_fingerprint and saved_fingerprint != rules_fingerprint(rules):
                     raise RuntimeError(
                         "Resume blocked: model.trainable_rules changed since "
                         "this checkpoint (rules fingerprint differs). Use "
                         "--fork to start a new run from an old checkpoint."
                     )
+                saved_step = int(peek.get("global_step", 0))
+                # ``trainable_state`` was written from unwrap_model(...), so it
+                # holds unprefixed names -- compare against bare_model.
                 saved_trainable = set(peek.get("trainable_state") or [])
-                for name, parameter in model.named_parameters():
-                    parameter.requires_grad = name in saved_trainable
+                apply_rules_at_step(bare_model, rules, saved_step)
+                current_trainable = {
+                    name
+                    for name, parameter in bare_model.named_parameters()
+                    if parameter.requires_grad
+                }
+                if saved_trainable and current_trainable != saved_trainable:
+                    raise RuntimeError(
+                        "Resume blocked: replaying model.trainable_rules at the "
+                        f"saved step ({saved_step}) does not reproduce the saved "
+                        "requires_grad mask: "
+                        f"missing={sorted(saved_trainable - current_trainable)}, "
+                        f"unexpected={sorted(current_trainable - saved_trainable)}. "
+                        "Use --fork to start a new run from this checkpoint."
+                    )
+                # The wrapper built above froze its Reducer around the step-0
+                # trainable set; the restored set is generally larger, so DDP
+                # has to be rebuilt before the first backward pass.
+                if world_size > 1:
+                    model = _wrap_distributed(bare_model, device, local_rank)
+                optimizer = torch.optim.AdamW(
+                    build_rule_groups(
+                        bare_model,
+                        rules,
+                        step=saved_step,
+                        weight_decay=float(config["optimizer"]["weight_decay"]),
+                        base_lr=float(config["optimizer"]["learning_rate"]),
+                    )
+                )
+                scheduler = _build_scheduler(
+                    optimizer, config["scheduler"], total_steps
+                )
             checkpoint = restore_training_checkpoint(
                 resume_path,
                 model,
@@ -459,30 +555,6 @@ def run_training(
                 expected_base_checkpoint=config["model"].get("checkpoint_path"),
             )
             global_step = int(checkpoint.get("global_step", 0))
-            if rules is not None:
-                from game_cls.model.trainable_rules import (
-                    apply_trainable_state as apply_rules_at_step,
-                )
-                from game_cls.model.trainable_rules import (
-                    build_optimizer_parameter_groups as build_rule_groups,
-                )
-
-                apply_rules_at_step(model, rules, global_step)
-                old_optimizer = optimizer
-                optimizer = torch.optim.AdamW(
-                    build_rule_groups(
-                        model,
-                        rules,
-                        step=global_step,
-                        weight_decay=float(config["optimizer"]["weight_decay"]),
-                        base_lr=float(config["optimizer"]["learning_rate"]),
-                    )
-                )
-                _transfer_optimizer_state(old_optimizer, optimizer)
-                scheduler = _build_scheduler(
-                    optimizer, config["scheduler"], total_steps
-                )
-                scheduler.last_epoch = global_step
             sampler_state = checkpoint.get("sampler_state", {})
             epoch = int(
                 sampler_state.get(
@@ -523,7 +595,7 @@ def run_training(
                 f"Resume step {global_step} is not below target max step {total_steps}"
             )
         if config["train"].get("verify_frozen_parameters", False):
-            frozen_snapshot = snapshot_frozen_parameters(model)
+            frozen_snapshot = snapshot_frozen_parameters(bare_model)
         stop_after_steps = train_cfg.get("stop_after_steps")
         run_until_step = (
             min(total_steps, int(stop_after_steps))
@@ -598,31 +670,66 @@ def run_training(
                     from game_cls.model.trainable_rules import (
                         build_optimizer_parameter_groups as build_rule_groups,
                     )
+                    from game_cls.model.trainable_rules import (
+                        resolve_trainable_names,
+                    )
 
-                    apply_rules_at_step(model, rules, global_step)
-                    _set_train_mode(model, config["model"])
-                    old_optimizer = optimizer
-                    optimizer = torch.optim.AdamW(
-                        build_rule_groups(
-                            model,
-                            rules,
-                            step=global_step,
-                            weight_decay=float(config["optimizer"]["weight_decay"]),
-                            base_lr=float(config["optimizer"]["learning_rate"]),
-                        )
+                    # _unfreeze_boundary is only a cheap pre-filter: a rule with
+                    # unfreeze_at_step == 0 matches on the very first batch even
+                    # though the trainable set was already applied before the
+                    # optimizer was built. Rebuild only when the set actually
+                    # moves relative to what the current optimizer was built
+                    # from. The decision is a pure function of (rules,
+                    # global_step, parameter names), so every rank reaches the
+                    # same verdict and the DDP re-wrap below stays collective.
+                    after_names, _ = resolve_trainable_names(
+                        bare_model, rules, global_step
                     )
-                    _transfer_optimizer_state(old_optimizer, optimizer)
-                    scheduler = _build_scheduler(
-                        optimizer, config["scheduler"], total_steps
-                    )
-                    scheduler.last_epoch = global_step
-                    if rank == 0:
-                        print(
-                            f"[TRAINABLE-RULES] step={global_step}: "
-                            "unfrozen a rule; optimizer rebuilt with "
-                            f"{len(optimizer.param_groups)} groups.",
-                            flush=True,
+                    if set(after_names) != current_trainable:
+                        apply_rules_at_step(bare_model, rules, global_step)
+                        _set_train_mode(model, config["model"])
+                        if world_size > 1:
+                            # Release the gradients that alias the old
+                            # Reducer's bucket views before it is discarded.
+                            optimizer.zero_grad(set_to_none=True)
+                            model = _wrap_distributed(bare_model, device, local_rank)
+                            _set_train_mode(model, config["model"])
+                        old_optimizer = optimizer
+                        optimizer = torch.optim.AdamW(
+                            build_rule_groups(
+                                bare_model,
+                                rules,
+                                step=global_step,
+                                weight_decay=float(config["optimizer"]["weight_decay"]),
+                                base_lr=float(config["optimizer"]["learning_rate"]),
+                            )
                         )
+                        _transfer_optimizer_state(old_optimizer, optimizer)
+                        scheduler = _build_scheduler(
+                            optimizer, config["scheduler"], total_steps
+                        )
+                        scheduler.last_epoch = global_step
+                        # Newly unfrozen parameters are allowed to change from
+                        # here on, so they must leave the frozen snapshot.
+                        frozen_snapshot = _prune_unfrozen_from_snapshot(
+                            frozen_snapshot, bare_model
+                        )
+                        newly = sorted(set(after_names) - current_trainable)
+                        current_trainable = set(after_names)
+                        if rank == 0:
+                            print(
+                                f"[TRAINABLE-RULES] step={global_step}: "
+                                f"unfroze {len(newly)} parameter tensors; "
+                                f"optimizer rebuilt with "
+                                f"{len(optimizer.param_groups)} groups"
+                                + (
+                                    "; DDP re-wrapped so the new gradients "
+                                    "are all-reduced."
+                                    if world_size > 1
+                                    else "."
+                                ),
+                                flush=True,
+                            )
                 if not first_batch_logged:
                     if rank == 0:
                         print(
@@ -669,7 +776,7 @@ def run_training(
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
+                    [p for p in bare_model.parameters() if p.requires_grad],
                     train_cfg.get("gradient_clip_norm", 5.0),
                 )
                 timing["host_backward_enqueue"] += (
@@ -813,6 +920,7 @@ def run_training(
                             early_cfg,
                             quick_metrics or {},
                             global_step,
+                            config["evaluation"],
                         ):
                             early_state["stop_reason"] = "validation_plateau_quick"
                             early_state["stopped_at_step"] = global_step
@@ -820,7 +928,7 @@ def run_training(
                             if rank == 0:
                                 print(
                                     "[EARLY-STOP] quick validation plateau: "
-                                    f"monitor={early_cfg.get('monitor', 'selection_score')} "
+                                    f"monitor={_early_stopping_monitor_label(early_cfg)} "
                                     f"bad_evaluations={early_state['bad_evaluation_count']} "
                                     f"best_step={early_state['best_step']} "
                                     f"step={global_step}",
@@ -910,6 +1018,7 @@ def run_training(
                             early_cfg,
                             metrics or {},
                             global_step,
+                            config["evaluation"],
                         ):
                             early_state["stop_reason"] = "validation_plateau"
                             early_state["stopped_at_step"] = global_step
@@ -917,7 +1026,7 @@ def run_training(
                             if rank == 0:
                                 print(
                                     "[EARLY-STOP] validation plateau: "
-                                    f"monitor={early_cfg.get('monitor', 'selection_score')} "
+                                    f"monitor={_early_stopping_monitor_label(early_cfg)} "
                                     f"bad_evaluations={early_state['bad_evaluation_count']} "
                                     f"best_step={early_state['best_step']} "
                                     f"step={global_step}",
@@ -1011,6 +1120,7 @@ def run_training(
                                 metrics=metrics or {},
                                 global_step=global_step,
                                 evaluation_state=evaluation_state,
+                                evaluation_cfg=config["evaluation"],
                             )
                 elif save_last_due:
                     checkpoint_started = time.perf_counter()
@@ -1320,13 +1430,14 @@ def run_training(
                 metrics=final_metrics,
                 global_step=global_step,
                 evaluation_state=evaluation_state,
+                evaluation_cfg=config["evaluation"],
             )
         if tb_writer is not None:
             tb_writer.close()
         distributed_barrier()
         if rank == 0:
             if frozen_snapshot is not None:
-                assert_frozen_parameters_unchanged(frozen_snapshot, model)
+                assert_frozen_parameters_unchanged(frozen_snapshot, bare_model)
                 print("Verified: every frozen parameter remained bitwise unchanged.")
             summary_payload = {
                 "global_step": global_step,

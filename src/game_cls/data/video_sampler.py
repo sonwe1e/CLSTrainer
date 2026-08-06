@@ -144,6 +144,78 @@ class VideoBalancedPairBatchSampler:
                 hard_negative_cfg.get("min_videos_per_subtype_bucket", 1)
             )
 
+    def subtype_bucket_summary(self) -> dict:
+        """Describe the hard-negative buckets this sampler actually built.
+
+        Returns per-bucket distinct video counts *and* legal pair counts (the
+        eligible start positions after ``max_pairs_per_video``), because an
+        empty or tiny hard bucket is otherwise invisible: sampling falls back
+        to the other bucket and training just looks normal. Also lists the
+        under-sized (game, delta) cells that will take that fallback and the
+        negatives excluded from both buckets by ``ordinary_subtypes``.
+        """
+        if not self._hard_negative_enabled:
+            return {"enabled": False}
+        # Video counts are distinct videos (a video appears in one bucket per
+        # delta, so summing cells would multiply it by the delta count); pair
+        # counts are sums, because a video contributes different start
+        # positions at each delta.
+        videos: dict[str, set[int]] = {"ordinary": set(), "hard": set()}
+        pairs: dict[str, int] = {"ordinary": 0, "hard": 0}
+        game_videos: dict[tuple[str, str], set[int]] = {}
+        game_pairs: dict[tuple[str, str], int] = {}
+        undersized: list[dict] = []
+        excluded: set[int] = set()
+        for delta, games in self._subtype_buckets.items():
+            for game, buckets in games.items():
+                classified: set[int] = set()
+                for bucket in ("ordinary", "hard"):
+                    members = buckets.get(bucket) or []
+                    classified.update(members)
+                    cell_pairs = sum(
+                        len(self.videos[index].valid_start_positions.get(delta, ()))
+                        for index in members
+                    )
+                    videos[bucket].update(members)
+                    pairs[bucket] += cell_pairs
+                    game_videos.setdefault((game, bucket), set()).update(members)
+                    game_pairs[(game, bucket)] = (
+                        game_pairs.get((game, bucket), 0) + cell_pairs
+                    )
+                    if len(members) < self._min_videos_per_subtype_bucket:
+                        undersized.append(
+                            {
+                                "game": game,
+                                "delta": int(delta),
+                                "bucket": bucket,
+                                "videos": len(members),
+                            }
+                        )
+                excluded.update(
+                    set(self._support[delta][game][0]) - classified,
+                )
+        by_game: dict[str, dict[str, dict[str, int]]] = {}
+        for (game, bucket), members in game_videos.items():
+            by_game.setdefault(game, {})[bucket] = {
+                "videos": len(members),
+                "legal_pairs": game_pairs.get((game, bucket), 0),
+            }
+        return {
+            "enabled": True,
+            "min_videos_per_subtype_bucket": self._min_videos_per_subtype_bucket,
+            "negative_mix": dict(self._negative_mix),
+            "buckets": {
+                bucket: {
+                    "videos": len(videos[bucket]),
+                    "legal_pairs": pairs[bucket],
+                }
+                for bucket in ("ordinary", "hard")
+            },
+            "by_game": by_game,
+            "undersized_cells": undersized,
+            "excluded_videos": len(excluded),
+        }
+
     def set_epoch(self, epoch: int, start_step: int = 0) -> None:
         self.epoch = epoch
         self.start_step = start_step
