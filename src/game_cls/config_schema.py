@@ -319,19 +319,18 @@ SCHEMA: dict[str, Any] = {
                 "Optional sidecar of the mining pool (subtype_before).",
                 nullable=True,
             ),
-            "output": _k(
-                "str", "Output hard_negatives.parquet mining manifest path."
-            ),
+            "output": _k("str", "Output hard_negatives.parquet mining manifest path."),
             "top_k_per_video": _k(
                 "int",
                 "Max negatives kept per source video (avoids continuous "
                 "frames drowning the manifest).",
             ),
-            "max_samples": _k("int", "Optional global cap on mined samples.", nullable=True),
+            "max_samples": _k(
+                "int", "Optional global cap on mined samples.", nullable=True
+            ),
             "score_threshold": _k(
                 "float",
-                "Optional p_positive floor; only negatives at or above it "
-                "are kept.",
+                "Optional p_positive floor; only negatives at or above it are kept.",
                 nullable=True,
             ),
             "version": _k("int", "Mining manifest format version."),
@@ -448,6 +447,12 @@ SCHEMA: dict[str, Any] = {
         "trainable_name_contains": _k(
             "str",
             "Substring selecting trainable parameters (task profile default: cls).",
+        ),
+        "trainable_rules": _k(
+            "dict",
+            "Staged partial unfreeze: dict keyed by rule name, each rule "
+            "{pattern, lr_scale, unfreeze_at_step, priority}. When absent, "
+            "trainable_name_contains is used (legacy behavior).",
         ),
         "num_classes": _k("int", "Output classes (task profile default: 2)."),
         "freeze_backbone_batchnorm_stats": _k(
@@ -837,9 +842,7 @@ SCHEMA: dict[str, Any] = {
         "backend": _k("str", "Process group backend, e.g. gloo / nccl / hccl."),
     },
     "benchmark": {
-        "output_dir": _k(
-            "str", "Directory for benchmark reports and data probes."
-        ),
+        "output_dir": _k("str", "Directory for benchmark reports and data probes."),
         "gate_metrics": _k(
             "dict",
             "Release/benchmark gates, e.g. {max_global_fpr: 0.01, "

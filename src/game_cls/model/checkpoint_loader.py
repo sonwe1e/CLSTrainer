@@ -17,26 +17,26 @@ def validate_production_load(
     report: LoadReport,
     *,
     trainable_name_contains: str = "cls",
+    frozen_parameter_names: set[str] | None = None,
 ) -> float:
     state_keys = set(model.state_dict())
-    non_cls_keys = {key for key in state_keys if trainable_name_contains not in key}
-    loaded_non_cls = {
-        key for key in report.loaded if trainable_name_contains not in key
-    }
-    missing_non_cls = {
-        key for key in report.missing if trainable_name_contains not in key
-    }
-    mismatch_non_cls = {
-        key for key in report.shape_mismatch if trainable_name_contains not in key
-    }
-    coverage = len(loaded_non_cls) / len(non_cls_keys) if non_cls_keys else 1.0
-    if missing_non_cls or mismatch_non_cls or coverage < 1.0:
+    if frozen_parameter_names is not None:
+        # Rule-based training: the frozen set is whatever the rules leave
+        # frozen at the current step, not the legacy name token.
+        frozen_keys = {key for key in state_keys if key in frozen_parameter_names}
+    else:
+        frozen_keys = {key for key in state_keys if trainable_name_contains not in key}
+    loaded_frozen = {key for key in report.loaded if key in frozen_keys}
+    missing_frozen = {key for key in report.missing if key in frozen_keys}
+    mismatch_frozen = {key for key in report.shape_mismatch if key in frozen_keys}
+    coverage = len(loaded_frozen) / len(frozen_keys) if frozen_keys else 1.0
+    if missing_frozen or mismatch_frozen or coverage < 1.0:
         raise RuntimeError(
             "Production checkpoint must load 100% of the frozen backbone "
             "parameters and buffers: "
             f"coverage={coverage:.2%}, "
-            f"missing_non_cls={sorted(missing_non_cls)}, "
-            f"shape_mismatch_non_cls={sorted(mismatch_non_cls)}"
+            f"missing_frozen={sorted(missing_frozen)}, "
+            f"shape_mismatch_frozen={sorted(mismatch_frozen)}"
         )
     return coverage
 

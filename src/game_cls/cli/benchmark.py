@@ -217,9 +217,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             group_catalogs=getattr(
                 getattr(loader, "dataset", None), "group_catalogs", None
             ),
-            cross_entropy_weight=float(
-                config["loss"].get("cross_entropy_weight", 1.0)
-            ),
+            cross_entropy_weight=float(config["loss"].get("cross_entropy_weight", 1.0)),
             threshold_safety_margin=float(
                 config["loss"].get("threshold_safety_margin", 0.20)
             ),
@@ -233,9 +231,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         )
         distributed_barrier()
         metrics = dict(result.metrics or {})
-        gates = check_gates(
-            metrics, config["benchmark"].get("gate_metrics") or {}
-        )
+        gates = check_gates(metrics, config["benchmark"].get("gate_metrics") or {})
         report_path = write_benchmark_report(
             Path(config["benchmark"].get("output_dir", "benchmarks")),
             run_id=run_dir.name,
@@ -251,9 +247,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
                 {
                     "report": str(report_path),
                     "scores": {
-                        "global_fpr": metrics.get(
-                            "global_fpr_at_decision_threshold"
-                        ),
+                        "global_fpr": metrics.get("global_fpr_at_decision_threshold"),
                         "global_recall": metrics.get(
                             "global_positive_recall_at_decision_threshold"
                         ),

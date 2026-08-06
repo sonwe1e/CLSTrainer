@@ -9,6 +9,16 @@ from functools import lru_cache
 from pathlib import Path
 
 
+def _rules_fingerprint(config: dict) -> str | None:
+    """Stable fingerprint of ``model.trainable_rules`` (None when absent)."""
+    rules_cfg = (config.get("model") or {}).get("trainable_rules")
+    if not rules_cfg:
+        return None
+    from game_cls.model.trainable_rules import parse_rules, rules_fingerprint
+
+    return rules_fingerprint(parse_rules(rules_cfg))
+
+
 def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -211,6 +221,18 @@ def save_checkpoint_pair(
             ),
             "base_checkpoint": base_checkpoint,
             "base_checkpoint_sha256": base_hash,
+            # Step5 P4: the trainable set and its rules fingerprint so resume
+            # can restore the saved requires_grad mask and refuse rule edits.
+            "trainable_state": sorted(
+                name
+                for name, parameter in unwrapped.named_parameters()
+                if parameter.requires_grad
+            ),
+            "trainable_rules_fingerprint": (
+                _rules_fingerprint(config)
+                if config.get("model", {}).get("trainable_rules")
+                else None
+            ),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler else None,
             "scaler": scaler.state_dict() if scaler else None,

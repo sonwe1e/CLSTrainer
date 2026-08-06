@@ -280,8 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
     annotate.add_argument(
         "--subtype",
         default=None,
-        help="negative_subtype assigned to mined videos (requires "
-        "--from-mining).",
+        help="negative_subtype assigned to mined videos (requires --from-mining).",
     )
     annotate.add_argument("overrides", nargs="*", metavar="key=value")
     annotate.set_defaults(func=cmd_dataset_annotate)
@@ -292,8 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_sub = benchmark.add_subparsers(dest="benchmark_command", required=True)
     scan = benchmark_sub.add_parser(
         "scan-negatives",
-        help="Score a negative pool with a checkpoint and write the mining "
-        "manifest.",
+        help="Score a negative pool with a checkpoint and write the mining manifest.",
     )
     scan.add_argument("--config")
     scan.add_argument("--run", required=True)

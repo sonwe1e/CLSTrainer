@@ -214,7 +214,10 @@ def write_benchmark_report(
         "run_id": run_id,
         "checkpoint": checkpoint_alias,
         "scores": _scores_from_metrics(metrics),
-        "gates": [{"name": name, "passed": passed, "detail": detail} for name, passed, detail in gates],
+        "gates": [
+            {"name": name, "passed": passed, "detail": detail}
+            for name, passed, detail in gates
+        ],
         "grouped": grouped_metrics or {},
     }
     path = report_dir / "report.json"

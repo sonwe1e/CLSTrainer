@@ -144,6 +144,7 @@ RESUME_CRITICAL_DIFFS = {
     "data.game_alpha",
     "model.factory",
     "model.trainable_name_contains",
+    "model.trainable_rules",
     "model.num_classes",
     "model.checkpoint_path",
     "model.require_pretrained_backbone",

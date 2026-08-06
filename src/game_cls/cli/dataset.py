@@ -244,7 +244,10 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
             return 2
         mined = read_mining_manifest(args.from_mining)
         rows = [
-            {"source_video_uid": row["source_video_uid"], "negative_subtype": args.subtype}
+            {
+                "source_video_uid": row["source_video_uid"],
+                "negative_subtype": args.subtype,
+            }
             for row in mined
         ]
         if not rows:

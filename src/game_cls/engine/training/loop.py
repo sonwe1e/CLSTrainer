@@ -89,6 +89,35 @@ from game_cls.runs import (
 )
 
 
+def _transfer_optimizer_state(old_optimizer, new_optimizer) -> None:
+    """Copy per-parameter AdamW state from ``old`` into ``new``.
+
+    Parameters present in both keep their momentum/variance/step; params
+    newly unfrozen get fresh state (the desired behavior for staged
+    unfreeze). State is keyed by the parameter Tensor itself.
+    """
+    old_state = {
+        parameter: state for parameter, state in old_optimizer.state.items() if state
+    }
+    for group in new_optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter in old_state:
+                new_optimizer.state[parameter] = old_state[parameter]
+
+
+def _unfreeze_boundary(rules, global_step: int) -> bool:
+    """True when ``global_step`` is exactly a rule's unfreeze_at_step."""
+    return any(rule.unfreeze_at_step == global_step for rule in rules)
+
+
+def _rule_frozen_at_zero(rules, parameter_name: str) -> bool:
+    """True when ``parameter_name`` is not trainable at step 0 under rules."""
+    from game_cls.model.trainable_rules import rule_for
+
+    rule = rule_for(rules, parameter_name)
+    return rule is None or rule.unfreeze_at_step > 0
+
+
 def run_training(
     config: dict[str, Any],
     run_meta: dict[str, Any] | None = None,
@@ -198,18 +227,44 @@ def run_training(
 
         model = build_model(config["model"])
         checkpoint_path = config["model"].get("checkpoint_path")
+        # Step5 P4: optional staged partial unfreeze. When
+        # ``model.trainable_rules`` is set it replaces the legacy
+        # ``trainable_name_contains`` token (byte-identical when absent).
+        from game_cls.model.freeze_policy import FreezeSummary
+        from game_cls.model.trainable_rules import (
+            apply_trainable_state,
+            parse_rules,
+        )
+
+        trainable_rules_cfg = config["model"].get("trainable_rules")
+        rules = parse_rules(trainable_rules_cfg) if trainable_rules_cfg else None
         if checkpoint_path:
             report = load_model_checkpoint(model, checkpoint_path)
             if not config["data"].get("synthetic", False) and config["model"].get(
                 "require_pretrained_backbone", True
             ):
-                coverage = validate_production_load(
-                    model,
-                    report,
-                    trainable_name_contains=config["model"].get(
-                        "trainable_name_contains", "cls"
-                    ),
-                )
+                if rules is not None:
+                    frozen_names = {
+                        name
+                        for name, _ in model.named_parameters()
+                        if _rule_frozen_at_zero(rules, name)
+                    }
+                    coverage = validate_production_load(
+                        model,
+                        report,
+                        trainable_name_contains=config["model"].get(
+                            "trainable_name_contains", "cls"
+                        ),
+                        frozen_parameter_names=frozen_names,
+                    )
+                else:
+                    coverage = validate_production_load(
+                        model,
+                        report,
+                        trainable_name_contains=config["model"].get(
+                            "trainable_name_contains", "cls"
+                        ),
+                    )
             else:
                 coverage = None
             if rank == 0:
@@ -219,9 +274,30 @@ def run_training(
                 print(f"Missing: {report.missing}")
                 print(f"Unexpected: {report.unexpected}")
                 print(f"Shape mismatch: {report.shape_mismatch}")
-        summary = configure_trainable_parameters(
-            model, config["model"].get("trainable_name_contains", "cls")
-        )
+        if rules is not None:
+            apply_trainable_state(model, rules, 0)
+            trainable_names = [
+                name
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ]
+            trainable_count = sum(
+                parameter.numel()
+                for _, parameter in model.named_parameters()
+                if parameter.requires_grad
+            )
+            frozen_count = sum(
+                parameter.numel()
+                for _, parameter in model.named_parameters()
+                if not parameter.requires_grad
+            )
+            summary = FreezeSummary(
+                tuple(trainable_names), trainable_count, frozen_count
+            )
+        else:
+            summary = configure_trainable_parameters(
+                model, config["model"].get("trainable_name_contains", "cls")
+            )
         _set_train_mode(model, config["model"])
         model.to(device)
         if world_size > 1:
@@ -284,12 +360,27 @@ def run_training(
             train_cfg.get("max_steps")
             or int(train_cfg["epochs"]) * int(train_cfg["steps_per_epoch"])
         )
-        optimizer = torch.optim.AdamW(
-            build_optimizer_parameter_groups(
-                model, float(config["optimizer"]["weight_decay"])
-            ),
-            lr=config["optimizer"]["learning_rate"],
-        )
+        if rules is not None:
+            from game_cls.model.trainable_rules import (
+                build_optimizer_parameter_groups as build_rule_groups,
+            )
+
+            optimizer = torch.optim.AdamW(
+                build_rule_groups(
+                    model,
+                    rules,
+                    step=0,
+                    weight_decay=float(config["optimizer"]["weight_decay"]),
+                    base_lr=float(config["optimizer"]["learning_rate"]),
+                )
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                build_optimizer_parameter_groups(
+                    model, float(config["optimizer"]["weight_decay"])
+                ),
+                lr=config["optimizer"]["learning_rate"],
+            )
         scheduler = _build_scheduler(optimizer, config["scheduler"], total_steps)
         use_amp = bool(config["device"].get("amp", False))
         scaler = torch.amp.GradScaler(
@@ -319,6 +410,27 @@ def run_training(
         }
         resume_path = train_cfg.get("resume_path")
         if resume_path:
+            # Step5 P4 rule-aware resume: peek the saved trainable state so
+            # the restore key-set check sees the SAVED requires_grad mask,
+            # then re-apply the current step's rules and rebuild the
+            # optimizer (transferring per-parameter state for params that
+            # were already trainable).
+            if rules is not None:
+                import torch
+
+                peek = torch.load(resume_path, map_location="cpu", weights_only=False)
+                saved_fingerprint = peek.get("trainable_rules_fingerprint")
+                from game_cls.model.trainable_rules import rules_fingerprint
+
+                if saved_fingerprint and saved_fingerprint != rules_fingerprint(rules):
+                    raise RuntimeError(
+                        "Resume blocked: model.trainable_rules changed since "
+                        "this checkpoint (rules fingerprint differs). Use "
+                        "--fork to start a new run from an old checkpoint."
+                    )
+                saved_trainable = set(peek.get("trainable_state") or [])
+                for name, parameter in model.named_parameters():
+                    parameter.requires_grad = name in saved_trainable
             checkpoint = restore_training_checkpoint(
                 resume_path,
                 model,
@@ -328,6 +440,30 @@ def run_training(
                 expected_base_checkpoint=config["model"].get("checkpoint_path"),
             )
             global_step = int(checkpoint.get("global_step", 0))
+            if rules is not None:
+                from game_cls.model.trainable_rules import (
+                    apply_trainable_state as apply_rules_at_step,
+                )
+                from game_cls.model.trainable_rules import (
+                    build_optimizer_parameter_groups as build_rule_groups,
+                )
+
+                apply_rules_at_step(model, rules, global_step)
+                old_optimizer = optimizer
+                optimizer = torch.optim.AdamW(
+                    build_rule_groups(
+                        model,
+                        rules,
+                        step=global_step,
+                        weight_decay=float(config["optimizer"]["weight_decay"]),
+                        base_lr=float(config["optimizer"]["learning_rate"]),
+                    )
+                )
+                _transfer_optimizer_state(old_optimizer, optimizer)
+                scheduler = _build_scheduler(
+                    optimizer, config["scheduler"], total_steps
+                )
+                scheduler.last_epoch = global_step
             sampler_state = checkpoint.get("sampler_state", {})
             epoch = int(
                 sampler_state.get(
@@ -432,6 +568,42 @@ def run_training(
             for batch in loaders.train:
                 yielded = True
                 batch_ready = time.perf_counter()
+                if rules is not None and _unfreeze_boundary(rules, global_step):
+                    # Step5 P4: a rule crossed its unfreeze_at_step — make the
+                    # newly unfrozen parameters trainable, rebuild the
+                    # optimizer (preserving state for already-trainable
+                    # params), and resync the scheduler.
+                    from game_cls.model.trainable_rules import (
+                        apply_trainable_state as apply_rules_at_step,
+                    )
+                    from game_cls.model.trainable_rules import (
+                        build_optimizer_parameter_groups as build_rule_groups,
+                    )
+
+                    apply_rules_at_step(model, rules, global_step)
+                    _set_train_mode(model, config["model"])
+                    old_optimizer = optimizer
+                    optimizer = torch.optim.AdamW(
+                        build_rule_groups(
+                            model,
+                            rules,
+                            step=global_step,
+                            weight_decay=float(config["optimizer"]["weight_decay"]),
+                            base_lr=float(config["optimizer"]["learning_rate"]),
+                        )
+                    )
+                    _transfer_optimizer_state(old_optimizer, optimizer)
+                    scheduler = _build_scheduler(
+                        optimizer, config["scheduler"], total_steps
+                    )
+                    scheduler.last_epoch = global_step
+                    if rank == 0:
+                        print(
+                            f"[TRAINABLE-RULES] step={global_step}: "
+                            "unfrozen a rule; optimizer rebuilt with "
+                            f"{len(optimizer.param_groups)} groups.",
+                            flush=True,
+                        )
                 if not first_batch_logged:
                     if rank == 0:
                         print(
