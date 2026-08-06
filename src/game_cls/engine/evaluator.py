@@ -25,7 +25,7 @@ class EvaluationOutput:
 
 def _metadata_dict(item: Any) -> dict:
     if is_dataclass(item):
-        return asdict(item)
+        return asdict(item)  # type: ignore[arg-type]
     if isinstance(item, dict):
         return dict(item)
     return {"sample": str(item)}
@@ -186,7 +186,9 @@ def _histogram_auc(
     if positives and negatives:
         negatives_below = 0
         concordant = 0.0
-        for positive, negative in zip(positive_histogram, negative_histogram, strict=False):
+        for positive, negative in zip(
+            positive_histogram, negative_histogram, strict=False
+        ):
             concordant += positive * (negatives_below + 0.5 * negative)
             negatives_below += negative
         roc_auc = concordant / (positives * negatives)
@@ -243,13 +245,9 @@ def _make_reduction_tensors(
     )
     floating = torch.stack(
         (
-            torch.as_tensor(
-                cross_entropy_sum, dtype=torch.float32, device=device
-            ),
+            torch.as_tensor(cross_entropy_sum, dtype=torch.float32, device=device),
             torch.as_tensor(brier_sum, dtype=torch.float32, device=device),
-            torch.as_tensor(
-                threshold_loss_sum, dtype=torch.float32, device=device
-            ),
+            torch.as_tensor(threshold_loss_sum, dtype=torch.float32, device=device),
         )
     )
     return counts, floating
@@ -290,9 +288,7 @@ def _histogram_max_margin(histogram, bins: int) -> float | None:
     """Margin at the center of the highest non-empty probability bin."""
     for bin_index in range(len(histogram) - 1, -1, -1):
         if histogram[bin_index]:
-            probability = min(
-                max((bin_index + 0.5) / bins, 1e-6), 1.0 - 1e-6
-            )
+            probability = min(max((bin_index + 0.5) / bins, 1e-6), 1.0 - 1e-6)
             return math.log(probability / (1.0 - probability))
     return None
 
@@ -346,9 +342,7 @@ def _low_fpr_histogram_metrics(
             else:
                 recall_at_bound = recall
             break
-        partial_auc += (
-            0.5 * (previous_recall + recall) * (fpr - previous_fpr)
-        )
+        partial_auc += 0.5 * (previous_recall + recall) * (fpr - previous_fpr)
         previous_fpr = fpr
         previous_recall = recall
     else:
@@ -356,9 +350,7 @@ def _low_fpr_histogram_metrics(
         # and extend the curve flat across the remaining FPR range so the
         # normalization stays consistent.
         recall_at_bound = previous_recall
-        partial_auc += previous_recall * (
-            max_fpr_for_recall - previous_fpr
-        )
+        partial_auc += previous_recall * (max_fpr_for_recall - previous_fpr)
     return recall_at_bound, partial_auc / max_fpr_for_recall
 
 
@@ -386,9 +378,7 @@ def _ece_tail(
     """ECE restricted to calibration bins overlapping ``[tail_lower, 1.0]``."""
     num_bins = len(calibration_counts)
     tail_indices = [
-        index
-        for index in range(num_bins)
-        if (index + 1) / num_bins > tail_lower
+        index for index in range(num_bins) if (index + 1) / num_bins > tail_lower
     ]
     tail_count = sum(calibration_counts[index] for index in tail_indices)
     return _calibration_metrics(
@@ -417,9 +407,7 @@ def _build_group_dicts(
     """
     group_game = {
         key: values.tolist()
-        for key, values in zip(
-            group_catalogs["game"], game_counts_array, strict=False
-        )
+        for key, values in zip(group_catalogs["game"], game_counts_array, strict=False)
         if values.sum()
     }
     group_game_label = {
@@ -451,9 +439,7 @@ def _build_group_dicts(
     return group_game, group_video, group_game_label, group_video_confidence
 
 
-def _all_reduce_group_arrays(
-    dist, sum_arrays, min_array, max_array, device
-) -> None:
+def _all_reduce_group_arrays(dist, sum_arrays, min_array, max_array, device) -> None:
     """Tensor-reduce the per-catalog numpy arrays in place on ``device``.
 
     Counts/sums use addition; the per-video probability min/max use the
@@ -495,8 +481,6 @@ def _all_reduce_group_arrays(
 # the sample count so a huge test set cannot turn into a communication and
 # rank-0 memory bottleneck. Histogram AUC is the default for large sets.
 EXACT_AUC_MAX_SAMPLES = 2_000_000
-
-
 
 
 def evaluate(
@@ -550,21 +534,14 @@ def evaluate(
     group_video_confidence: dict = {}
     vectorized_groups = bool(group_catalogs)
     if vectorized_groups:
-        game_counts_array = np.zeros(
-            (len(group_catalogs["game"]), 4), dtype=np.int64
-        )
+        assert group_catalogs is not None
+        game_counts_array = np.zeros((len(group_catalogs["game"]), 4), dtype=np.int64)
         game_label_counts_array = np.zeros(
             (len(group_catalogs["game_label"]), 4), dtype=np.int64
         )
-        video_counts_array = np.zeros(
-            (len(group_catalogs["video"]), 4), dtype=np.int64
-        )
-        video_probability_count = np.zeros(
-            len(group_catalogs["video"]), dtype=np.int64
-        )
-        video_probability_sum = np.zeros(
-            len(group_catalogs["video"]), dtype=np.float64
-        )
+        video_counts_array = np.zeros((len(group_catalogs["video"]), 4), dtype=np.int64)
+        video_probability_count = np.zeros(len(group_catalogs["video"]), dtype=np.int64)
+        video_probability_sum = np.zeros(len(group_catalogs["video"]), dtype=np.float64)
         video_probability_min = np.full(
             len(group_catalogs["video"]), np.inf, dtype=np.float64
         )
@@ -624,12 +601,12 @@ def evaluate(
                 logits_fp32 = logits.float()
                 batch_margins = logits_fp32[:, 1] - logits_fp32[:, 0]
                 probabilities = torch.sigmoid(batch_margins)
-                cross_entropy_sum.add_(torch.nn.functional.cross_entropy(
-                    logits_fp32, labels, reduction="sum"
-                ))
-                brier_sum.add_(torch.square(
-                    probabilities - labels.float()
-                ).sum())
+                cross_entropy_sum.add_(
+                    torch.nn.functional.cross_entropy(
+                        logits_fp32, labels, reduction="sum"
+                    )
+                )
+                brier_sum.add_(torch.square(probabilities - labels.float()).sum())
                 threshold_loss_sum.add_(
                     threshold_margin_loss(
                         logits_fp32,
@@ -663,12 +640,8 @@ def evaluate(
                 negative_hist += torch.bincount(
                     auc_indices[labels == 0], minlength=auc_histogram_bins
                 )
-                calibration_indices = torch.clamp(
-                    (probabilities * 20).long(), max=19
-                )
-                calibration_count += torch.bincount(
-                    calibration_indices, minlength=20
-                )
+                calibration_indices = torch.clamp((probabilities * 20).long(), max=19)
+                calibration_count += torch.bincount(calibration_indices, minlength=20)
                 calibration_probability.scatter_add_(
                     0, calibration_indices, probabilities
                 )
@@ -678,9 +651,7 @@ def evaluate(
                 confidence_indices = sum(
                     probabilities >= edge for edge in confidence_edges
                 ).to(torch.int64)
-                confidence_counts += torch.bincount(
-                    confidence_indices, minlength=5
-                )
+                confidence_counts += torch.bincount(confidence_indices, minlength=5)
 
                 raw_metadata = batch.get("meta", [{}] * len(labels))
                 batch_metadata = (
@@ -700,12 +671,8 @@ def evaluate(
                     dim=1,
                 ).cpu()
                 compact_numpy = compact.numpy()
-                targets_numpy = compact_numpy[:, 2].astype(
-                    np.int64, copy=False
-                )
-                predictions_numpy = compact_numpy[:, 3].astype(
-                    np.int64, copy=False
-                )
+                targets_numpy = compact_numpy[:, 2].astype(np.int64, copy=False)
+                predictions_numpy = compact_numpy[:, 3].astype(np.int64, copy=False)
                 if exact_scores:
                     margins.extend(compact_numpy[:, 0].tolist())
                     targets.extend(targets_numpy.tolist())
@@ -716,9 +683,7 @@ def evaluate(
                         "video_group_id",
                     )
                     missing_group_fields = [
-                        key
-                        for key in required_group_fields
-                        if key not in batch
+                        key for key in required_group_fields if key not in batch
                     ]
                     if missing_group_fields:
                         raise KeyError(
@@ -726,49 +691,29 @@ def evaluate(
                             f"{missing_group_fields}"
                         )
                     outcomes = np.empty(len(targets_numpy), dtype=np.int64)
-                    outcomes[
-                        (predictions_numpy == 1) & (targets_numpy == 1)
-                    ] = 0
-                    outcomes[
-                        (predictions_numpy == 1) & (targets_numpy == 0)
-                    ] = 1
-                    outcomes[
-                        (predictions_numpy == 0) & (targets_numpy == 1)
-                    ] = 2
-                    outcomes[
-                        (predictions_numpy == 0) & (targets_numpy == 0)
-                    ] = 3
+                    outcomes[(predictions_numpy == 1) & (targets_numpy == 1)] = 0
+                    outcomes[(predictions_numpy == 1) & (targets_numpy == 0)] = 1
+                    outcomes[(predictions_numpy == 0) & (targets_numpy == 1)] = 2
+                    outcomes[(predictions_numpy == 0) & (targets_numpy == 0)] = 3
 
-                    def accumulate_counts(
-                        destination, ids, outcomes=outcomes
-                    ) -> None:
+                    def accumulate_counts(destination, ids, outcomes=outcomes) -> None:
                         ids = ids.numpy().astype(np.int64, copy=False)
                         flattened = np.bincount(
                             ids * 4 + outcomes,
                             minlength=destination.size,
                         )
                         if flattened.size != destination.size:
-                            raise IndexError(
-                                "Evaluation group ID exceeds its catalog"
-                            )
-                        destination += flattened.reshape(
-                            destination.shape
-                        )
+                            raise IndexError("Evaluation group ID exceeds its catalog")
+                        destination += flattened.reshape(destination.shape)
 
-                    accumulate_counts(
-                        game_counts_array, batch["game_id"]
-                    )
+                    accumulate_counts(game_counts_array, batch["game_id"])
                     accumulate_counts(
                         game_label_counts_array,
                         batch["game_label_id"],
                     )
-                    accumulate_counts(
-                        video_counts_array, batch["video_group_id"]
-                    )
+                    accumulate_counts(video_counts_array, batch["video_group_id"])
                     video_ids = (
-                        batch["video_group_id"]
-                        .numpy()
-                        .astype(np.int64, copy=False)
+                        batch["video_group_id"].numpy().astype(np.int64, copy=False)
                     )
                     probability_values = compact_numpy[:, 1].astype(
                         np.float64, copy=False
@@ -798,31 +743,24 @@ def evaluate(
                         target = int(values[2])
                         counts = _counter(margin, target, cutoff)
                         game = str(meta.get("game", "unknown"))
-                        video_id = str(
-                            meta.get("video_id", "unknown")
-                        )
+                        video_id = str(meta.get("video_id", "unknown"))
                         _add_counter(group_game, game, counts)
                         _add_counter(
                             group_video,
                             (game, target, video_id),
                             counts,
                         )
-                        _add_counter(
-                            group_game_label, (game, target), counts
-                        )
+                        _add_counter(group_game_label, (game, target), counts)
                         _add_confidence(
                             group_video_confidence,
                             (game, target, video_id),
                             probability,
                         )
-                report_mask = (
-                    (predictions != labels.bool())
-                    | ((probabilities >= 0.980) & (probabilities <= 0.995))
+                report_mask = (predictions != labels.bool()) | (
+                    (probabilities >= 0.980) & (probabilities <= 0.995)
                 )
                 report_indices = report_mask.nonzero(as_tuple=False).flatten()
-                report_logits = logits_fp32.index_select(
-                    0, report_indices
-                ).cpu()
+                report_logits = logits_fp32.index_select(0, report_indices).cpu()
                 for index, logit in zip(
                     report_indices.cpu().tolist(), report_logits, strict=False
                 ):
@@ -850,12 +788,8 @@ def evaluate(
                     if band is not None:
                         batch_near.append({**row, "threshold_band": band})
                 if evaluation_kind == "quick":
-                    remaining_errors = max(
-                        0, quick_local_limit - len(retained_errors)
-                    )
-                    remaining_near = max(
-                        0, quick_local_limit - len(retained_near)
-                    )
+                    remaining_errors = max(0, quick_local_limit - len(retained_errors))
+                    remaining_near = max(0, quick_local_limit - len(retained_near))
                     batch_errors = batch_errors[:remaining_errors]
                     batch_near = batch_near[:remaining_near]
                 if writer is not None:
@@ -868,6 +802,7 @@ def evaluate(
             writer.close()
 
     if vectorized_groups and not distributed:
+        assert group_catalogs is not None
         group_game, group_video, group_game_label, group_video_confidence = (
             _build_group_dicts(
                 group_catalogs,
@@ -916,6 +851,7 @@ def evaluate(
                 video_probability_max,
                 device,
             )
+            assert group_catalogs is not None
             group_game, group_video, group_game_label, group_video_confidence = (
                 _build_group_dicts(
                     group_catalogs,
@@ -928,7 +864,7 @@ def evaluate(
                     video_probability_max,
                 )
             )
-        gathered_scores = None
+        gathered_scores: list[Any] | None = None
         if exact_scores:
             if full_auc_mode == "exact" and int(sample_count) > EXACT_AUC_MAX_SAMPLES:
                 raise ValueError(
@@ -937,14 +873,12 @@ def evaluate(
                     f"{EXACT_AUC_MAX_SAMPLES} cap. Use "
                     "evaluation.full_auc_mode=histogram for large test sets."
                 )
-            gathered_scores = (
-                [None for _ in range(world_size)] if rank == 0 else None
-            )
+            gathered_scores = [None for _ in range(world_size)] if rank == 0 else None
             dist.gather_object((margins, targets), gathered_scores, dst=0)
         if not vectorized_groups:
             # No shared catalog: the per-rank dicts are small and are still
             # merged through gather_object (every rank participates).
-            gathered_groups = (
+            gathered_groups: list[Any] | None = (
                 [None for _ in range(world_size)] if rank == 0 else None
             )
             dist.gather_object(
@@ -965,6 +899,7 @@ def evaluate(
             game_label_counters = group_game_label
             video_confidence = group_video_confidence
         else:
+            assert gathered_groups is not None
             game_counters = _merge_group_counters(
                 [payload[0] for payload in gathered_groups]
             )
@@ -978,12 +913,9 @@ def evaluate(
                 [payload[3] for payload in gathered_groups]
             )
         if exact_scores:
-            margins = [
-                margin for payload in gathered_scores for margin in payload[0]
-            ]
-            targets = [
-                target for payload in gathered_scores for target in payload[1]
-            ]
+            assert gathered_scores is not None
+            margins = [margin for payload in gathered_scores for margin in payload[0]]
+            targets = [target for payload in gathered_scores for target in payload[1]]
         tp, fp, fn, tn, sample_count = counts.tolist()
         (
             cross_entropy_sum,
@@ -1002,9 +934,7 @@ def evaluate(
             cross_entropy_sum,
             brier_sum,
             threshold_loss_sum,
-        ) = torch.stack(
-            (cross_entropy_sum, brier_sum, threshold_loss_sum)
-        ).tolist()
+        ) = torch.stack((cross_entropy_sum, brier_sum, threshold_loss_sum)).tolist()
         positive_histogram = positive_hist.cpu().tolist()
         negative_histogram = negative_hist.cpu().tolist()
 
@@ -1013,9 +943,7 @@ def evaluate(
         roc_auc, pr_auc = ranking.roc_auc, ranking.pr_auc
         auc_method = "exact"
     else:
-        roc_auc, pr_auc = _histogram_auc(
-            positive_histogram, negative_histogram
-        )
+        roc_auc, pr_auc = _histogram_auc(positive_histogram, negative_histogram)
         auc_method = f"histogram_{auc_histogram_bins}_bins"
     global_binary = metrics_from_counts(
         int(tp),
@@ -1032,8 +960,8 @@ def evaluate(
     calibration_probabilities = calibration_probability.cpu().tolist()
     calibration_targets = calibration_target.cpu().tolist()
     metrics = global_binary.to_dict()
-    worst_game_fpr, worst_game_positive_recall = (
-        _worst_game_fpr_and_recall(game_counters)
+    worst_game_fpr, worst_game_positive_recall = _worst_game_fpr_and_recall(
+        game_counters
     )
     recall_at_max_fpr, low_fpr_partial_auc = _low_fpr_histogram_metrics(
         positive_histogram, negative_histogram, max_fpr_for_recall
@@ -1041,9 +969,7 @@ def evaluate(
     negative_tail_percentiles = _histogram_margin_percentiles(
         negative_histogram, auc_histogram_bins, (0.99, 0.999)
     )
-    negative_score_max = _histogram_max_margin(
-        negative_histogram, auc_histogram_bins
-    )
+    negative_score_max = _histogram_max_margin(negative_histogram, auc_histogram_bins)
     ece_tail_95_100 = (
         _ece_tail(
             calibration_counts,
@@ -1053,12 +979,8 @@ def evaluate(
         if tail_calibration_enabled
         else 0.0
     )
-    cross_entropy_mean = (
-        cross_entropy_sum / sample_count if sample_count else 0.0
-    )
-    threshold_loss_mean = (
-        threshold_loss_sum / sample_count if sample_count else 0.0
-    )
+    cross_entropy_mean = cross_entropy_sum / sample_count if sample_count else 0.0
+    threshold_loss_mean = threshold_loss_sum / sample_count if sample_count else 0.0
     positive_total = int(tp) + int(fn)
     negative_total = int(fp) + int(tn)
     positive_percentiles = _histogram_margin_percentiles(
@@ -1116,12 +1038,8 @@ def evaluate(
             "negative_margin_p50": negative_percentiles[1],
             "negative_margin_p90": negative_percentiles[2],
             "global_fpr_at_decision_threshold": _safe_ratio(fp, fp + tn),
-            "global_specificity_at_decision_threshold": _safe_ratio(
-                tn, fp + tn
-            ),
-            "global_positive_recall_at_decision_threshold": _safe_ratio(
-                tp, tp + fn
-            ),
+            "global_specificity_at_decision_threshold": _safe_ratio(tn, fp + tn),
+            "global_positive_recall_at_decision_threshold": _safe_ratio(tp, tp + fn),
             "worst_game_fpr_at_decision_threshold": worst_game_fpr,
             "worst_game_positive_recall_at_decision_threshold": (
                 worst_game_positive_recall
@@ -1135,7 +1053,8 @@ def evaluate(
             "confidence_histogram": dict(
                 zip(
                     ["<0.980", "0.980-0.990", "0.990-0.995", "0.995-0.999", ">=0.999"],
-                    confidence_counts.cpu().tolist(), strict=False,
+                    confidence_counts.cpu().tolist(),
+                    strict=False,
                 )
             ),
         }

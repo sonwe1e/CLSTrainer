@@ -10,7 +10,9 @@ def initialize_device(accelerator: str, local_rank: int = 0):
         accelerator = "cuda" if torch.cuda.is_available() else "cpu"
     if accelerator == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+            raise RuntimeError(
+                "CUDA was requested but torch.cuda.is_available() is false"
+            )
         torch.cuda.set_device(local_rank)
         return torch.device(f"cuda:{local_rank}")
     if accelerator == "npu":
@@ -18,7 +20,7 @@ def initialize_device(accelerator: str, local_rank: int = 0):
             import torch_npu  # noqa: F401
         except ImportError as exc:
             raise RuntimeError("NPU training requires torch_npu") from exc
-        torch.npu.set_device(local_rank)
+        torch.npu.set_device(local_rank)  # type: ignore[attr-defined]
         return torch.device(f"npu:{local_rank}")
     if accelerator == "cpu":
         return torch.device("cpu")
@@ -32,4 +34,3 @@ def autocast_context(device, enabled: bool, dtype_name: str):
         return nullcontext()
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
     return torch.autocast(device_type=device.type, dtype=dtype)
-

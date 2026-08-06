@@ -15,6 +15,9 @@ operator genuinely cannot be probed because torch_npu is absent.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 
 def probe_npu_environment() -> dict[str, tuple[bool | None, str]]:
     """Run the NPU checks and return ``{label: (ok, detail)}``.
@@ -33,11 +36,12 @@ def probe_npu_environment() -> dict[str, tuple[bool | None, str]]:
 
         version = getattr(torch_npu, "__version__", "?")
         available = bool(
-            getattr(torch, "npu", None)
-            and torch.npu.is_available()
+            getattr(torch, "npu", None) and torch.npu.is_available()  # type: ignore[attr-defined]
         )
         results["torch_npu available"] = (
-            (True, f"torch_npu {version}") if available else (False, f"torch_npu {version} not available")
+            (True, f"torch_npu {version}")
+            if available
+            else (False, f"torch_npu {version} not available")
         )
     except ImportError as exc:
         results["torch_npu available"] = (None, f"torch_npu not installed: {exc}")
@@ -77,7 +81,7 @@ def probe_npu_environment() -> dict[str, tuple[bool | None, str]]:
 
     # torch.device("npu") requires torch_npu to register the device type, so
     # only construct it once the device is actually available.
-    if getattr(torch, "npu", None) and torch.npu.is_available():
+    if getattr(torch, "npu", None) and torch.npu.is_available():  # type: ignore[attr-defined]
         device = torch.device("npu")
         # BF16 autocast must be usable on-device (deployment parity).
         bf_ok: bool | None = None
@@ -142,7 +146,7 @@ def _probe_grad_scaler(device) -> None:
     scaler.scale(y).backward()
 
 
-_DEVICE_OP_PROBES: dict[str, object] = {
+_DEVICE_OP_PROBES: dict[str, Callable[..., Any]] = {
     "bincount": _probe_bincount,
     "scatter_add_": _probe_scatter_add,
     "nonzero": _probe_nonzero,

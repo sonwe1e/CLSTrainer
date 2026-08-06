@@ -82,7 +82,7 @@ class TopKCheckpointTests(unittest.TestCase):
                 return mock.Mock(metrics=dict(payload))
 
             with mock.patch(
-                "game_cls.engine.trainer._run_evaluation",
+                "game_cls.engine.training.loop._run_evaluation",
                 side_effect=fake_run_evaluation,
             ):
                 result = run_training(config)
@@ -165,7 +165,7 @@ class TopKCheckpointTests(unittest.TestCase):
                 return mock.Mock(metrics=dict(payload))
 
             with mock.patch(
-                "game_cls.engine.trainer._run_evaluation",
+                "game_cls.engine.training.loop._run_evaluation",
                 side_effect=fake_run_evaluation,
             ):
                 result = run_training(config)
@@ -206,7 +206,7 @@ class TopKCheckpointTests(unittest.TestCase):
                 return mock.Mock(metrics=dict(fake_metrics[0]))
 
             with mock.patch(
-                "game_cls.engine.trainer._run_evaluation",
+                "game_cls.engine.training.loop._run_evaluation",
                 side_effect=fake_run_evaluation,
             ):
                 result = run_training(config)

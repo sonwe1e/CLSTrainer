@@ -77,19 +77,16 @@ def _decode_many_pairs(
     requests: Sequence[PairRequest],
     decoder,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    references = []
+    references: list[Any] = []
     metadata = []
     for request in requests:
-        path0, path1, meta = _pair_references(
-            videos[request.video_index], request
-        )
+        path0, path1, meta = _pair_references(videos[request.video_index], request)
         references.extend((path0, path1))
         metadata.append(meta)
     decoded = decoder.get_many(references)
     if decoded.ndim != 4 or decoded.shape[0] != len(requests) * 2:
         raise ValueError(
-            "Batch decoder must return [2B,C,H,W], got "
-            f"{tuple(decoded.shape)}"
+            f"Batch decoder must return [2B,C,H,W], got {tuple(decoded.shape)}"
         )
     return decoded.reshape(len(requests), 2, *decoded.shape[1:]), metadata
 
@@ -126,21 +123,15 @@ class LazyTrainingPairDataset:
                 images = self.transform(images)
         return {"images": images, "label": meta["label"], "meta": meta}
 
-    def __getitems__(
-        self, requests: Sequence[PairRequest]
-    ) -> list[dict[str, Any]]:
+    def __getitems__(self, requests: Sequence[PairRequest]) -> list[dict[str, Any]]:
         requests = list(requests)
         if not callable(getattr(self.decoder, "get_many", None)):
             return [self[request] for request in requests]
         import torch
 
-        decoded, metadata = _decode_many_pairs(
-            self.videos, requests, self.decoder
-        )
+        decoded, metadata = _decode_many_pairs(self.videos, requests, self.decoder)
         samples = []
-        for request, images, meta in zip(
-            requests, decoded, metadata, strict=False
-        ):
+        for request, images, meta in zip(requests, decoded, metadata, strict=False):
             if self.transform is not None:
                 with torch.random.fork_rng(devices=[]):
                     torch.manual_seed(request.augmentation_seed)
@@ -172,29 +163,19 @@ class EvalPairDataset:
         self.start_positions = start_positions.astype(np.int32, copy=False)
         self.decoder = decoder or _decode_image_png
         game_keys = sorted({video.game for video in videos})
-        game_label_keys = sorted(
-            {(video.game, video.label) for video in videos}
-        )
+        game_label_keys = sorted({(video.game, video.label) for video in videos})
         self.group_catalogs = {
             "game": game_keys,
             "game_label": game_label_keys,
-            "video": [
-                (video.game, video.label, video.video_id)
-                for video in videos
-            ],
+            "video": [(video.game, video.label, video.video_id) for video in videos],
         }
         game_to_id = {key: index for index, key in enumerate(game_keys)}
-        game_label_to_id = {
-            key: index for index, key in enumerate(game_label_keys)
-        }
+        game_label_to_id = {key: index for index, key in enumerate(game_label_keys)}
         self._game_id_by_video = np.asarray(
             [game_to_id[video.game] for video in videos], dtype=np.int32
         )
         self._game_label_id_by_video = np.asarray(
-            [
-                game_label_to_id[(video.game, video.label)]
-                for video in videos
-            ],
+            [game_label_to_id[(video.game, video.label)] for video in videos],
             dtype=np.int32,
         )
 
@@ -213,12 +194,8 @@ class EvalPairDataset:
         return {
             "images": images,
             "label": meta["label"],
-            "game_id": int(
-                self._game_id_by_video[request.video_index]
-            ),
-            "game_label_id": int(
-                self._game_label_id_by_video[request.video_index]
-            ),
+            "game_id": int(self._game_id_by_video[request.video_index]),
+            "game_label_id": int(self._game_label_id_by_video[request.video_index]),
             "video_group_id": request.video_index,
             "meta": meta,
         }
@@ -235,33 +212,23 @@ class EvalPairDataset:
             )
             for index in indices
         ]
-        decoded, metadata = _decode_many_pairs(
-            self.videos, requests, self.decoder
-        )
+        decoded, metadata = _decode_many_pairs(self.videos, requests, self.decoder)
         return [
             {
                 "images": images,
                 "label": meta["label"],
-                "game_id": int(
-                    self._game_id_by_video[request.video_index]
-                ),
-                "game_label_id": int(
-                    self._game_label_id_by_video[request.video_index]
-                ),
+                "game_id": int(self._game_id_by_video[request.video_index]),
+                "game_label_id": int(self._game_label_id_by_video[request.video_index]),
                 "video_group_id": request.video_index,
                 "meta": meta,
             }
-            for request, images, meta in zip(
-                requests, decoded, metadata, strict=False
-            )
+            for request, images, meta in zip(requests, decoded, metadata, strict=False)
         ]
 
     @property
     def index_nbytes(self) -> int:
         return (
-            self.video_indices.nbytes
-            + self.deltas.nbytes
-            + self.start_positions.nbytes
+            self.video_indices.nbytes + self.deltas.nbytes + self.start_positions.nbytes
         )
 
 

@@ -18,6 +18,7 @@ The two checks that protect against silent corruption:
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from game_cls.engine.device import initialize_device
 
@@ -76,9 +77,7 @@ def validate_launch_environment(config: dict) -> dict[str, int]:
             f"(one of {_ACCELERATOR_BACKENDS.get(accelerator, ())})."
         )
     if not 0 <= rank < world_size:
-        raise RuntimeError(
-            f"RANK={rank} is outside [0, WORLD_SIZE={world_size})."
-        )
+        raise RuntimeError(f"RANK={rank} is outside [0, WORLD_SIZE={world_size}).")
     if not 0 <= local_rank < world_size:
         raise RuntimeError(
             f"LOCAL_RANK={local_rank} is outside [0, WORLD_SIZE={world_size})."
@@ -94,7 +93,7 @@ def validate_launch_environment(config: dict) -> dict[str, int]:
     return env
 
 
-def init_runtime(config: dict) -> tuple[int, int, int, object]:
+def init_runtime(config: dict) -> tuple[int, int, int, Any]:
     """Validate the launch, bind the device, then initialize c10d.
 
     Returns ``(rank, world_size, local_rank, device)``. Idempotent for the

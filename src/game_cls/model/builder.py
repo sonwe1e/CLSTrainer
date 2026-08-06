@@ -41,11 +41,13 @@ def build_demo_model(config: dict[str, Any] | None = None):
                 nn.AdaptiveAvgPool2d(1),
             )
             with torch.no_grad():
-                self.backbone[0].weight.fill_(1.0)
+                self.backbone[0].weight.fill_(1.0)  # type: ignore[operator]
             self.cls = nn.Linear(6, num_classes)
 
         def forward(self, image0, image1):
-            features = self.backbone(torch.cat([image0, image1], dim=1)).flatten(1)
+            features = self.backbone(  # type: ignore[operator]
+                torch.cat([image0, image1], dim=1)
+            ).flatten(1)
             return self.cls(features)
 
     return DemoDualFrameModel()

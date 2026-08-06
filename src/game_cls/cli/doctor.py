@@ -1,0 +1,243 @@
+"""cls-trainer command line interface.
+
+Workflows:
+
+    cls-trainer train --config configs/npu_1p.yaml [key=value ...]
+    cls-trainer train --config ... --dry-run
+    cls-trainer train --resume <run_dir>
+    cls-trainer config show --config ... [--with-source]
+    cls-trainer config validate --config ...
+    cls-trainer config reference
+    cls-trainer run list [--root runs]
+    cls-trainer run show latest|<run_dir>
+    cls-trainer doctor --config ...
+
+Every ``train`` start defaults to ``--run-mode unique``: the configured
+``experiment.output_dir`` is treated as a runs root and a fresh timestamped
+run directory is allocated, so re-running a command can never overwrite a
+previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+
+    failures = 0
+
+    def check(ok: bool | None, label: str, detail: str = "") -> None:
+        nonlocal failures
+        mark = "[OK]" if ok else ("[WARN]" if ok is None else "[FAIL]")
+        if ok is False:
+            failures += 1
+        suffix = f" — {detail}" if detail else ""
+        print(f"{mark} {label}{suffix}")
+
+    print(f"python: {sys.version.split()[0]} on {sys.platform}")
+    try:
+        import torch
+
+        check(True, "torch importable", torch.__version__)
+        check(
+            torch.cuda.is_available() or None,
+            "CUDA visible",
+            "cuda.is_available()=" + str(torch.cuda.is_available()),
+        )
+    except ImportError as exc:
+        check(False, "torch importable", str(exc))
+    try:
+        import torch_npu  # type: ignore
+
+        check(True, "torch_npu importable", getattr(torch_npu, "__version__", "?"))
+    except ImportError:
+        check(None, "torch_npu importable", "not installed (needed only for NPU)")
+
+    try:
+        config = load_config(args.config, args.overrides)
+        check(True, f"config schema valid: {args.config}")
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            check(False, "config schema", problem)
+        return 1
+    except FileNotFoundError as exc:
+        check(False, "config file", str(exc))
+        return 1
+
+    accelerator = str(config["device"].get("accelerator", "auto"))
+    if accelerator == "npu":
+        from game_cls.runtime.npu_checks import probe_npu_environment
+
+        for label, (ok, detail) in probe_npu_environment().items():
+            check(ok, label, detail)
+    else:
+        check(
+            None,
+            "NPU device-operator probes",
+            f"accelerator={accelerator}; run doctor with an npu config "
+            "to probe bincount/scatter_add_/nonzero/index_select/GradScaler",
+        )
+
+    data_cfg = config["data"]
+    if data_cfg.get("synthetic"):
+        check(None, "data", "synthetic=true, index checks skipped")
+    else:
+        for key in ("train_index", "val_index", "test_index"):
+            path = data_cfg.get(key)
+            check(
+                bool(path) and Path(path).is_file(),
+                f"data.{key}",
+                str(path),
+            )
+        for key in ("train_video_index", "val_video_index", "test_video_index"):
+            path = data_cfg.get(key)
+            check(
+                bool(path) and Path(path).is_file(),
+                f"data.{key}",
+                str(path),
+            )
+        migration = data_cfg.get("split_migration") or {}
+        if migration.get("test_used_as_validation"):
+            check(
+                None,
+                "split roles",
+                "test_index is aliased as validation; no independent "
+                "test set (add data.val_index)",
+            )
+        else:
+            check(True, "split roles", "train / validation / test")
+        audit_path = data_cfg.get("audit_path")
+        audit_exists = bool(audit_path) and Path(audit_path).is_file()
+        audit_ok: bool | None = None
+        if audit_exists:
+            try:
+                payload = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+                audit_ok = bool(payload)
+            except (json.JSONDecodeError, OSError):
+                audit_ok = False
+            check(
+                audit_ok,
+                "data.audit_path parses",
+                str(audit_path),
+            )
+        else:
+            check(
+                False,
+                "data.audit_path",
+                str(audit_path) + " (run tools/audit_dataset.py)",
+            )
+        if data_cfg.get("backend") == "packed_uint8":
+            for key in (
+                "train_packed_index",
+                "test_packed_index",
+                "train_packed_video_index",
+                "test_packed_video_index",
+            ):
+                path = data_cfg.get(key)
+                check(
+                    bool(path) and Path(path).is_file(),
+                    f"data.{key}",
+                    str(path),
+                )
+            val_packed_index = data_cfg.get("val_packed_index")
+            if val_packed_index:
+                check(
+                    Path(val_packed_index).is_file(),
+                    "data.val_packed_index",
+                    str(val_packed_index),
+                )
+
+    model_cfg = config["model"]
+    factory = str(model_cfg.get("factory", ""))
+    if ":" in factory and "your_package" not in factory:
+        module_name, _, function_name = factory.partition(":")
+        try:
+            import importlib
+
+            module = importlib.import_module(module_name)
+            check(
+                callable(getattr(module, function_name, None)),
+                "model.factory resolves",
+                factory,
+            )
+        except ImportError as exc:
+            check(False, "model.factory resolves", f"{factory}: {exc}")
+    else:
+        check(False, "model.factory", f"placeholder or malformed: {factory!r}")
+    checkpoint_path = model_cfg.get("checkpoint_path")
+    if checkpoint_path:
+        check(
+            Path(checkpoint_path).is_file(),
+            "model.checkpoint_path exists",
+            checkpoint_path,
+        )
+        checkpoint_file = Path(checkpoint_path)
+        if checkpoint_file.is_file():
+            try:
+                payload = torch.load(
+                    checkpoint_file, map_location="cpu", weights_only=True
+                )
+                check(
+                    isinstance(payload, dict) and len(payload) > 0,
+                    "model.checkpoint parses (weights_only)",
+                    f"{len(payload) if isinstance(payload, dict) else '?'} keys",
+                )
+            except Exception as exc:
+                check(False, "model.checkpoint parses (weights_only)", str(exc))
+    elif not data_cfg.get("synthetic"):
+        check(False, "model.checkpoint_path", "not set (required for real data)")
+
+    # Dummy forward: the model must build and return exactly [B, 2] logits.
+    try:
+        from game_cls.engine.device import autocast_context
+        from game_cls.model.builder import build_model
+
+        probe_model = build_model(dict(model_cfg))
+        probe_model.eval()
+        width = int(data_cfg.get("width", 448))
+        height = int(data_cfg.get("height", 208))
+        with torch.no_grad(), autocast_context(torch.device("cpu"), False, "bfloat16"):
+            # Same conversion the training loop applies: uint8 [B,2,3,H,W]
+            # frames are scaled to float before the forward pass.
+            dummy = torch.zeros(1, 2, 3, height, width, dtype=torch.uint8)
+            dummy = dummy.to(torch.float32).div_(255.0)
+            logits = probe_model(dummy[:, 0], dummy[:, 1])
+        shape = tuple(logits.shape)
+        check(
+            shape == (1, 2),
+            "model dummy forward returns [B, 2]",
+            f"got {shape}",
+        )
+    except Exception as exc:
+        check(False, "model dummy forward returns [B, 2]", str(exc)[:300])
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    distributed = bool(config.get("distributed", {}).get("enabled", False))
+    try:
+        from game_cls.runtime.distributed_runtime import (
+            validate_launch_environment,
+        )
+
+        validate_launch_environment(config)
+        check(
+            True,
+            "distributed",
+            f"enabled={distributed} world_size={world_size}",
+        )
+    except Exception as exc:
+        check(False, "distributed", str(exc))
+
+    print("")
+    print("FAIL" if failures else "PASS", f"({failures} failing checks)")
+    return 1 if failures else 0

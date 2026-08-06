@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from .image_spec import ImageSpec
 from .index_policy import DuplicatePolicy, ScanFindings, ScanPolicy
@@ -70,9 +71,7 @@ def iter_frame_candidates(
                 findings.add_ignored("ignored_directory", label_dir)
                 continue
             if not label_dir.is_dir():
-                findings.add_ignored(
-                    "non_directory_at_label_level", label_dir
-                )
+                findings.add_ignored("non_directory_at_label_level", label_dir)
                 continue
             if label_dir.name not in {"0", "1"}:
                 candidate_frames = [
@@ -129,16 +128,12 @@ def scan_split(
 ) -> ScanResult:
     root = Path(root).resolve()
     image_spec.validate()
-    findings = ScanFindings(
-        ignored_example_limit=scan_policy.ignored_example_limit
-    )
+    findings = ScanFindings(ignored_example_limit=scan_policy.ignored_example_limit)
     frames: list[FrameRecord] = []
     if not root.is_dir():
         raise FileNotFoundError(f"{split} root does not exist: {root}")
 
-    for game, label, path in iter_frame_candidates(
-        root, scan_policy, findings
-    ):
+    for game, label, path in iter_frame_candidates(root, scan_policy, findings):
         try:
             video_id, frame_id = parse_filename(path.name, filename_pattern)
         except ValueError as exc:
@@ -166,18 +161,14 @@ def scan_split(
             continue
         try:
             file_size = path.stat().st_size
-            content_sha256 = (
-                _sha256(path) if compute_content_hash else ""
-            )
+            content_sha256 = _sha256(path) if compute_content_hash else ""
         except OSError as exc:
             findings.add("error", "unreadable_file", path, str(exc))
             continue
         label_text = str(label)
         frames.append(
             FrameRecord(
-                sample_id=(
-                    f"{split}:{game}:{label_text}:{video_id}:{frame_id:05d}"
-                ),
+                sample_id=(f"{split}:{game}:{label_text}:{video_id}:{frame_id:05d}"),
                 split=split,
                 game=game,
                 label=label,
@@ -200,8 +191,7 @@ def _pyarrow():
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise RuntimeError(
-            "Writing Parquet indexes requires pyarrow: "
-            "python -m pip install pyarrow"
+            "Writing Parquet indexes requires pyarrow: python -m pip install pyarrow"
         ) from exc
     return pa, pq
 
@@ -219,9 +209,7 @@ def write_parquet(
 
 def read_frame_parquet(path: str | Path) -> list[FrameRecord]:
     _, pq = _pyarrow()
-    return [
-        FrameRecord(**row) for row in pq.read_table(path).to_pylist()
-    ]
+    return [FrameRecord(**row) for row in pq.read_table(path).to_pylist()]
 
 
 def analyze_content_duplicates(
@@ -238,7 +226,7 @@ def analyze_content_duplicates(
             if frame.content_sha256:
                 by_hash[frame.content_sha256].append(frame)
 
-    result: dict[str, object] = {
+    result: dict[str, Any] = {
         "errors": [],
         "warnings": [],
         "info": [],
@@ -283,9 +271,7 @@ def analyze_content_duplicates(
         }
         result[f"{severity}s"].append(finding)
 
-    basename_groups = [
-        records for records in by_basename.values() if len(records) > 1
-    ]
+    basename_groups = [records for records in by_basename.values() if len(records) > 1]
     result["same_basename"] = {
         "group_count": len(basename_groups),
         "record_count": sum(len(records) for records in basename_groups),
@@ -295,9 +281,7 @@ def analyze_content_duplicates(
     return result
 
 
-def _split_report(
-    frames: list[FrameRecord], findings: ScanFindings
-) -> dict:
+def _split_report(frames: list[FrameRecord], findings: ScanFindings) -> dict:
     dimensions = Counter(
         (frame.width, frame.height, frame.channels) for frame in frames
     )
@@ -313,9 +297,7 @@ def _split_report(
         "frame_count": len(frames),
         "video_count": len(videos),
         "game_count": len(games),
-        "label_counts": dict(
-            sorted(Counter(frame.label for frame in frames).items())
-        ),
+        "label_counts": dict(sorted(Counter(frame.label for frame in frames).items())),
         "dimensions": [
             {
                 "width": width,
@@ -323,30 +305,19 @@ def _split_report(
                 "channels": channels,
                 "count": count,
             }
-            for (width, height, channels), count in sorted(
-                dimensions.items()
-            )
+            for (width, height, channels), count in sorted(dimensions.items())
         ],
         "findings": findings.to_dict(),
         "games_missing_labels": {
             game: sorted(
-                {0, 1}
-                - {
-                    frame.label
-                    for frame in frames
-                    if frame.game == game
-                }
+                {0, 1} - {frame.label for frame in frames if frame.game == game}
             )
             for game in games
-            if {
-                frame.label for frame in frames if frame.game == game
-            }
-            != {0, 1}
+            if {frame.label for frame in frames if frame.game == game} != {0, 1}
         },
         "valid_pairs": {
             str(delta): sum(
-                getattr(video, f"valid_pair_count_delta{delta}")
-                for video in videos
+                getattr(video, f"valid_pair_count_delta{delta}") for video in videos
             )
             for delta in (1, 2, 3)
         },
@@ -357,9 +328,7 @@ def _split_report(
                 "delta": delta,
                 "count": count,
             }
-            for (game, label, delta), count in sorted(
-                pair_grid_counts.items()
-            )
+            for (game, label, delta), count in sorted(pair_grid_counts.items())
         ],
     }
 
@@ -377,8 +346,7 @@ def make_audit(
             (frame.game, frame.label, frame.video_id) for frame in frames
         }
         source_uids_by_split[split] = {
-            source_video_uid(frame.game, frame.video_id)
-            for frame in frames
+            source_video_uid(frame.game, frame.video_id) for frame in frames
         }
     split_names = [name for name in SPLIT_ORDER if name in frames_by_split]
     video_key_overlap: dict[str, list[dict]] = {}
@@ -389,8 +357,7 @@ def make_audit(
             video_key_overlap[pair_key] = [
                 {"game": game, "label": label, "video_id": video_id}
                 for game, label, video_id in sorted(
-                    video_keys_by_split[left]
-                    & video_keys_by_split[right]
+                    video_keys_by_split[left] & video_keys_by_split[right]
                 )
             ]
             source_uid_overlap[pair_key] = sorted(
@@ -407,19 +374,13 @@ def make_audit(
             "duplicate_policy": asdict(duplicate_policy),
         },
         "splits": {
-            split: _split_report(
-                frames, findings_by_split.get(split, ScanFindings())
-            )
+            split: _split_report(frames, findings_by_split.get(split, ScanFindings()))
             for split, frames in frames_by_split.items()
         },
-        "duplicates": analyze_content_duplicates(
-            frames_by_split, duplicate_policy
-        ),
+        "duplicates": analyze_content_duplicates(frames_by_split, duplicate_policy),
         "leakage": {
             # Backwards-compatible train/test view.
-            "video_keys_across_splits": video_key_overlap.get(
-                "train__test", []
-            ),
+            "video_keys_across_splits": video_key_overlap.get("train__test", []),
             "split_pair_video_key_overlap": video_key_overlap,
             "source_video_uid_overlap": source_uid_overlap,
             "video_key_check_note": (
@@ -438,22 +399,14 @@ def audit_warning_messages(audit: dict) -> list[str]:
             counts = Counter(item.get("kind", "unknown") for item in warnings)
             messages.append(
                 f"{split} scan warnings: "
-                + ", ".join(
-                    f"{kind}={count}"
-                    for kind, count in sorted(counts.items())
-                )
+                + ", ".join(f"{kind}={count}" for kind, count in sorted(counts.items()))
             )
     duplicate_warnings = audit.get("duplicates", {}).get("warnings", [])
     if duplicate_warnings:
-        counts = Counter(
-            item.get("kind", "unknown") for item in duplicate_warnings
-        )
+        counts = Counter(item.get("kind", "unknown") for item in duplicate_warnings)
         messages.append(
             "duplicate warnings: "
-            + ", ".join(
-                f"{kind}={count}"
-                for kind, count in sorted(counts.items())
-            )
+            + ", ".join(f"{kind}={count}" for kind, count in sorted(counts.items()))
         )
     return messages
 
@@ -492,22 +445,16 @@ def validate_audit(
                 f"{configured}; rebuild indexes"
             )
     if duplicate_policy is not None:
-        recorded_policy = (
-            audit.get("policies", {}).get("duplicate_policy", {})
-        )
+        recorded_policy = audit.get("policies", {}).get("duplicate_policy", {})
         if recorded_policy != asdict(duplicate_policy):
             problems.append(
-                "audit duplicate policy does not match configuration; "
-                "rebuild indexes"
+                "audit duplicate policy does not match configuration; rebuild indexes"
             )
     if scan_policy is not None:
-        recorded_scan_policy = (
-            audit.get("policies", {}).get("scan_policy", {})
-        )
+        recorded_scan_policy = audit.get("policies", {}).get("scan_policy", {})
         if recorded_scan_policy != scan_policy.to_dict():
             problems.append(
-                "audit scan policy does not match configuration; "
-                "rebuild indexes"
+                "audit scan policy does not match configuration; rebuild indexes"
             )
 
     for split in SPLIT_ORDER:
@@ -518,13 +465,11 @@ def validate_audit(
             continue
         for finding in report.get("findings", {}).get("errors", []):
             problems.append(
-                f"{split}: {finding.get('kind', 'error')}: "
-                f"{finding.get('path', '')}"
+                f"{split}: {finding.get('kind', 'error')}: {finding.get('path', '')}"
             )
         if report.get("games_missing_labels"):
             problems.append(
-                f"{split} games missing labels: "
-                f"{report['games_missing_labels']}"
+                f"{split} games missing labels: {report['games_missing_labels']}"
             )
         if report.get("frame_count", 0) == 0:
             problems.append(f"{split} has no valid frames")
@@ -536,48 +481,32 @@ def validate_audit(
                     int(row["label"]),
                     int(row["delta"]),
                 ): int(row["count"])
-                for row in report.get(
-                    "valid_pairs_by_game_label_delta", []
-                )
+                for row in report.get("valid_pairs_by_game_label_delta", [])
             }
             games = {
                 str(row["game"])
-                for row in report.get(
-                    "valid_pairs_by_game_label_delta", []
-                )
+                for row in report.get("valid_pairs_by_game_label_delta", [])
             }
             for game in sorted(games):
                 for label in (0, 1):
                     for delta, minimum in sorted(requirements.items()):
-                        actual = grid.get((game, label, int(delta)), 0)
-                        if actual < int(minimum):
+                        pair_count = grid.get((game, label, int(delta)), 0)
+                        if pair_count < int(minimum):
                             problems.append(
                                 f"{split} {game}/label={label}/delta={delta} "
-                                f"has {actual} pairs, requires {minimum}"
+                                f"has {pair_count} pairs, requires {minimum}"
                             )
 
     test_report = audit.get("splits", {}).get("test", {})
-    if int(
-        test_report.get("valid_pairs", {}).get(
-            str(require_test_delta), 0
-        )
-    ) <= 0:
+    if int(test_report.get("valid_pairs", {}).get(str(require_test_delta), 0)) <= 0:
         problems.append(f"test has no legal delta={require_test_delta} pairs")
     if "val" in audit.get("splits", {}):
         val_report = audit["splits"]["val"]
-        if int(
-            val_report.get("valid_pairs", {}).get(
-                str(require_test_delta), 0
-            )
-        ) <= 0:
-            problems.append(
-                f"val has no legal delta={require_test_delta} pairs"
-            )
+        if int(val_report.get("valid_pairs", {}).get(str(require_test_delta), 0)) <= 0:
+            problems.append(f"val has no legal delta={require_test_delta} pairs")
 
     duplicates = audit.get("duplicates", {})
-    if require_content_hash and not duplicates.get(
-        "content_hash_check_enabled", False
-    ):
+    if require_content_hash and not duplicates.get("content_hash_check_enabled", False):
         problems.append("content-hash duplicate check was not performed")
     for conflict in duplicates.get("errors", []):
         problems.append(
@@ -586,25 +515,17 @@ def validate_audit(
         )
     # Identical content crossing split boundaries is always leakage, no
     # matter which severity the duplicate policy recorded at index time.
-    for warning in duplicates.get("warnings", []) + duplicates.get(
-        "info", []
-    ):
-        if warning.get(
-            "kind"
-        ) == "same_label_content_overlap_across_splits":
+    for warning in duplicates.get("warnings", []) + duplicates.get("info", []):
+        if warning.get("kind") == "same_label_content_overlap_across_splits":
             problems.append(
                 "identical content crosses split boundaries: "
                 f"sha256={warning.get('sha256', '')} "
                 f"splits={warning.get('splits', [])}"
             )
     leakage = audit.get("leakage", {})
-    if (
-        require_unique_video_keys
-        and leakage.get("video_keys_across_splits")
-    ):
+    if require_unique_video_keys and leakage.get("video_keys_across_splits"):
         problems.append(
-            "train/test share video keys: "
-            f"{leakage['video_keys_across_splits'][:20]}"
+            f"train/test share video keys: {leakage['video_keys_across_splits'][:20]}"
         )
     # Source videos must never span train/val/test. Label-independent
     # source_video_uid overlap is leakage regardless of the policy flags.
@@ -622,9 +543,7 @@ def validate_audit(
             f"{leakage['video_keys_across_splits'][:20]}"
         )
     if problems:
-        raise RuntimeError(
-            "Strict dataset audit failed: " + "; ".join(problems[:100])
-        )
+        raise RuntimeError("Strict dataset audit failed: " + "; ".join(problems[:100]))
 
 
 def validate_audit_file(
@@ -687,9 +606,7 @@ def write_index_bundle(
         )
         frames_by_split[split] = result.frames
         findings_by_split[split] = result.findings
-        write_parquet(
-            result.frames, output_dir / f"{split}_frames.parquet"
-        )
+        write_parquet(result.frames, output_dir / f"{split}_frames.parquet")
         write_parquet(
             summarize_videos(result.frames),
             output_dir / f"{split}_videos.parquet",
@@ -738,18 +655,10 @@ def write_split_bundle(
             "data.split.mode must be 'from_train' when writing a split "
             f"bundle, got {split_config.get('mode')!r}"
         )
-    if (
-        split_config.get("group_key", "source_video_uid")
-        != "source_video_uid"
-    ):
+    if split_config.get("group_key", "source_video_uid") != "source_video_uid":
         raise ValueError("data.split.group_key must be 'source_video_uid'")
-    if (
-        split_config.get("balance_by", "legal_pair_count")
-        != "legal_pair_count"
-    ):
-        raise ValueError(
-            "data.split.balance_by must be 'legal_pair_count'"
-        )
+    if split_config.get("balance_by", "legal_pair_count") != "legal_pair_count":
+        raise ValueError("data.split.balance_by must be 'legal_pair_count'")
     output_dir = Path(output_dir)
     train_all = scan_split(
         train_all_root,
@@ -773,9 +682,7 @@ def write_split_bundle(
     target_delta = int(split_config.get("target_delta", 2))
     on_new_groups = split_config.get("on_new_groups", "error")
     small_stratum_policy = split_config.get("small_stratum_policy", "error")
-    manifest_path = Path(
-        split_config.get("manifest", "indexes/split_manifest.parquet")
-    )
+    manifest_path = Path(split_config.get("manifest", "indexes/split_manifest.parquet"))
     if not manifest_path.is_absolute():
         manifest_path = output_dir / manifest_path
     manifest_path.parent.mkdir(parents=True, exist_ok=True)

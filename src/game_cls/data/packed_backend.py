@@ -23,9 +23,7 @@ class PackedUint8Backend:
             import numpy as np
             import pyarrow.parquet as pq
         except ImportError as exc:
-            raise RuntimeError(
-                "Packed backend requires NumPy and pyarrow"
-            ) from exc
+            raise RuntimeError("Packed backend requires NumPy and pyarrow") from exc
         if max_open_shards <= 0:
             raise ValueError("max_open_shards must be positive")
         image_spec.validate()
@@ -39,9 +37,7 @@ class PackedUint8Backend:
         self.channels = image_spec.channels
         self.height = image_spec.height
         self.width = image_spec.width
-        self.image_bytes = (
-            image_spec.channels * image_spec.height * image_spec.width
-        )
+        self.image_bytes = image_spec.channels * image_spec.height * image_spec.width
         self.max_open_shards = int(max_open_shards)
         schema_names = set(pq.read_schema(self.index_path).names)
         required = {"frame_index", "shard_id", "offset", "length"}
@@ -59,9 +55,7 @@ class PackedUint8Backend:
         )
         expected = np.arange(len(frame_indices), dtype=frame_indices.dtype)
         if not np.array_equal(frame_indices, expected):
-            raise ValueError(
-                "Packed frame_index must be contiguous and start at zero"
-            )
+            raise ValueError("Packed frame_index must be contiguous and start at zero")
         self.shard_ids = (
             table["shard_id"]
             .combine_chunks()
@@ -87,8 +81,7 @@ class PackedUint8Backend:
             )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.shard_paths = tuple(
-            (manifest_path.parent / path).resolve()
-            for path in manifest["shards"]
+            (manifest_path.parent / path).resolve() for path in manifest["shards"]
         )
         manifest_shape = (
             int(manifest["channels"]),
@@ -116,9 +109,7 @@ class PackedUint8Backend:
             return memory_map
         if not 0 <= shard_id < len(self.shard_paths):
             raise IndexError(f"Packed shard id is out of range: {shard_id}")
-        memory_map = np.memmap(
-            self.shard_paths[shard_id], mode="r", dtype=np.uint8
-        )
+        memory_map = np.memmap(self.shard_paths[shard_id], mode="r", dtype=np.uint8)
         self._memory_maps[shard_id] = memory_map
         while len(self._memory_maps) > self.max_open_shards:
             _, evicted = self._memory_maps.popitem(last=False)
@@ -145,18 +136,14 @@ class PackedUint8Backend:
         by_shard: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for output_index, location in enumerate(locations):
             if not 0 <= location < len(self.offsets):
-                raise IndexError(
-                    f"Packed frame index is out of range: {location}"
-                )
+                raise IndexError(f"Packed frame index is out of range: {location}")
             length = int(self.lengths[location])
             if length != self.image_bytes:
                 raise ValueError(
                     f"Packed image has {length} bytes, expected "
                     f"{self.image_bytes}: frame={location}"
                 )
-            by_shard[int(self.shard_ids[location])].append(
-                (output_index, location)
-            )
+            by_shard[int(self.shard_ids[location])].append((output_index, location))
 
         for shard_id, items in by_shard.items():
             memory_map = self._map(shard_id)
@@ -206,16 +193,13 @@ def pack_frame_index(
         import pyarrow.parquet as pq
         from PIL import Image
     except ImportError as exc:
-        raise RuntimeError(
-            "Packing requires NumPy, Pillow and pyarrow"
-        ) from exc
+        raise RuntimeError("Packing requires NumPy, Pillow and pyarrow") from exc
     if images_per_shard <= 0:
         raise ValueError("images_per_shard must be positive")
     image_spec.validate()
     if image_spec.channels != 3:
         raise ValueError(
-            "Packing requires RGB images with 3 channels, "
-            f"got {image_spec.channels}"
+            f"Packing requires RGB images with 3 channels, got {image_spec.channels}"
         )
     parquet_file = pq.ParquetFile(frame_index)
     output_dir = Path(output_dir).resolve()
@@ -229,16 +213,12 @@ def pack_frame_index(
             pa.field("length", pa.int64()),
         ]
     )
-    index_writer = pq.ParquetWriter(
-        index_path, index_schema, compression="zstd"
-    )
+    index_writer = pq.ParquetWriter(index_path, index_schema, compression="zstd")
     row_buffer = []
     shard_stream = None
     shard_path = None
     shard_names: list[str] = []
-    packed_groups: dict[
-        tuple[str, int, str], list[tuple[int, int]]
-    ] = {}
+    packed_groups: dict[tuple[str, int, str], list[tuple[int, int]]] = {}
     try:
         index = 0
         for batch in parquet_file.iter_batches(batch_size=1024):
@@ -265,6 +245,9 @@ def pack_frame_index(
                         f"Unexpected image shape {array.shape}: {row['path']}"
                     )
                 chw = np.ascontiguousarray(array.transpose(2, 0, 1))
+                # The first frame always opens a shard (index == 0 hits the
+                # ``if`` branch), so the stream is non-None here.
+                assert shard_stream is not None
                 offset = shard_stream.tell()
                 shard_stream.write(chw.tobytes())
                 row_buffer.append(
@@ -275,10 +258,7 @@ def pack_frame_index(
                         "length": chw.nbytes,
                     }
                 )
-                if all(
-                    key in row
-                    for key in ("game", "label", "video_id", "frame_id")
-                ):
+                if all(key in row for key in ("game", "label", "video_id", "frame_id")):
                     packed_groups.setdefault(
                         (
                             str(row["game"]),
@@ -289,9 +269,7 @@ def pack_frame_index(
                     ).append((int(row["frame_id"]), index))
                 if len(row_buffer) >= 4096:
                     index_writer.write_table(
-                        pa.Table.from_pylist(
-                            row_buffer, schema=index_schema
-                        )
+                        pa.Table.from_pylist(row_buffer, schema=index_schema)
                     )
                     row_buffer.clear()
                 index += 1
@@ -309,9 +287,7 @@ def pack_frame_index(
         "channels": image_spec.channels,
         "height": image_spec.height,
         "width": image_spec.width,
-        "image_bytes": (
-            image_spec.channels * image_spec.height * image_spec.width
-        ),
+        "image_bytes": (image_spec.channels * image_spec.height * image_spec.width),
         "frame_count": index,
         "shards": shard_names,
     }
@@ -326,9 +302,7 @@ def pack_frame_index(
         )
 
         entries = []
-        for (game, label, video_id), values in sorted(
-            packed_groups.items()
-        ):
+        for (game, label, video_id), values in sorted(packed_groups.items()):
             ordered = sorted(values)
             frame_ids = np.asarray(
                 [frame_id for frame_id, _ in ordered], dtype=np.int32
