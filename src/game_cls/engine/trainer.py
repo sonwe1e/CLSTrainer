@@ -540,13 +540,18 @@ def _threshold_weight_for_eval(
 
 
 def _new_interval_accumulator(device) -> dict:
-    """Sample-weighted interval accumulators (device tensors, no sync)."""
+    """Sample-weighted interval accumulators (device tensors, no sync).
+
+    Accumulators are float32: NPU/CANN does not support float64 device
+    tensors (``k::double`` errors), and the sample-weighted means only
+    need float32 precision. Do not switch these back to float64.
+    """
     import torch
 
     return {
-        "loss_sum": torch.zeros((), dtype=torch.float64, device=device),
-        "ce_sum": torch.zeros((), dtype=torch.float64, device=device),
-        "threshold_sum": torch.zeros((), dtype=torch.float64, device=device),
+        "loss_sum": torch.zeros((), dtype=torch.float32, device=device),
+        "ce_sum": torch.zeros((), dtype=torch.float32, device=device),
+        "threshold_sum": torch.zeros((), dtype=torch.float32, device=device),
         "threshold_weight_sum": 0.0,
         "counts": torch.zeros(4, dtype=torch.int64, device=device),
         "samples": 0,
@@ -563,9 +568,9 @@ def _reduce_interval_accumulator(accum: dict, device) -> dict:
             accum["ce_sum"],
             accum["threshold_sum"],
         )
-    ).to(torch.float64)
+    )
     samples = torch.tensor(
-        [accum["samples"]], dtype=torch.float64, device=device
+        [accum["samples"]], dtype=torch.float32, device=device
     )
     counts = accum["counts"].clone()
     if is_distributed():
