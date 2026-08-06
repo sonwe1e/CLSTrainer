@@ -25,6 +25,7 @@ import argparse
 from game_cls.cli.benchmark import (
     cmd_benchmark_data,
     cmd_benchmark_evaluate,
+    cmd_benchmark_gate_check,
     cmd_benchmark_scan_negatives,
 )
 from game_cls.cli.common import DEFAULT_RUNS_ROOT
@@ -375,5 +376,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_eval.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     bench_eval.set_defaults(func=cmd_benchmark_evaluate)
+    bench_gate_check = benchmark_sub.add_parser(
+        "gate-check",
+        help="Check a persisted benchmark_gate.json without re-running evaluation. "
+        "Exits 0 (passed), 1 (failed), or 2 (file missing/malformed).",
+    )
+    bench_gate_check.add_argument("--run", required=True)
+    bench_gate_check.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    bench_gate_check.set_defaults(func=cmd_benchmark_gate_check)
 
     return parser

@@ -155,6 +155,35 @@ def _export_manifest(
     }
 
 
+def _check_benchmark_gate(run_dir: Path) -> None:
+    """Warn when a persisted gate report exists and recorded a failure.
+
+    The gate is advisory at export time (it already fired at benchmark
+    evaluation time), so this never raises or returns a non-zero code.
+    If ``benchmark_gate.json`` is absent, the gate simply hasn't been run
+    yet — also fine.
+    """
+    gate_path = run_dir / "benchmark_gate.json"
+    if not gate_path.is_file():
+        return
+    try:
+        gate_data = json.loads(gate_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if not gate_data.get("passed", True):
+        violations = gate_data.get("violations", [])
+        detail = (
+            "; ".join(v.get("metric", "?") for v in violations)
+            if violations
+            else "see " + str(gate_path)
+        )
+        print(
+            f"WARNING: benchmark gate FAILED for run {run_dir.name} "
+            f"({detail}). Exporting anyway — gate is advisory at export time.",
+            file=sys.stderr,
+        )
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
@@ -162,6 +191,10 @@ def cmd_export(args: argparse.Namespace) -> int:
     from game_cls.model.builder import build_model
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
+    # Advisory gate check: warn when benchmark_gate.json exists and recorded
+    # a failure, but never block the export — the gate already fired at
+    # benchmark evaluation time.
+    _check_benchmark_gate(run_dir)
     config_source = args.config or str(run_dir / "resolved_config.json")
     if not Path(config_source).is_file():
         print(

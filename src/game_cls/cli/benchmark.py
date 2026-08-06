@@ -10,6 +10,7 @@ nor feeds model selection.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sys
 from pathlib import Path
@@ -84,16 +85,30 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
     config["data"]["mining"] = mining
     pool_index = mining.get("pool_index")
     pool_video_index = mining.get("pool_video_index")
+    pool_packed_index = mining.get("pool_packed_index")
+    pool_packed_video_index = mining.get("pool_packed_video_index")
     pool_metadata = mining.get("pool_metadata")
     mining_version = int(mining.get("version", 1))
     mining_enabled = bool(mining.get("enabled", False))
-    if not pool_index or not pool_video_index:
+    has_plain_pool = bool(pool_index and pool_video_index)
+    has_packed_pool = bool(pool_packed_index and pool_packed_video_index)
+    if not has_plain_pool and not has_packed_pool:
         print(
             "scan-negatives needs data.mining.pool_index and "
-            "data.mining.pool_video_index (or --pool-index/--pool-video-index).",
+            "data.mining.pool_video_index (plain PNG), or "
+            "data.mining.pool_packed_index and "
+            "data.mining.pool_packed_video_index (packed uint8).",
             file=sys.stderr,
         )
         return 2
+    import logging
+
+    logging.getLogger(__name__).info(
+        "benchmark: forcing single-process mode (distributed.enabled overridden)"
+    )
+    config = dict(config)
+    config["distributed"] = dict(config.get("distributed") or {})
+    config["distributed"]["enabled"] = False
     try:
         rank, world_size, local_rank, device = initialize_runtime(config)
     except RuntimeError as exc:
@@ -234,14 +249,28 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         return 2
     challenge_index = config["data"].get("challenge_index")
     challenge_video_index = config["data"].get("challenge_video_index")
+    challenge_packed_index = config["data"].get("challenge_packed_index")
+    challenge_packed_video_index = config["data"].get("challenge_packed_video_index")
     challenge_metadata = config["data"].get("challenge_metadata")
-    if not challenge_index or not challenge_video_index:
+    has_plain_challenge = bool(challenge_index and challenge_video_index)
+    has_packed_challenge = bool(challenge_packed_index and challenge_packed_video_index)
+    if not has_plain_challenge and not has_packed_challenge:
         print(
             "benchmark evaluate needs data.challenge_index and "
-            "data.challenge_video_index (the fixed challenge set).",
+            "data.challenge_video_index (plain PNG), or "
+            "data.challenge_packed_index and "
+            "data.challenge_packed_video_index (packed uint8).",
             file=sys.stderr,
         )
         return 2
+    import logging
+
+    logging.getLogger(__name__).info(
+        "benchmark: forcing single-process mode (distributed.enabled overridden)"
+    )
+    config = dict(config)
+    config["distributed"] = dict(config.get("distributed") or {})
+    config["distributed"]["enabled"] = False
     try:
         rank, world_size, local_rank, device = initialize_runtime(config)
     except RuntimeError as exc:
@@ -297,6 +326,33 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         distributed_barrier()
         metrics = dict(result.metrics or {})
         gates = check_gates(metrics, gate_metrics)
+        # Persist the gate verdict to run_dir so export and CI can read it
+        # without re-running evaluation.
+        all_passed = all(passed for _, passed, _ in gates)
+        gate_report = {
+            "passed": all_passed,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "run_id": run_dir.name,
+            "checkpoint": args.checkpoint,
+            "gate_metrics": gate_metrics,
+            "actual_metrics": {
+                name: metrics.get(str(name)) for name in gate_metrics
+            },
+            "violations": [
+                {"metric": name, "detail": detail}
+                for name, passed, detail in gates
+                if not passed
+            ],
+        }
+        gate_report_path = run_dir / "benchmark_gate.json"
+        gate_report_path.write_text(
+            json.dumps(gate_report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            f"gate: {'PASSED' if all_passed else 'FAILED'} — {gate_report_path}",
+            file=sys.stderr,
+        )
         report_path = write_benchmark_report(
             Path(config["benchmark"].get("output_dir", "benchmarks")),
             run_id=run_dir.name,
@@ -333,3 +389,45 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         return 1 if unmet else 0
     finally:
         cleanup_distributed()
+
+
+def cmd_benchmark_gate_check(args: argparse.Namespace) -> int:
+    """Check a persisted gate report without re-running evaluation.
+
+    Exits 0 when the stored gate passed, 1 when it failed, 2 when the
+    file is missing or malformed.  Lets CI pipeline scripts gate a
+    deployment on a previously-measured benchmark result without paying
+    the cost of a full evaluation pass.
+    """
+    run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
+    gate_report_path = run_dir / "benchmark_gate.json"
+    if not gate_report_path.is_file():
+        print(
+            f"No gate report found at {gate_report_path}. "
+            "Run 'cls-trainer benchmark evaluate' first.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        gate_data = json.loads(gate_report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"Failed to read gate report {gate_report_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    passed = bool(gate_data.get("passed", False))
+    print(
+        json.dumps(
+            {
+                "passed": passed,
+                "run_id": gate_data.get("run_id"),
+                "checkpoint": gate_data.get("checkpoint"),
+                "timestamp": gate_data.get("timestamp"),
+                "violations": gate_data.get("violations", []),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0 if passed else 1

@@ -38,7 +38,7 @@ def _metrics(
     worst_game_fpr: float = 0.01,
     global_recall: float = 0.9,
     worst_game_recall: float = 0.8,
-    negative_p999: float = -2.0,
+    negative_p999: float = 0.10,
     worst_game_f1: float = 0.7,
 ) -> dict:
     return {
@@ -104,17 +104,18 @@ class ConstrainedEligibilityTests(unittest.TestCase):
 class ConstrainedRankingTests(unittest.TestCase):
     def test_rank_key_orders_recall_worst_recall_negative_p999(self) -> None:
         cfg = _constrained_cfg()
+        # negative_p999 values are probabilities in [0,1]; lower = better.
         high_recall = _metrics(
-            global_recall=0.9, worst_game_recall=0.8, negative_p999=-2.0
+            global_recall=0.9, worst_game_recall=0.8, negative_p999=0.10
         )
         lower_recall = _metrics(
-            global_recall=0.85, worst_game_recall=0.8, negative_p999=-2.0
+            global_recall=0.85, worst_game_recall=0.8, negative_p999=0.10
         )
         lower_worst = _metrics(
-            global_recall=0.9, worst_game_recall=0.7, negative_p999=-2.0
+            global_recall=0.9, worst_game_recall=0.7, negative_p999=0.10
         )
         higher_p999 = _metrics(
-            global_recall=0.9, worst_game_recall=0.8, negative_p999=-1.0
+            global_recall=0.9, worst_game_recall=0.8, negative_p999=0.27
         )
         self.assertGreater(
             _selection_rank_key(high_recall, cfg),
@@ -149,15 +150,16 @@ class ConstrainedRankingTests(unittest.TestCase):
 
     def test_better_model_breaks_tie_on_negative_p999(self) -> None:
         cfg = _constrained_cfg()
+        # Lower probability = fewer hard negatives near the threshold = better.
         better = _metrics(
             global_recall=0.9,
             worst_game_recall=0.8,
-            negative_p999=-3.0,
+            negative_p999=0.05,
         )
         worse = _metrics(
             global_recall=0.9,
             worst_game_recall=0.8,
-            negative_p999=-1.0,
+            negative_p999=0.27,
         )
         self.assertTrue(_is_better_model(better, worse, cfg))
         self.assertFalse(_is_better_model(worse, better, cfg))
@@ -189,7 +191,9 @@ class SelectionSortValueTests(unittest.TestCase):
         value = selection_sort_value(_metrics(), cfg)
         self.assertIsInstance(value, list)
         # eligibility flag + the three constrained components.
-        self.assertEqual(value, [1.0, 0.9, 0.8, 2.0])
+        # negative_score_p999 is now stored as probability [0,1]; the sort
+        # component is negated so lower probability ranks higher.
+        self.assertEqual(value, [1.0, 0.9, 0.8, -0.1])
         # A tuple would decode back as a list and stop comparing; a list
         # survives the topk registry / run index round-trip unchanged.
         self.assertEqual(json.loads(json.dumps(value)), value)
@@ -198,7 +202,7 @@ class SelectionSortValueTests(unittest.TestCase):
         cfg = _constrained_cfg()
         self.assertEqual(
             selection_sort_value(_metrics(), cfg, include_eligibility=False),
-            [0.9, 0.8, 2.0],
+            [0.9, 0.8, -0.1],
         )
 
     def test_ineligible_sorts_below_every_eligible_candidate(self) -> None:
@@ -218,10 +222,10 @@ class SelectionSortValueTests(unittest.TestCase):
         # these two at all; only the worst-game recall / negative-p99.9
         # tie-breakers can.
         scalar_winner = _metrics(
-            global_recall=0.9, worst_game_recall=0.60, negative_p999=-1.0
+            global_recall=0.9, worst_game_recall=0.60, negative_p999=0.27
         )
         tuple_winner = _metrics(
-            global_recall=0.9, worst_game_recall=0.85, negative_p999=-3.0
+            global_recall=0.9, worst_game_recall=0.85, negative_p999=0.05
         )
         self.assertTrue(_is_better_model(tuple_winner, scalar_winner, cfg))
         self.assertGreater(
@@ -245,15 +249,15 @@ class SelectionSortValueTests(unittest.TestCase):
     def test_report_fields_expose_eligibility_and_tie_breakers(self) -> None:
         cfg = _constrained_cfg()
         fields = selection_report_fields(
-            _metrics(global_recall=0.88, worst_game_recall=0.72, negative_p999=-2.5),
+            _metrics(global_recall=0.88, worst_game_recall=0.72, negative_p999=0.08),
             cfg,
         )
         self.assertEqual(fields["selection_mode"], "constrained")
         self.assertTrue(fields["selection_eligible"])
         self.assertAlmostEqual(fields["selection_score"], 0.88)
         self.assertAlmostEqual(fields["worst_game_positive_recall"], 0.72)
-        self.assertAlmostEqual(fields["negative_score_p999"], -2.5)
-        self.assertEqual(fields["selection_sort_value"], [1.0, 0.88, 0.72, 2.5])
+        self.assertAlmostEqual(fields["negative_score_p999"], 0.08)
+        self.assertEqual(fields["selection_sort_value"], [1.0, 0.88, 0.72, -0.08])
         # JSON-serializable so it can live in index.jsonl.
         self.assertEqual(json.loads(json.dumps(fields)), fields)
 

@@ -481,6 +481,7 @@ def build_external_pool_loader(
     if packed:
         from game_cls.data.packed_backend import PackedUint8Backend
 
+        assert packed_index is not None
         decoder = PackedUint8Backend(
             packed_index,
             image_spec=ImageSpec.from_config(data_cfg),

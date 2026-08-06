@@ -293,6 +293,49 @@ def _histogram_max_margin(histogram, bins: int) -> float | None:
     return None
 
 
+def _histogram_probability_percentiles(
+    histogram,
+    bins: int,
+    quantiles: tuple[float, ...],
+) -> list[float | None]:
+    """Probability-space percentiles from a probability histogram.
+
+    Identical to ``_histogram_margin_percentiles`` except the bin-center
+    probability is returned directly (range [0, 1]) rather than being
+    converted to log-odds.  ``negative_score_p99/p999`` use this form so
+    that gate thresholds and stored values share a [0, 1] unit throughout:
+    the release recipe writes ``negative_score_p999: {op: "<", value: 0.99}``
+    in probability space, and this function ensures the stored value is in
+    the same space.
+    """
+    import numpy as np
+
+    counts = np.asarray(histogram, dtype=np.int64)
+    total = int(counts.sum())
+    if total <= 0:
+        return [None] * len(quantiles)
+    cdf = np.cumsum(counts)
+    results: list[float | None] = []
+    for quantile in quantiles:
+        target = max(1, int(math.ceil(quantile * total)))
+        bin_index = int(np.searchsorted(cdf, target, side="left"))
+        bin_index = min(max(bin_index, 0), bins - 1)
+        results.append((bin_index + 0.5) / bins)
+    return results
+
+
+def _histogram_max_probability(histogram, bins: int) -> float | None:
+    """Probability at the center of the highest non-empty probability bin.
+
+    Companion to ``_histogram_max_margin``; returns a [0, 1] value so that
+    ``negative_score_max`` shares units with ``negative_score_p99/p999``.
+    """
+    for bin_index in range(len(histogram) - 1, -1, -1):
+        if histogram[bin_index]:
+            return (bin_index + 0.5) / bins
+    return None
+
+
 def _low_fpr_histogram_metrics(
     positive_histogram,
     negative_histogram,
@@ -1054,7 +1097,7 @@ def evaluate(
     if subtype_available and int(sample_count) > 0 and not subtype_counters:
         raise RuntimeError(
             "Evaluation lost the negative-subtype counters: the dataset "
-            f"published {len(subtype_catalog)} subtype group(s) and "
+            f"published {len(subtype_catalog or [])} subtype group(s) and "
             f"{int(sample_count)} sample(s) were scored, but no subtype "
             "counts survived the reduction. Downstream constrained selection "
             "would silently reject every checkpoint."
@@ -1067,10 +1110,10 @@ def evaluate(
     recall_at_max_fpr, low_fpr_partial_auc = _low_fpr_histogram_metrics(
         positive_histogram, negative_histogram, max_fpr_for_recall
     )
-    negative_tail_percentiles = _histogram_margin_percentiles(
+    negative_tail_percentiles = _histogram_probability_percentiles(
         negative_histogram, auc_histogram_bins, (0.99, 0.999)
     )
-    negative_score_max = _histogram_max_margin(negative_histogram, auc_histogram_bins)
+    negative_score_max = _histogram_max_probability(negative_histogram, auc_histogram_bins)
     ece_tail_95_100 = (
         _ece_tail(
             calibration_counts,

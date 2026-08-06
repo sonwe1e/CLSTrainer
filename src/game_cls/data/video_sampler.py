@@ -195,9 +195,9 @@ class VideoBalancedPairBatchSampler:
                     set(self._support[delta][game][0]) - classified,
                 )
         by_game: dict[str, dict[str, dict[str, int]]] = {}
-        for (game, bucket), members in game_videos.items():
+        for (game, bucket), gv_members in game_videos.items():
             by_game.setdefault(game, {})[bucket] = {
-                "videos": len(members),
+                "videos": len(gv_members),
                 "legal_pairs": game_pairs.get((game, bucket), 0),
             }
         return {
