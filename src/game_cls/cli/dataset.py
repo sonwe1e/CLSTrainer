@@ -44,15 +44,15 @@ def _run_split_prepare(
     is the physical ``source_root`` (train_all) whose frames are logically
     re-partitioned into train/val.
     """
+    from game_cls.config_schema import resolve_source_identity_namespaces
     from game_cls.data.image_spec import ImageSpec
     from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
     from game_cls.data.indexing import write_split_bundle
 
     data_config = config["data"]
     split = dict(data_config.get("split") or {})
-    identity_mode = (data_config.get("source_video_identity") or {}).get(
-        "mode", "game_video"
-    )
+    source_video_identity = data_config.get("source_video_identity") or {}
+    identity_mode = source_video_identity.get("mode", "game_video")
     if identity_mode == "game_label_video":
         print(
             "[WARNING] source_video_identity.mode=game_label_video\n"
@@ -61,6 +61,15 @@ def _run_split_prepare(
             "physically unrelated source videos. If this assumption is false, "
             "train/validation\n"
             "leakage may occur."
+        )
+    namespaces_by_split = resolve_source_identity_namespaces(source_video_identity)
+    if namespaces_by_split:
+        print(
+            "[INFO] source identity namespaces: "
+            + ", ".join(
+                f"{split}={namespace}"
+                for split, namespace in sorted(namespaces_by_split.items())
+            )
         )
     if output_dir is None:
         # Match tools/build_index.py's default index output dir; the split
@@ -77,6 +86,7 @@ def _run_split_prepare(
         split_config=split,
         compute_content_hash=True,
         identity_mode=identity_mode,
+        namespaces_by_split=namespaces_by_split,
     )
 
 
@@ -209,10 +219,17 @@ def cmd_dataset_prepare(args: argparse.Namespace) -> int:
 
 def cmd_dataset_audit(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
-    from game_cls.config_schema import ConfigSchemaError
+    from game_cls.config_schema import (
+        ConfigSchemaError,
+        resolve_source_identity_namespaces,
+    )
     from game_cls.data.image_spec import ImageSpec
     from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
-    from game_cls.data.indexing import audit_warning_messages, validate_audit
+    from game_cls.data.indexing import (
+        audit_warning_messages,
+        format_uid_overlap_content_classification,
+        validate_audit,
+    )
 
     try:
         config = load_config(args.config, args.overrides)
@@ -221,6 +238,8 @@ def cmd_dataset_audit(args: argparse.Namespace) -> int:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
     data_config = config["data"]
+    source_video_identity = data_config.get("source_video_identity") or {}
+    namespaces_by_split = resolve_source_identity_namespaces(source_video_identity)
     source = Path(args.index_dir) / "audit.json"
     if not source.is_file():
         print(f"audit report not found: {source}", file=sys.stderr)
@@ -236,6 +255,13 @@ def cmd_dataset_audit(args: argparse.Namespace) -> int:
         )
     for warning in audit_warning_messages(audit):
         print(f"[WARNING] {warning}")
+    # Print the collision classification before the strict gate so the
+    # diagnostic stays visible when the gate fails.
+    classification = audit.get("leakage", {}).get(
+        "source_uid_overlap_content_classification"
+    )
+    if classification:
+        print(format_uid_overlap_content_classification(classification))
     if args.strict:
         validate_audit(
             audit,
@@ -255,9 +281,8 @@ def cmd_dataset_audit(args: argparse.Namespace) -> int:
                     "minimum_pairs_per_game_label_delta", {}
                 ).items()
             },
-            identity_mode=(data_config.get("source_video_identity") or {}).get(
-                "mode", "game_video"
-            ),
+            identity_mode=source_video_identity.get("mode", "game_video"),
+            namespaces_by_split=namespaces_by_split,
         )
         print("Strict dataset audit passed.")
     return 0

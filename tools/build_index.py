@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from game_cls.config import load_config
+from game_cls.config_schema import resolve_source_identity_namespaces
 from game_cls.data.image_spec import ImageSpec
 from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
 from game_cls.data.indexing import write_index_bundle, write_split_bundle
@@ -76,6 +77,9 @@ def main() -> None:
     config = load_config(args.config, args.overrides)
     data_config = config["data"]
     image_spec = ImageSpec.from_config(data_config)
+    namespaces_by_split = resolve_source_identity_namespaces(
+        data_config.get("source_video_identity")
+    )
     if args.split_mode == "from_train":
         if args.val_root is not None:
             parser.error(
@@ -91,10 +95,9 @@ def main() -> None:
             scan_policy=ScanPolicy.from_config(data_config),
             duplicate_policy=DuplicatePolicy.from_config(data_config),
             split_config=split_config,
-            identity_mode=split_config.get(
-                "source_identity_mode", "game_video"
-            ),
+            identity_mode=split_config.get("source_identity_mode", "game_video"),
             compute_content_hash=not args.skip_content_hash,
+            namespaces_by_split=namespaces_by_split,
         )
     else:
         audit = write_index_bundle(
@@ -105,10 +108,11 @@ def main() -> None:
             scan_policy=ScanPolicy.from_config(data_config),
             duplicate_policy=DuplicatePolicy.from_config(data_config),
             val_root=args.val_root,
-            identity_mode=(
-                data_config.get("source_video_identity") or {}
-            ).get("mode", "game_video"),
+            identity_mode=(data_config.get("source_video_identity") or {}).get(
+                "mode", "game_video"
+            ),
             compute_content_hash=not args.skip_content_hash,
+            namespaces_by_split=namespaces_by_split,
         )
     print(json.dumps(audit, ensure_ascii=False, indent=2))
 

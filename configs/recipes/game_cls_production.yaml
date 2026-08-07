@@ -51,6 +51,16 @@ data:
   #   mode: from_train
   #   val_ratio: 0.10
   #   seed: 20260728
+  #
+  # If train and test are independent raw-video pools whose local video_id
+  # numbering happens to overlap, declare distinct source namespaces (step8)
+  # so the strict audit does not flag the coincidence as leakage:
+  # source_video_identity:
+  #   mode: game_label_video
+  #   namespaces:
+  #     source: train_pool    # shorthand: covers both train and val
+  #     test:   heldout_pool  # must differ from the train-side namespace
+  # (omit the namespaces block entirely for the default single-pool behavior.)
   prepare_if_missing: false
   synthetic: false
   require_content_hash_audit: true

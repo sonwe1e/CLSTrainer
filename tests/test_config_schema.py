@@ -68,7 +68,9 @@ class SchemaStrictnessTests(unittest.TestCase):
 class OverrideStrictnessTests(unittest.TestCase):
     def test_typo_override_is_rejected_with_suggestion(self) -> None:
         with self.assertRaises(ConfigSchemaError) as ctx:
-            load_config("configs/recipes/example_debug.yaml", ["optimzier.learning_rate=0.0001"])
+            load_config(
+                "configs/recipes/example_debug.yaml", ["optimzier.learning_rate=0.0001"]
+            )
         message = str(ctx.exception)
         self.assertIn("optimzier.learning_rate", message)
         self.assertIn("optimizer.learning_rate", message)
@@ -80,7 +82,9 @@ class OverrideStrictnessTests(unittest.TestCase):
             load_config("configs/recipes/example_debug.yaml", ["optimizer.name=SGD"])
 
     def test_valid_override_applies(self) -> None:
-        config = load_config("configs/recipes/example_debug.yaml", ["train.max_steps=7"])
+        config = load_config(
+            "configs/recipes/example_debug.yaml", ["train.max_steps=7"]
+        )
         self.assertEqual(config["train"]["max_steps"], 7)
 
     def test_schema_known_path_missing_from_file_is_created(self) -> None:
@@ -344,7 +348,9 @@ class DecisionThresholdTests(unittest.TestCase):
 
 class SourceTrackingTests(unittest.TestCase):
     def test_sources_track_recipe_layers(self) -> None:
-        _, sources = load_config_with_sources("configs/recipes/game_cls_production.yaml")
+        _, sources = load_config_with_sources(
+            "configs/recipes/game_cls_production.yaml"
+        )
         # Machine behavior comes from the profile layer, business facts from
         # the task profile, selection policy from the production preset.
         self.assertTrue(sources["device.accelerator"].endswith("npu_8p.yaml"))
@@ -372,8 +378,52 @@ class SourceTrackingTests(unittest.TestCase):
             "evaluation.selection_metric",
             "checkpoint.periodic_state_mode",
             "distributed.backend",
+            "data.source_video_identity.namespaces.test",
+            "data.source_video_identity.namespaces.source",
         ):
             self.assertIn(required, paths)
+
+
+class SourceNamespaceSchemaTests(unittest.TestCase):
+    """step8 source provenance namespaces are schema-known and validated."""
+
+    def _config(self, namespaces: dict) -> dict:
+        config = load_config("configs/recipes/example_debug.yaml")
+        config["data"]["source_video_identity"]["namespaces"] = namespaces
+        return config
+
+    def test_namespaces_block_is_schema_known(self) -> None:
+        paths = set(known_dotted_paths())
+        for leaf in ("train", "val", "test", "source"):
+            self.assertIn(f"data.source_video_identity.namespaces.{leaf}", paths)
+
+    def test_unknown_namespace_key_is_rejected(self) -> None:
+        config = self._config({"train": "a", "val": "a", "test": "b", "bogus": "c"})
+        with self.assertRaises(ConfigSchemaError) as ctx:
+            finalize_config(config)
+        self.assertIn("data.source_video_identity.namespaces.bogus", str(ctx.exception))
+
+    def test_valid_explicit_form_finalizes(self) -> None:
+        config = self._config(
+            {"train": "train_pool", "val": "train_pool", "test": "heldout_pool"}
+        )
+        finalized = finalize_config(config)
+        self.assertEqual(
+            finalized["data"]["source_video_identity"]["namespaces"],
+            {"train": "train_pool", "val": "train_pool", "test": "heldout_pool"},
+        )
+
+    def test_valid_shorthand_form_finalizes(self) -> None:
+        config = self._config({"source": "train_pool", "test": "heldout_pool"})
+        finalized = finalize_config(config)
+        self.assertEqual(
+            finalized["data"]["source_video_identity"]["namespaces"]["source"],
+            "train_pool",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

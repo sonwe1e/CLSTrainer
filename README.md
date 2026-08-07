@@ -206,6 +206,37 @@ data:
 `labels` 列与 `split_source_identity_mode` 字段。旧的 v2 manifest 会被明确拒绝并
 提示 "Delete/rebuild the manifest"（删除后重建即可）。
 
+**源池命名空间（source namespace）** 解决另一个独立问题：`train` 与 `test` 是
+分别准备、互不重叠的两组原始视频，只是局部编号恰好相同（例如两边都有 `MC/0/01`），
+此时 strict audit 会把它们误判为同一源视频跨 split 泄漏。用
+`data.source_video_identity.namespaces` 显式声明测试池来自独立原始视频池后，跨
+split 的源身份比较会带上来源池前缀，编号冲突不再触发泄漏：
+
+```yaml
+data:
+  source_video_identity:
+    mode: game_label_video      # 按数据需要
+    namespaces:
+      source: train_pool        # 简写：source 同时覆盖 train 与 val（from_train 划分）
+      test:   heldout_pool      # 测试池必须存在且与 train 侧不同
+  # 显式形态：{train: train_pool, val: train_pool, test: heldout_pool}
+```
+
+规则：
+
+- `train` 与 `val` 必须共享同一 namespace（它们来自同一个物理池，自动划分）。
+- `test` 必须存在且与 train 侧不同，否则配置校验直接报错。
+- 不配置 `namespaces` 时行为与旧版完全一致（字节级不变）。
+- namespace 只作用于 audit 的跨 split 身份比较；split manifest、dataset 指纹、
+  逐 split parquet 的 uid、metadata sidecar key 均不受影响。三 root
+  （`split.mode=off`）下 `train`/`val` 也必须共享 namespace；同 namespace 内
+  train/val 的真重叠仍被强制判定为泄漏。
+- SHA-256 内容层对 namespace **不可见**：即使声明了不同 namespace，任何跨 split
+  的相同帧内容仍被强制判定为泄漏。
+- `dataset audit --strict` 遇到源身份重叠时，会额外输出**内容冲突分类**诊断：对
+  每个冲突源视频报告跨 split 共享内容帧数——`0` 说明大概率只是编号冲突，`>0`
+  说明可能是同一原始视频的真泄漏。该诊断只是报告，不放松泄漏闸门。
+
 ### 5. 高级选项
 
 #### 模型选择与早停

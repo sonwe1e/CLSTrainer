@@ -5,7 +5,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from game_cls.config_schema import finalize_config
+from game_cls.config_schema import finalize_config, resolve_source_identity_namespaces
 from game_cls.data.collate import pair_collate
 from game_cls.data.image_spec import ImageSpec
 from game_cls.engine.training.config_validation import (
@@ -122,6 +122,9 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
 
     data_cfg = config["data"]
     image_spec = ImageSpec.from_config(data_cfg)
+    namespaces_by_split = resolve_source_identity_namespaces(
+        data_cfg.get("source_video_identity")
+    )
     if data_cfg.get("strict_audit", True):
         audit_path = data_cfg.get("audit_path")
         if not audit_path:
@@ -147,6 +150,7 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
             identity_mode=(data_cfg.get("source_video_identity") or {}).get(
                 "mode", "game_video"
             ),
+            namespaces_by_split=namespaces_by_split,
         )
         if rank == 0:
             for warning in audit_warning_messages(audit):

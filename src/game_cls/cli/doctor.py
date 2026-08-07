@@ -185,6 +185,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "data.audit_path parses",
                 str(audit_path),
             )
+            if audit_ok:
+                from game_cls.config_schema import resolve_source_identity_namespaces
+
+                stored_namespaces = (payload.get("leakage") or {}).get(
+                    "source_identity_namespaces"
+                )
+                configured = resolve_source_identity_namespaces(
+                    data_cfg.get("source_video_identity")
+                )
+                check(
+                    (stored_namespaces or {}) == configured,
+                    "audit source identity namespaces",
+                    f"audit={stored_namespaces or {}} config={configured}",
+                )
         else:
             check(
                 False,

@@ -182,6 +182,100 @@ class DatasetCliTests(unittest.TestCase):
             )
             self.assertEqual(cmd_dataset_audit(args), 0)
 
+    def _build_overlap_roots(self, base: Path) -> None:
+        """train_all and test reuse the same (game, video_id) numbering but
+        are physically different videos (each PNG's bytes are unique)."""
+        train_all = base / "train_all"
+        for game in ("game_a", "game_b"):
+            for video in range(4):
+                label = video % 2
+                write_video(train_all, game, label, f"{video + 1:02d}", 4)
+        test_root = base / "test"
+        for label in (0, 1):
+            write_video(test_root, "game_a", label, f"{label + 1:02d}", 3)
+
+    def _write_namespaced_config(self, directory: Path) -> Path:
+        config = _write_config(directory)
+        text = config.read_text(encoding="utf-8")
+        text = text.replace(
+            "  duplicate_policy:",
+            "  source_video_identity:\n"
+            "    namespaces:\n"
+            "      source: train_pool\n"
+            "      test: heldout_pool\n"
+            "  duplicate_policy:",
+        )
+        config.write_text(text, encoding="utf-8")
+        return config
+
+    def test_namespaced_coincidental_ids_pass_strict_audit(self) -> None:
+        """step8 end-to-end: declaring distinct source pools clears the
+        false-positive source-video overlap and the strict gate passes."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            self._build_overlap_roots(base)
+            config = self._write_namespaced_config(base)
+            output_dir = base / "indexes"
+            prepare_args = argparse.Namespace(
+                config=str(config),
+                train_root=str(base / "train_all"),
+                test_root=str(base / "test"),
+                output_dir=str(output_dir),
+                val_ratio=None,
+                overrides=[],
+            )
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(cmd_dataset_prepare(prepare_args), 0)
+            self.assertIn("source identity namespaces", buffer.getvalue())
+            audit = json.loads((output_dir / "audit.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                audit["leakage"]["source_identity_namespaces"],
+                {"train": "train_pool", "val": "train_pool", "test": "heldout_pool"},
+            )
+            audit_args = argparse.Namespace(
+                config=str(config),
+                index_dir=str(output_dir),
+                strict=True,
+                overrides=[],
+            )
+            self.assertEqual(cmd_dataset_audit(audit_args), 0)
+
+    def test_unconfigured_coincidental_ids_fail_with_classification(self) -> None:
+        """Without namespaces the same data fails the strict gate, but the
+        content-collision classification is printed first (diagnostic)."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            self._build_overlap_roots(base)
+            config = _write_config(base)  # no namespaces
+            output_dir = base / "indexes"
+            prepare_args = argparse.Namespace(
+                config=str(config),
+                train_root=str(base / "train_all"),
+                test_root=str(base / "test"),
+                output_dir=str(output_dir),
+                val_ratio=None,
+                overrides=[],
+            )
+            self.assertEqual(cmd_dataset_prepare(prepare_args), 0)
+            audit_args = argparse.Namespace(
+                config=str(config),
+                index_dir=str(output_dir),
+                strict=True,
+                overrides=[],
+            )
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer), self.assertRaises(RuntimeError):
+                cmd_dataset_audit(audit_args)
+            self.assertIn("content classification", buffer.getvalue())
+            self.assertIn("shared content frames=0", buffer.getvalue())
+
     def test_dataset_pack_packs_train_frames(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

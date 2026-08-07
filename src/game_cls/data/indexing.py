@@ -322,6 +322,131 @@ def _split_report(frames: list[FrameRecord], findings: ScanFindings) -> dict:
     }
 
 
+def _video_key(frame: FrameRecord, namespace: str | None) -> tuple:
+    """Cross-split video-key identity for one frame.
+
+    Under a source namespace the key is the 4-tuple ``(namespace, game,
+    label, video_id)`` so coincidentally equal local numbering in a
+    distinct source pool does not intersect; otherwise the legacy 3-tuple
+    keeps the default path byte-for-byte identical.
+    """
+    if namespace is not None:
+        return (namespace, frame.game, frame.label, frame.video_id)
+    return (frame.game, frame.label, frame.video_id)
+
+
+def _video_key_entry(item: tuple) -> dict:
+    """Render a cross-split video-key overlap entry for storage.
+
+    Namespaced keys (4-tuples) include a ``namespace`` field; the legacy
+    3-tuple keeps the ``{"game", "label", "video_id"}`` shape so
+    pre-namespace audit consumers are unchanged.
+    """
+    if len(item) == 4:
+        namespace, game, label, video_id = item
+        return {
+            "game": game,
+            "label": label,
+            "video_id": video_id,
+            "namespace": namespace,
+        }
+    game, label, video_id = item
+    return {"game": game, "label": label, "video_id": video_id}
+
+
+def _source_uid_content_classification(
+    frames_by_split: dict[str, list[FrameRecord]],
+    source_uids_by_split: dict[str, set[str]],
+    namespaces_by_split: dict[str, str],
+) -> dict:
+    """Per-colliding-uid diagnostic: how much frame content is shared.
+
+    For every split pair with non-empty source-uid overlap, report for each
+    colliding uid how many frames share identical content (SHA-256) across
+    the two splits. This is a *diagnostic* to help an operator tell an ID
+    numbering collision (shared=0) apart from a real source-video leak
+    (shared>0); it never relaxes the strict gate. ``content_hashes_available``
+    is False when any involved frame lacks a content hash, in which case the
+    counts are best-effort.
+    """
+    grouped: dict[str, dict[str, list[FrameRecord]]] = {}
+    hashes_available = True
+    for split, frames in frames_by_split.items():
+        namespace = namespaces_by_split.get(split)
+        for frame in frames:
+            uid = source_video_uid(
+                frame.game,
+                frame.video_id,
+                frame.label,
+                namespace=namespace,
+            )
+            grouped.setdefault(split, {}).setdefault(uid, []).append(frame)
+            if not frame.content_sha256:
+                hashes_available = False
+    split_names = [name for name in SPLIT_ORDER if name in frames_by_split]
+    pairs: dict[str, list[dict]] = {}
+    for index, left in enumerate(split_names):
+        for right in split_names[index + 1 :]:
+            pair_key = f"{left}__{right}"
+            overlap = sorted(source_uids_by_split[left] & source_uids_by_split[right])
+            if not overlap:
+                continue
+            entries: list[dict] = []
+            for uid in overlap:
+                shared_hashes = {
+                    frame.content_sha256
+                    for frame in grouped[left][uid]
+                    if frame.content_sha256
+                } & {
+                    frame.content_sha256
+                    for frame in grouped[right][uid]
+                    if frame.content_sha256
+                }
+                shared_frames = sum(
+                    1
+                    for frame in grouped[left][uid] + grouped[right][uid]
+                    if frame.content_sha256 in shared_hashes
+                )
+                entries.append(
+                    {
+                        "source_video_uid": uid,
+                        "shared_content_frames": shared_frames,
+                    }
+                )
+            pairs[pair_key] = entries
+    return {"content_hashes_available": hashes_available, "pairs": pairs}
+
+
+def format_uid_overlap_content_classification(classification: dict) -> str:
+    """Human-readable collision classification for ``dataset audit``."""
+    pairs = classification.get("pairs", {})
+    if not pairs:
+        return ""
+    lines = [
+        "source-video overlap content classification (diagnostic only; "
+        "the strict gate stays in force):"
+    ]
+    if not classification.get("content_hashes_available", True):
+        lines.append(
+            "  (content hashes were unavailable on some frames; shared-frame "
+            "counts are best-effort)"
+        )
+    for pair_key, entries in sorted(pairs.items()):
+        for entry in entries:
+            shared = entry["shared_content_frames"]
+            hint = (
+                "likely numbering collision"
+                if shared == 0
+                else "likely same video, real leakage"
+            )
+            lines.append(
+                f"  {entry['source_video_uid']} "
+                f"({pair_key.replace('__', '/')}): "
+                f"shared content frames={shared} -> {hint}"
+            )
+    return "\n".join(lines)
+
+
 def make_audit(
     frames_by_split: dict[str, list[FrameRecord]],
     findings_by_split: dict[str, ScanFindings],
@@ -329,16 +454,21 @@ def make_audit(
     duplicate_policy: DuplicatePolicy,
     *,
     identity_mode: str = "game_video",
+    namespaces_by_split: dict[str, str] | None = None,
 ) -> dict:
-    video_keys_by_split: dict[str, set[tuple[str, int, str]]] = {}
+    namespaces_by_split = namespaces_by_split or {}
+    video_keys_by_split: dict[str, set[tuple]] = {}
     source_uids_by_split: dict[str, set[str]] = {}
     for split, frames in frames_by_split.items():
-        video_keys_by_split[split] = {
-            (frame.game, frame.label, frame.video_id) for frame in frames
-        }
+        namespace = namespaces_by_split.get(split)
+        video_keys_by_split[split] = {_video_key(frame, namespace) for frame in frames}
         source_uids_by_split[split] = {
             source_video_uid(
-                frame.game, frame.video_id, frame.label, mode=identity_mode
+                frame.game,
+                frame.video_id,
+                frame.label,
+                mode=identity_mode,
+                namespace=namespace,
             )
             for frame in frames
         }
@@ -349,14 +479,39 @@ def make_audit(
         for right in split_names[index + 1 :]:
             pair_key = f"{left}__{right}"
             video_key_overlap[pair_key] = [
-                {"game": game, "label": label, "video_id": video_id}
-                for game, label, video_id in sorted(
+                _video_key_entry(item)
+                for item in sorted(
                     video_keys_by_split[left] & video_keys_by_split[right]
                 )
             ]
             source_uid_overlap[pair_key] = sorted(
                 source_uids_by_split[left] & source_uids_by_split[right]
             )
+    leakage: dict[str, object] = {
+        # Backwards-compatible train/test view.
+        "video_keys_across_splits": video_key_overlap.get("train__test", []),
+        "split_pair_video_key_overlap": video_key_overlap,
+        "source_video_uid_overlap": source_uid_overlap,
+        "source_identity_mode": identity_mode,
+        "video_key_check_note": (
+            f"source_video_uid identity mode is {identity_mode}"
+            + (
+                f" with source namespaces {dict(sorted(namespaces_by_split.items()))}"
+                if namespaces_by_split
+                else ""
+            )
+            + "; a source video must not span train/val/test"
+        ),
+    }
+    if namespaces_by_split:
+        leakage["source_identity_namespaces"] = dict(
+            sorted(namespaces_by_split.items())
+        )
+    classification = _source_uid_content_classification(
+        frames_by_split, source_uids_by_split, namespaces_by_split
+    )
+    if classification["pairs"]:
+        leakage["source_uid_overlap_content_classification"] = classification
     return {
         "audit_format_version": AUDIT_FORMAT_VERSION,
         "expected": {
@@ -372,17 +527,7 @@ def make_audit(
             for split, frames in frames_by_split.items()
         },
         "duplicates": analyze_content_duplicates(frames_by_split, duplicate_policy),
-        "leakage": {
-            # Backwards-compatible train/test view.
-            "video_keys_across_splits": video_key_overlap.get("train__test", []),
-            "split_pair_video_key_overlap": video_key_overlap,
-            "source_video_uid_overlap": source_uid_overlap,
-            "source_identity_mode": identity_mode,
-            "video_key_check_note": (
-                f"source_video_uid identity mode is {identity_mode}; a "
-                "source video must not span train/val/test"
-            ),
-        },
+        "leakage": leakage,
     }
 
 
@@ -417,6 +562,7 @@ def validate_audit(
     require_unique_video_keys: bool = False,
     minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
     identity_mode: str = "game_video",
+    namespaces_by_split: dict[str, str] | None = None,
 ) -> None:
     problems: list[str] = []
     if audit.get("audit_format_version") not in (2, AUDIT_FORMAT_VERSION):
@@ -528,7 +674,14 @@ def validate_audit(
     # what the caller thinks they mean.
     if leakage.get("source_identity_mode", "game_video") != identity_mode:
         problems.append(
-            "audit source identity mode does not match configuration; "
+            "audit source identity mode does not match configuration; rebuild indexes"
+        )
+    # The audit must also have been built under the same per-split source
+    # namespaces: its overlap verdicts only mean what the caller expects if
+    # the provenance boundary it was computed under is the configured one.
+    if leakage.get("source_identity_namespaces", {}) != (namespaces_by_split or {}):
+        problems.append(
+            "audit source identity namespaces do not match configuration; "
             "rebuild indexes"
         )
     # Source videos must never span train/val/test. Label-independent
@@ -561,6 +714,7 @@ def validate_audit_file(
     require_unique_video_keys: bool = False,
     minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
     identity_mode: str = "game_video",
+    namespaces_by_split: dict[str, str] | None = None,
 ) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -578,6 +732,7 @@ def validate_audit_file(
         require_unique_video_keys=require_unique_video_keys,
         minimum_pairs_per_game_label_delta=minimum_pairs_per_game_label_delta,
         identity_mode=identity_mode,
+        namespaces_by_split=namespaces_by_split,
     )
     return audit
 
@@ -594,6 +749,7 @@ def write_index_bundle(
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
     compute_content_hash: bool = True,
     identity_mode: str = "game_video",
+    namespaces_by_split: dict[str, str] | None = None,
 ) -> dict:
     output_dir = Path(output_dir)
     frames_by_split: dict[str, list[FrameRecord]] = {}
@@ -633,6 +789,7 @@ def write_index_bundle(
         image_spec,
         duplicate_policy,
         identity_mode=identity_mode,
+        namespaces_by_split=namespaces_by_split,
     )
     audit["policies"]["scan_policy"] = scan_policy.to_dict()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -655,6 +812,7 @@ def write_split_bundle(
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
     compute_content_hash: bool = True,
     identity_mode: str = "game_video",
+    namespaces_by_split: dict[str, str] | None = None,
 ) -> dict:
     """Scan train_all once, auto-split it into train/val by source video,
     combine with the independently scanned test set, and write the full
@@ -790,6 +948,7 @@ def write_split_bundle(
         image_spec,
         duplicate_policy,
         identity_mode=identity_mode,
+        namespaces_by_split=namespaces_by_split,
     )
     # The source identity precheck rides along on the returned audit dict.
     audit["source_identity_precheck"] = source_identity_report

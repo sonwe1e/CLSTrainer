@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from game_cls.config import load_config
+from game_cls.config_schema import resolve_source_identity_namespaces
 from game_cls.data.image_spec import ImageSpec
 from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
 from game_cls.data.indexing import audit_warning_messages, validate_audit
@@ -23,6 +24,9 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
     data_config = config["data"]
+    namespaces_by_split = resolve_source_identity_namespaces(
+        data_config.get("source_video_identity")
+    )
     source = Path(args.index_dir) / "audit.json"
     audit = json.loads(source.read_text(encoding="utf-8"))
     output = Path(args.output_dir)
@@ -63,6 +67,7 @@ def main() -> None:
             identity_mode=(data_config.get("source_video_identity") or {}).get(
                 "mode", "game_video"
             ),
+            namespaces_by_split=namespaces_by_split,
         )
         print("Strict dataset audit passed.")
 

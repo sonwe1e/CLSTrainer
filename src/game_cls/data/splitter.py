@@ -56,6 +56,7 @@ def source_video_uid(
     label=None,
     *,
     mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
+    namespace: str | None = None,
 ) -> str:
     """Stable identity of a source video under ``mode``.
 
@@ -65,6 +66,13 @@ def source_video_uid(
     ``"game_label_video"`` the label is embedded in the uid, so a video
     that carries frames under both labels becomes two independent
     identities and ``label`` is required.
+
+    ``namespace`` is an optional source-pool provenance prefix (step8). It
+    is applied only where cross-split identity is compared (the audit); it
+    never enters the split manifest, dataset fingerprint, per-split parquet
+    uids or the metadata sidecar key. A distinct test namespace declares
+    that coincidentally equal local video numbering belongs to a
+    physically unrelated raw-video pool.
     """
     if mode not in SOURCE_IDENTITY_MODES:
         raise ValueError(
@@ -74,8 +82,12 @@ def source_video_uid(
     if mode == "game_label_video":
         if label is None:
             raise ValueError("source_video_uid mode=game_label_video requires label")
-        return f"{game}::{int(label)}::{video_id}"
-    return f"{game}::{video_id}"
+        uid = f"{game}::{int(label)}::{video_id}"
+    else:
+        uid = f"{game}::{video_id}"
+    if namespace:
+        uid = f"{namespace}::{uid}"
+    return uid
 
 
 def _stable_rank(seed: int, uid: str) -> int:
@@ -907,9 +919,7 @@ def format_source_identity_precheck(report: dict) -> str:
     if report["mixed_label_examples"]:
         lines.append("Mixed-label examples:")
         for example in report["mixed_label_examples"]:
-            lines.append(
-                f"  {example['source_video_uid']}  labels={example['labels']}"
-            )
+            lines.append(f"  {example['source_video_uid']}  labels={example['labels']}")
     label0 = report["pair_counts_label0"]
     label1 = report["pair_counts_label1"]
     lines.append(

@@ -981,6 +981,29 @@ _NESTED_KEY_SCHEMAS: dict[str, dict[str, Any]] = {
             "identical video_id under different labels are unrelated videos.",
             choices=("game_video", "game_label_video"),
         ),
+        "namespaces": {
+            "train": _k(
+                "str",
+                "Source-pool namespace for the train split (explicit form). "
+                "Train and val are split from one physical pool, so train "
+                "must equal val.",
+            ),
+            "val": _k(
+                "str",
+                "Source-pool namespace for the validation split; must equal train.",
+            ),
+            "test": _k(
+                "str",
+                "Source-pool namespace for the test split; must differ from "
+                "the train-side namespace (a declaration that test is an "
+                "independent raw-video pool).",
+            ),
+            "source": _k(
+                "str",
+                "Train-side pool namespace under the {source, test} shorthand "
+                "(use with data.split.mode=from_train).",
+            ),
+        },
     },
 }
 
@@ -1452,6 +1475,26 @@ def split_role_warnings(config: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def resolve_source_identity_namespaces(
+    source_video_identity: dict | None,
+) -> dict[str, str]:
+    """Normalize ``data.source_video_identity.namespaces`` to per-split roles.
+
+    Returns ``{}`` when namespaces are unconfigured. Accepts the explicit
+    ``{train, val, test}`` form or the ``{source, test}`` shorthand; both
+    resolve to ``{train: <train-side>, val: <train-side>, test: <test>}``.
+    Callers must run ``finalize_config`` first so the forms and equality
+    constraints already hold.
+    """
+    raw = (source_video_identity or {}).get("namespaces")
+    if not raw:
+        return {}
+    if "source" in raw:
+        train_side = raw["source"]
+        return {"train": train_side, "val": train_side, "test": raw["test"]}
+    return {"train": raw["train"], "val": raw["val"], "test": raw["test"]}
+
+
 def semantic_validate(config: dict[str, Any]) -> None:
     """Third validation layer: ranges, probabilities and cross-field facts.
 
@@ -1770,6 +1813,69 @@ def semantic_validate(config: dict[str, Any]) -> None:
             require(
                 int(target_delta) in (1, 2, 3),
                 f"data.split.target_delta must be 1, 2 or 3 (got {target_delta}).",
+            )
+
+    # Source provenance namespaces (step8): per-split source-pool labels.
+    # Namespaces exist only to separate independent collection pools that
+    # coincidentally share local video_id numbering; the SHA-256 layer stays
+    # namespace-blind, so identical content across splits is still fatal.
+    svc = data_meta.get("source_video_identity") or {}
+    namespaces = svc.get("namespaces")
+    if namespaces is not None:
+        ns_keys = set(namespaces)
+        if "source" in ns_keys:
+            # Only train/val are mutually exclusive with the source
+            # shorthand; test is shared by both forms.
+            require(
+                not (ns_keys & {"train", "val"}),
+                "data.source_video_identity.namespaces: the {source, test} "
+                "shorthand is mutually exclusive with explicit train/val "
+                "keys.",
+            )
+            require(
+                "test" in ns_keys,
+                "data.source_video_identity.namespaces: the {source, test} "
+                "shorthand requires a test key.",
+            )
+        else:
+            require(
+                {"train", "val", "test"} <= ns_keys,
+                "data.source_video_identity.namespaces: the explicit form "
+                "requires train, val and test keys.",
+            )
+        # Only resolve once the configured form is complete; the resolver
+        # indexes the missing keys directly, so guard before calling it.
+        form_complete = (
+            ("source" in ns_keys and "test" in ns_keys)
+            if "source" in ns_keys
+            else {"train", "val", "test"} <= ns_keys
+        )
+        resolved = resolve_source_identity_namespaces(svc) if form_complete else {}
+        require(
+            bool(resolved) and all(resolved.values()),
+            "data.source_video_identity.namespaces values must be non-empty.",
+        )
+        if resolved:
+            require(
+                resolved["train"] == resolved["val"],
+                "data.source_video_identity.namespaces: train and val must "
+                "share one namespace because they are split from a single "
+                "source pool.",
+            )
+            require(
+                resolved["train"] != resolved["test"],
+                "data.source_video_identity.namespaces: the train-side "
+                "namespace must differ from the test namespace; identical "
+                "namespaces would collapse the provenance boundary and hide "
+                "cross-pool leakage.",
+            )
+            require(
+                not (data_meta.get("split_migration") or {}).get(
+                    "test_used_as_validation", False
+                ),
+                "data.source_video_identity.namespaces requires an independent "
+                "test split; the current config aliases test_index as "
+                "validation (data.split_migration.test_used_as_validation).",
             )
 
     # early_stopping.mode: min with a selection monitor is a silent behavior

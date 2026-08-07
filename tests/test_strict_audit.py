@@ -156,9 +156,7 @@ class StrictAuditTests(unittest.TestCase):
         train = frame(
             split="train", label=0, path="/train/0100001.png", sha256="hash-a"
         )
-        test = frame(
-            split="test", label=0, path="/test/0100001.png", sha256="hash-b"
-        )
+        test = frame(split="test", label=0, path="/test/0100001.png", sha256="hash-b")
         train_uid = source_video_uid(
             train.game, train.video_id, train.label, mode="game_label_video"
         )
@@ -305,6 +303,79 @@ class StrictAuditTests(unittest.TestCase):
             duplicates["warnings"][0]["kind"],
             "duplicate_content_within_split",
         )
+
+
+class NamespaceAuditTests(unittest.TestCase):
+    """step8: per-split source namespaces must match the audit and clear
+    coincidental train/test overlap."""
+
+    NAMESPACES = {
+        "train": "train_pool",
+        "val": "train_pool",
+        "test": "heldout_pool",
+    }
+
+    def test_namespaces_mismatch_is_fatal(self) -> None:
+        audit = valid_audit()
+        audit["leakage"]["source_identity_namespaces"] = self.NAMESPACES
+        audit["leakage"]["source_video_uid_overlap"] = {
+            "train__test": [],
+            "train__val": [],
+            "val__test": [],
+        }
+        with self.assertRaisesRegex(RuntimeError, "namespaces do not match"):
+            validate_audit(audit, namespaces_by_split={"test": "other_pool"})
+        validate_audit(audit, namespaces_by_split=self.NAMESPACES)
+
+    def test_old_audit_without_namespaces_requires_rebuild_when_configured(
+        self,
+    ) -> None:
+        # A pre-namespace audit.json has no source_identity_namespaces key; a
+        # config that now declares namespaces must force a rebuild.
+        audit = valid_audit()
+        with self.assertRaisesRegex(RuntimeError, "namespaces do not match"):
+            validate_audit(audit, namespaces_by_split=self.NAMESPACES)
+
+    def test_old_audit_without_namespaces_passes_when_unconfigured(self) -> None:
+        # Default path unchanged: absent namespaces on both sides validate.
+        audit = valid_audit()
+        validate_audit(audit)
+        validate_audit(audit, namespaces_by_split=None)
+
+    def test_namespaced_stored_overlap_is_honored(self) -> None:
+        audit = valid_audit()
+        audit["leakage"]["source_identity_namespaces"] = self.NAMESPACES
+        # Under namespaces the stored overlap is empty (coincidental ids in
+        # distinct pools), so the strict gate passes.
+        audit["leakage"]["source_video_uid_overlap"] = {
+            "train__test": [],
+            "train__val": [],
+            "val__test": [],
+        }
+        audit["leakage"]["video_keys_across_splits"] = []
+        validate_audit(audit, namespaces_by_split=self.NAMESPACES)
+
+    def test_content_classification_formatter(self) -> None:
+        from game_cls.data.indexing import (
+            format_uid_overlap_content_classification,
+        )
+
+        text = format_uid_overlap_content_classification(
+            {
+                "content_hashes_available": True,
+                "pairs": {
+                    "train__test": [
+                        {
+                            "source_video_uid": "MC::01",
+                            "shared_content_frames": 0,
+                        }
+                    ]
+                },
+            }
+        )
+        self.assertIn("MC::01", text)
+        self.assertIn("numbering collision", text)
+        self.assertEqual(format_uid_overlap_content_classification({"pairs": {}}), "")
 
 
 if __name__ == "__main__":

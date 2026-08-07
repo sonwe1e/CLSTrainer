@@ -284,6 +284,52 @@ class IndexBundleTests(unittest.TestCase):
                     require_content_hash=False,
                 )
 
+    def test_three_split_bundle_with_namespaces_separates_test(self) -> None:
+        """A distinct test namespace clears train/test id coincidence while
+        the same-namespace train/val overlap stays fatal (train/val always
+        share one pool)."""
+        namespaces_by_split = {
+            "train": "train_pool",
+            "val": "train_pool",
+            "test": "heldout_pool",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for split in ("train", "val", "test"):
+                write_png_header(root / split / "game_A" / "0" / "0100001.png")
+            output = root / "indexes"
+            audit = write_index_bundle(
+                root / "train",
+                root / "test",
+                output,
+                ImageSpec(width=448, height=208, channels=3),
+                scan_policy(),
+                DuplicatePolicy(),
+                val_root=root / "val",
+                namespaces_by_split=namespaces_by_split,
+            )
+            overlap = audit["leakage"]["source_video_uid_overlap"]
+            # train/val share the train_pool namespace: the real overlap of
+            # the same source video stays detectable.
+            self.assertEqual(overlap["train__val"], ["train_pool::game_A::01"])
+            # test lives in a distinct pool: coincidental ids are not leakage.
+            self.assertEqual(overlap["train__test"], [])
+            self.assertEqual(overlap["val__test"], [])
+            self.assertEqual(
+                audit["leakage"]["source_identity_namespaces"],
+                dict(sorted(namespaces_by_split.items())),
+            )
+            with self.assertRaisesRegex(RuntimeError, "train/val"):
+                from game_cls.data.indexing import validate_audit
+
+                validate_audit(
+                    audit,
+                    image_spec=ImageSpec(width=448, height=208, channels=3),
+                    duplicate_policy=DuplicatePolicy(),
+                    require_content_hash=False,
+                    namespaces_by_split=namespaces_by_split,
+                )
+
 
 @unittest.skipIf(pq is None, "pyarrow is not installed in the current interpreter")
 class SplitBundleTests(unittest.TestCase):
