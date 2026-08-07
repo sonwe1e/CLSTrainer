@@ -285,6 +285,11 @@ class CliWorkflowTests(unittest.TestCase):
         env["PYTHONPATH"] = (
             str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
         )
+        # Force the child to write UTF-8 regardless of the host locale. On a
+        # Chinese-locale Windows box piped stdout would otherwise be GBK
+        # (cp936), which this harness decodes as UTF-8 and blows up on
+        # non-ASCII CLI text (e.g. the em dash in the dry-run banner).
+        env["PYTHONIOENCODING"] = "utf-8"
         completed = subprocess.run(
             [sys.executable, "-m", "game_cls.cli", *args],
             cwd=REPO_ROOT,

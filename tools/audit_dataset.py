@@ -60,6 +60,9 @@ def main() -> None:
                     "minimum_pairs_per_game_label_delta", {}
                 ).items()
             },
+            identity_mode=(data_config.get("source_video_identity") or {}).get(
+                "mode", "game_video"
+            ),
         )
         print("Strict dataset audit passed.")
 

@@ -18,23 +18,12 @@ from .records import (
     read_png_metadata,
     summarize_videos,
 )
-from .splitter import resolve_split, write_split_summary
+from .splitter import resolve_split, source_video_uid, write_split_summary
 
 AUDIT_FORMAT_VERSION = 3
 
 # Ordered split roles of the train/validation/test protocol.
 SPLIT_ORDER = ("train", "val", "test")
-
-
-def source_video_uid(game: str, video_id: str) -> str:
-    """Stable, label-independent identity of a source video.
-
-    Two-digit ``video_id`` values alone are not globally unique; the
-    game prefix makes them safe for cross-split leakage checks. Adjacent
-    frames and every delta pair of one source video must live in a single
-    split, so this identity is the unit of leakage detection.
-    """
-    return f"{game}::{video_id}"
 
 
 @dataclass(frozen=True)
@@ -338,6 +327,8 @@ def make_audit(
     findings_by_split: dict[str, ScanFindings],
     image_spec: ImageSpec,
     duplicate_policy: DuplicatePolicy,
+    *,
+    identity_mode: str = "game_video",
 ) -> dict:
     video_keys_by_split: dict[str, set[tuple[str, int, str]]] = {}
     source_uids_by_split: dict[str, set[str]] = {}
@@ -346,7 +337,10 @@ def make_audit(
             (frame.game, frame.label, frame.video_id) for frame in frames
         }
         source_uids_by_split[split] = {
-            source_video_uid(frame.game, frame.video_id) for frame in frames
+            source_video_uid(
+                frame.game, frame.video_id, frame.label, mode=identity_mode
+            )
+            for frame in frames
         }
     split_names = [name for name in SPLIT_ORDER if name in frames_by_split]
     video_key_overlap: dict[str, list[dict]] = {}
@@ -383,9 +377,10 @@ def make_audit(
             "video_keys_across_splits": video_key_overlap.get("train__test", []),
             "split_pair_video_key_overlap": video_key_overlap,
             "source_video_uid_overlap": source_uid_overlap,
+            "source_identity_mode": identity_mode,
             "video_key_check_note": (
-                "source_video_uid is game::video_id; a source video must "
-                "not span train/val/test"
+                f"source_video_uid identity mode is {identity_mode}; a "
+                "source video must not span train/val/test"
             ),
         },
     }
@@ -421,6 +416,7 @@ def validate_audit(
     require_content_hash: bool = False,
     require_unique_video_keys: bool = False,
     minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
+    identity_mode: str = "game_video",
 ) -> None:
     problems: list[str] = []
     if audit.get("audit_format_version") not in (2, AUDIT_FORMAT_VERSION):
@@ -527,6 +523,14 @@ def validate_audit(
         problems.append(
             f"train/test share video keys: {leakage['video_keys_across_splits'][:20]}"
         )
+    # The audit must have been built under the same source identity mode as
+    # the current configuration, otherwise its leakage verdicts do not mean
+    # what the caller thinks they mean.
+    if leakage.get("source_identity_mode", "game_video") != identity_mode:
+        problems.append(
+            "audit source identity mode does not match configuration; "
+            "rebuild indexes"
+        )
     # Source videos must never span train/val/test. Label-independent
     # source_video_uid overlap is leakage regardless of the policy flags.
     source_overlap = leakage.get("source_video_uid_overlap")
@@ -556,6 +560,7 @@ def validate_audit_file(
     require_content_hash: bool = False,
     require_unique_video_keys: bool = False,
     minimum_pairs_per_game_label_delta: dict[int, int] | None = None,
+    identity_mode: str = "game_video",
 ) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -572,6 +577,7 @@ def validate_audit_file(
         require_content_hash=require_content_hash,
         require_unique_video_keys=require_unique_video_keys,
         minimum_pairs_per_game_label_delta=minimum_pairs_per_game_label_delta,
+        identity_mode=identity_mode,
     )
     return audit
 
@@ -587,6 +593,7 @@ def write_index_bundle(
     val_root: str | Path | None = None,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
     compute_content_hash: bool = True,
+    identity_mode: str = "game_video",
 ) -> dict:
     output_dir = Path(output_dir)
     frames_by_split: dict[str, list[FrameRecord]] = {}
@@ -625,6 +632,7 @@ def write_index_bundle(
         findings_by_split,
         image_spec,
         duplicate_policy,
+        identity_mode=identity_mode,
     )
     audit["policies"]["scan_policy"] = scan_policy.to_dict()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -646,6 +654,7 @@ def write_split_bundle(
     split_config: dict,
     filename_pattern: str = DEFAULT_FILENAME_PATTERN,
     compute_content_hash: bool = True,
+    identity_mode: str = "game_video",
 ) -> dict:
     """Scan train_all once, auto-split it into train/val by source video,
     combine with the independently scanned test set, and write the full
@@ -659,6 +668,20 @@ def write_split_bundle(
         raise ValueError("data.split.group_key must be 'source_video_uid'")
     if split_config.get("balance_by", "legal_pair_count") != "legal_pair_count":
         raise ValueError("data.split.balance_by must be 'legal_pair_count'")
+    if identity_mode not in ("game_video", "game_label_video"):
+        raise ValueError(
+            "identity_mode must be 'game_video' or 'game_label_video', "
+            f"got {identity_mode!r}"
+        )
+    # A caller may record the mode inside split_config (tools/build_index.py
+    # does); if it disagrees with the explicit kwarg, fail rather than
+    # silently split under the wrong leakage unit.
+    split_identity = split_config.get("source_identity_mode")
+    if split_identity is not None and split_identity != identity_mode:
+        raise ValueError(
+            "split_config['source_identity_mode'] and the identity_mode "
+            f"argument disagree: {split_identity!r} != {identity_mode!r}"
+        )
     output_dir = Path(output_dir)
     train_all = scan_split(
         train_all_root,
@@ -687,20 +710,37 @@ def write_split_bundle(
         manifest_path = output_dir / manifest_path
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    assignment, summary = resolve_split(
-        train_all.frames,
-        val_ratio=val_ratio,
-        seed=seed,
-        target_delta=target_delta,
-        manifest_path=manifest_path,
-        on_new_groups=on_new_groups,
-        small_stratum_policy=small_stratum_policy,
+    # step7 section 8: the source-identity structure is analysed before the
+    # split runs. On success the report rides along on the returned audit;
+    # on failure it is attached to the error so the operator sees the data
+    # structure instead of a bare traceback.
+    from .splitter import format_source_identity_precheck, source_identity_precheck
+
+    source_identity_report = source_identity_precheck(
+        train_all.frames, identity_mode=identity_mode
     )
+    try:
+        assignment, summary = resolve_split(
+            train_all.frames,
+            val_ratio=val_ratio,
+            seed=seed,
+            target_delta=target_delta,
+            manifest_path=manifest_path,
+            on_new_groups=on_new_groups,
+            small_stratum_policy=small_stratum_policy,
+            identity_mode=identity_mode,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}\n\n{format_source_identity_precheck(source_identity_report)}"
+        ) from exc
 
     train_frames: list[FrameRecord] = []
     val_frames: list[FrameRecord] = []
     for frame in train_all.frames:
-        uid = source_video_uid(frame.game, frame.video_id)
+        uid = source_video_uid(
+            frame.game, frame.video_id, frame.label, mode=identity_mode
+        )
         if assignment[uid] == "val":
             val_frames.append(
                 replace(
@@ -749,7 +789,10 @@ def write_split_bundle(
         findings_by_split,
         image_spec,
         duplicate_policy,
+        identity_mode=identity_mode,
     )
+    # The source identity precheck rides along on the returned audit dict.
+    audit["source_identity_precheck"] = source_identity_report
     audit["policies"]["scan_policy"] = scan_policy.to_dict()
     write_split_summary(summary, output_dir / "split_summary.json")
     audit["split"] = {**summary, "manifest": str(manifest_path)}

@@ -32,6 +32,9 @@ def _split_config(data_config: dict) -> dict:
         "manifest": split.get("manifest", "split_manifest.parquet"),
         "on_new_groups": split.get("on_new_groups", "error"),
         "small_stratum_policy": split.get("small_stratum_policy", "error"),
+        "source_identity_mode": (data_config.get("source_video_identity") or {}).get(
+            "mode", "game_video"
+        ),
     }
 
 
@@ -79,6 +82,7 @@ def main() -> None:
                 "--split-mode from_train derives the validation split from "
                 "--train-root; --val-root is forbidden in this mode."
             )
+        split_config = _split_config(data_config)
         audit = write_split_bundle(
             train_all_root=args.train_root,
             test_root=args.test_root,
@@ -86,7 +90,10 @@ def main() -> None:
             image_spec=image_spec,
             scan_policy=ScanPolicy.from_config(data_config),
             duplicate_policy=DuplicatePolicy.from_config(data_config),
-            split_config=_split_config(data_config),
+            split_config=split_config,
+            identity_mode=split_config.get(
+                "source_identity_mode", "game_video"
+            ),
             compute_content_hash=not args.skip_content_hash,
         )
     else:
@@ -98,6 +105,9 @@ def main() -> None:
             scan_policy=ScanPolicy.from_config(data_config),
             duplicate_policy=DuplicatePolicy.from_config(data_config),
             val_root=args.val_root,
+            identity_mode=(
+                data_config.get("source_video_identity") or {}
+            ).get("mode", "game_video"),
             compute_content_hash=not args.skip_content_hash,
         )
     print(json.dumps(audit, ensure_ascii=False, indent=2))

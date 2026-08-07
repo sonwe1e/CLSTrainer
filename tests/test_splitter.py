@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
+from collections import defaultdict
 from pathlib import Path
 
-from game_cls.data.records import FrameRecord
+from game_cls.data.records import DEFAULT_FILENAME_PATTERN, FrameRecord
 from game_cls.data.splitter import (
     SPLIT_ALGORITHM_VERSION,
+    _group_frames,
     compute_dataset_fingerprint,
     extend_split,
     fingerprint_covers_content,
@@ -49,6 +52,33 @@ def _frames(
     ]
 
 
+def _frames_at_ids(
+    game: str,
+    label: int,
+    video_id: str,
+    frame_ids: tuple[int, ...],
+    root: str = "/data",
+):
+    """Like ``_frames`` but with explicit frame ids (for pair-count tests)."""
+    return [
+        FrameRecord(
+            sample_id=f"train:{game}:{label}:{video_id}:{frame_id:05d}",
+            split="train",
+            game=game,
+            label=label,
+            video_id=video_id,
+            frame_id=frame_id,
+            path=f"{root}/{game}/{label}/{video_id}{frame_id:05d}.png",
+            width=448,
+            height=208,
+            channels=3,
+            file_size=1,
+            content_sha256=f"sha-{game}-{label}-{video_id}-{frame_id}",
+        )
+        for frame_id in frame_ids
+    ]
+
+
 def _dataset(
     *,
     videos_per_game_label: int = 4,
@@ -56,16 +86,23 @@ def _dataset(
     root: str = "/data",
     content_hash: bool = True,
 ):
-    """Three games x two labels x N videos, each a clean run of frames."""
+    """Three games x two labels x N videos, each a clean run of frames.
+
+    video_id is a production-compliant two-digit id drawn from a single
+    per-game counter spanning both labels (step7 §一): ids never collide
+    within a game and no source video spans labels under game_video
+    identity.
+    """
     frames: list[FrameRecord] = []
-    for game_index, game in enumerate(("game_a", "game_b", "game_c")):
+    for game in ("game_a", "game_b", "game_c"):
         for label in (0, 1):
             for video in range(videos_per_game_label):
+                video_id = f"{video + label * videos_per_game_label:02d}"
                 frames.extend(
                     _frames(
                         game,
                         label,
-                        f"{game_index:02d}{label}{video:02d}",
+                        video_id,
                         frames_per_video,
                         root=root,
                         content_hash=content_hash,
@@ -78,15 +115,16 @@ def _ragged_dataset(frame_counts: tuple[int, ...]):
     """Same layout as ``_dataset`` but with uneven per-video frame counts.
 
     Uniform runs give every delta the same pair ratio, which hides a
-    delta-specific reporting bug; uneven runs separate them.
+    delta-specific reporting bug; uneven runs separate them. video_id is a
+    per-game counter spanning both labels, exactly like ``_dataset``.
     """
     frames: list[FrameRecord] = []
-    for game_index, game in enumerate(("game_a", "game_b", "game_c")):
+    per_game_label = len(frame_counts)
+    for game in ("game_a", "game_b", "game_c"):
         for label in (0, 1):
             for video, count in enumerate(frame_counts):
-                frames.extend(
-                    _frames(game, label, f"{game_index:02d}{label}{video:02d}", count)
-                )
+                video_id = f"{video + label * per_game_label:02d}"
+                frames.extend(_frames(game, label, video_id, count))
     return frames
 
 
@@ -94,6 +132,27 @@ class SplitterCoreTests(unittest.TestCase):
     def test_source_video_uid_is_label_independent(self) -> None:
         self.assertEqual(source_video_uid("g", "01"), "g::01")
         self.assertNotEqual(source_video_uid("g", "01"), source_video_uid("h", "01"))
+
+    def test_source_video_uid_label_aware_mode(self) -> None:
+        self.assertEqual(
+            source_video_uid("g", "01", 0, mode="game_label_video"), "g::0::01"
+        )
+        self.assertNotEqual(
+            source_video_uid("g", "01", 0, mode="game_label_video"),
+            source_video_uid("g", "01", 1, mode="game_label_video"),
+        )
+        with self.assertRaises(ValueError):
+            source_video_uid("g", "01", 0, mode="game_label")
+
+    def test_dataset_filenames_match_the_production_contract(self) -> None:
+        # step7 §一: fixtures must use the real two-digit video_id filename
+        # contract, not synthetic 5-digit ids that could never collide in a
+        # (game, label) directory layout.
+        for frame in _dataset(videos_per_game_label=8, frames_per_video=20):
+            self.assertIsNotNone(
+                re.fullmatch(DEFAULT_FILENAME_PATTERN, Path(frame.path).name),
+                frame.path,
+            )
 
     def test_fingerprint_is_deterministic_and_sensitive(self) -> None:
         frames = _dataset()
@@ -355,15 +414,17 @@ class SplitManifestTests(unittest.TestCase):
                 manifest_path=manifest,
             )
             # Rewrite the manifest as if an older algorithm version produced
-            # it: reuse must refuse rather than trust a stale rule.
+            # it: reuse must refuse rather than trust a stale rule. The v3
+            # schema no longer carries the per-video balancing columns that
+            # v1 stored, so they are popped defensively.
             from game_cls.data.indexing import _pyarrow
 
             pa, pq = _pyarrow()
             rows = pq.read_table(manifest).to_pylist()
             for row in rows:
                 row["split_algorithm_version"] = SPLIT_ALGORITHM_VERSION - 1
-                row.pop("split_val_ratio")
-                row.pop("split_target_delta")
+                row.pop("split_val_ratio", None)
+                row.pop("split_target_delta", None)
             pq.write_table(pa.Table.from_pylist(rows), manifest)
             with self.assertRaises(ValueError) as caught:
                 resolve_split(
@@ -373,7 +434,10 @@ class SplitManifestTests(unittest.TestCase):
                     target_delta=2,
                     manifest_path=manifest,
                 )
-        self.assertIn("split_algorithm_version", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("split_algorithm_version", message)
+        # A stale manifest is never migrated silently (step7 §五).
+        self.assertIn("Delete/rebuild the manifest", message)
 
     def test_load_split_manifest_releases_file_handle(self) -> None:
         """load_split_manifest must not retain a pyarrow file handle.
@@ -422,7 +486,7 @@ class ExtendSplitTests(unittest.TestCase):
     def test_extend_keeps_every_existing_assignment(self) -> None:
         frames = _dataset()
         base = split_source_videos(frames, val_ratio=0.2, seed=9, target_delta=2)
-        grown = frames + _frames("game_a", 1, "0199", 12)
+        grown = frames + _frames("game_a", 1, "99", 12)
         assignment, stats = extend_split(
             grown,
             base,
@@ -432,7 +496,7 @@ class ExtendSplitTests(unittest.TestCase):
         )
         for uid, split in base.items():
             self.assertEqual(assignment[uid], split, f"{uid} moved")
-        new_uid = source_video_uid("game_a", "0199")
+        new_uid = source_video_uid("game_a", "99")
         self.assertIn(new_uid, assignment)
         self.assertEqual(stats["added_source_videos"], 1)
         self.assertEqual(stats["added_source_video_uids"], [new_uid])
@@ -456,7 +520,7 @@ class ExtendSplitTests(unittest.TestCase):
     def test_extend_is_deterministic(self) -> None:
         frames = _dataset()
         base = split_source_videos(frames, val_ratio=0.2, seed=9, target_delta=2)
-        grown = frames + _frames("game_b", 0, "0198", 12)
+        grown = frames + _frames("game_b", 0, "98", 12)
         first, _ = extend_split(grown, base, val_ratio=0.2, seed=9)
         second, _ = extend_split(grown, base, val_ratio=0.2, seed=9)
         self.assertEqual(first, second)
@@ -478,15 +542,22 @@ class ExtendSplitTests(unittest.TestCase):
         self.assertEqual(assignment[source_video_uid("brand_new_game", "01")], "train")
 
     def test_extend_keeps_the_ratio_near_target(self) -> None:
-        frames = _dataset(videos_per_game_label=10, frames_per_video=20)
+        videos_per_game_label = 10
+        frames = _dataset(
+            videos_per_game_label=videos_per_game_label, frames_per_video=20
+        )
         base = split_source_videos(frames, val_ratio=0.2, seed=9, target_delta=2)
         grown = list(frames)
-        for game_index, game in enumerate(("game_a", "game_b", "game_c")):
+        # New video ids continue the per-game counter from where the base
+        # set stopped (label 0 takes the next N ids, label 1 the N after
+        # that), so every added source video is single-label and distinct.
+        for game in ("game_a", "game_b", "game_c"):
             for label in (0, 1):
-                for video in range(10, 20):
-                    grown.extend(
-                        _frames(game, label, f"{game_index:02d}{label}{video:02d}", 20)
-                    )
+                for video in range(
+                    2 * videos_per_game_label, 3 * videos_per_game_label
+                ):
+                    video_id = f"{video + label * videos_per_game_label:02d}"
+                    grown.extend(_frames(game, label, video_id, 20))
         assignment, stats = extend_split(
             grown,
             base,
@@ -509,7 +580,7 @@ class ExtendSplitTests(unittest.TestCase):
 
     def test_resolve_extends_and_rewrites_the_manifest(self) -> None:
         frames = _dataset()
-        grown = frames + _frames("game_c", 0, "0197", 12)
+        grown = frames + _frames("game_c", 0, "97", 12)
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "split_manifest.parquet"
             base, _ = resolve_split(
@@ -554,6 +625,260 @@ class ExtendSplitTests(unittest.TestCase):
                 manifest_path=manifest,
             )
         self.assertFalse(summary["fingerprint_covers_content"])
+
+
+class MixedLabelSplitTests(unittest.TestCase):
+    """step7 regression: one source video may carry both labels.
+
+    Under the default ``game_video`` identity a uid is ``game::video_id``
+    even when its frames span label 0 and label 1 (case A in step7.md). The
+    whole uid is atomic — every frame and every delta pair of both labels
+    lands in a single split — and pairs never cross labels.
+    """
+
+    def test_mixed_label_uid_does_not_error(self) -> None:
+        # A single mixed-label video is one lone source in both label
+        # strata, so it needs warn to be placeable; the regression is that
+        # the grouping no longer rejects a uid spanning both labels.
+        frames = _frames("MC", 0, "01", 8) + _frames("MC", 1, "01", 8)
+        assignment = split_source_videos(
+            frames, val_ratio=0.2, seed=1, small_stratum_policy="warn"
+        )
+        self.assertIn(source_video_uid("MC", "01"), assignment)
+
+    def test_mixed_label_uid_all_frames_in_one_split(self) -> None:
+        frames = _frames("MC", 0, "01", 8) + _frames("MC", 1, "01", 8)
+        assignment = split_source_videos(
+            frames, val_ratio=0.2, seed=1, small_stratum_policy="warn"
+        )
+        splits = {
+            assignment[source_video_uid("MC", "01", label, mode="game_video")]
+            for label in (0, 1)
+        }
+        self.assertEqual(len(splits), 1)
+        self.assertIn(next(iter(splits)), ("train", "val"))
+
+    def test_no_cross_label_pair_counts(self) -> None:
+        # One source video with disjoint label-0 and label-1 frame runs:
+        # delta-2 pairs exist per label, never across labels.
+        frames = (
+            _frames_at_ids("g", 0, "42", (1, 2, 3))
+            + _frames_at_ids("g", 1, "42", (100, 101, 102))
+        )
+        group = _group_frames(frames)["g::42"]
+        self.assertEqual(group["pair_counts_by_label"][0][2], 1)
+        self.assertEqual(group["pair_counts_by_label"][1][2], 1)
+        self.assertEqual(group["pair_counts"][2], 2)
+
+    def test_train_val_keep_game_label_ratio(self) -> None:
+        frames = _dataset(videos_per_game_label=8, frames_per_video=12)
+        assignment = split_source_videos(
+            frames, val_ratio=0.2, seed=11, target_delta=2
+        )
+        strata: dict[tuple[str, int], set[str]] = defaultdict(set)
+        for frame in frames:
+            strata[(frame.game, frame.label)].add(
+                source_video_uid(frame.game, frame.video_id)
+            )
+        self.assertGreaterEqual(len(strata), 3)
+        for (game, label), uids in sorted(strata.items()):
+            if len(uids) < 2:
+                continue
+            splits = {assignment[uid] for uid in uids}
+            self.assertIn("train", splits, f"{game}/label={label} lost train")
+            self.assertIn("val", splits, f"{game}/label={label} lost val")
+
+    def test_same_seed_identical_assignment_mixed_label(self) -> None:
+        frames: list[FrameRecord] = []
+        for video in range(1, 7):
+            video_id = f"{video:02d}"
+            frames.extend(_frames("MC", 0, video_id, 8))
+            frames.extend(_frames("MC", 1, video_id, 8))
+        first = split_source_videos(frames, val_ratio=0.2, seed=42)
+        second = split_source_videos(frames, val_ratio=0.2, seed=42)
+        self.assertEqual(first, second)
+
+    def test_manifest_roundtrip_preserves_assignment_and_mode(self) -> None:
+        frames = (
+            _frames("MC", 0, "01", 8)
+            + _frames("MC", 1, "01", 8)
+            + _frames("MC", 0, "02", 8)
+            + _frames("MC", 1, "02", 8)
+        )
+        assignment = split_source_videos(frames, val_ratio=0.2, seed=5, target_delta=2)
+        fingerprint = compute_dataset_fingerprint(frames)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "split_manifest.parquet"
+            write_split_manifest(
+                frames,
+                assignment,
+                manifest,
+                dataset_fingerprint=fingerprint,
+                seed=5,
+                val_ratio=0.2,
+                target_delta=2,
+            )
+            loaded = load_split_manifest(manifest)
+        self.assertEqual(loaded["assignment"], assignment)
+        self.assertEqual(loaded["split_source_identity_mode"], "game_video")
+
+    def test_v2_manifest_rejected_by_v3(self) -> None:
+        frames = _dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "split_manifest.parquet"
+            resolve_split(
+                frames,
+                val_ratio=0.2,
+                seed=9,
+                target_delta=2,
+                manifest_path=manifest,
+            )
+            # Rewrite as a v2 manifest: stale algorithm version and no
+            # split_source_identity_mode column.
+            from game_cls.data.indexing import _pyarrow
+
+            pa, pq = _pyarrow()
+            rows = pq.read_table(manifest).to_pylist()
+            for row in rows:
+                row["split_algorithm_version"] = SPLIT_ALGORITHM_VERSION - 1
+                row.pop("split_source_identity_mode", None)
+            pq.write_table(pa.Table.from_pylist(rows), manifest)
+            with self.assertRaises(ValueError) as caught:
+                resolve_split(
+                    frames,
+                    val_ratio=0.2,
+                    seed=9,
+                    target_delta=2,
+                    manifest_path=manifest,
+                )
+        self.assertIn("Delete/rebuild the manifest", str(caught.exception))
+
+    def test_extend_with_new_mixed_label_video_keeps_old_assignment(self) -> None:
+        frames = _dataset()
+        base = split_source_videos(frames, val_ratio=0.2, seed=9, target_delta=2)
+        grown = (
+            frames + _frames("game_a", 0, "99", 8) + _frames("game_a", 1, "99", 8)
+        )
+        assignment, stats = extend_split(
+            grown, base, val_ratio=0.2, seed=9, target_delta=2
+        )
+        for uid, split in base.items():
+            self.assertEqual(assignment[uid], split, f"{uid} moved")
+        new_uid = source_video_uid("game_a", "99")
+        self.assertIn(new_uid, assignment)
+        # Atomic: both labels of the new source video share one split.
+        for label in (0, 1):
+            self.assertEqual(
+                assignment[
+                    source_video_uid("game_a", "99", label, mode="game_video")
+                ],
+                assignment[new_uid],
+            )
+        self.assertEqual(stats["added_source_videos"], 1)
+        self.assertEqual(stats["added_source_video_uids"], [new_uid])
+        self.assertEqual(stats["dropped_source_videos"], 0)
+
+    def test_mixed_label_presence_is_guaranteed(self) -> None:
+        # step7 regression: a mixed-label uid shared between two strata made
+        # the presence fix pull it into val for one stratum and eject it for
+        # the other, every pass, so the bounded loop exited mid-cycle with a
+        # whole (game,label) stratum in one split. Every stratum with >=2
+        # eligible videos must keep both a train and a val video.
+        frames = (
+            _frames_at_ids("g", 0, "01", (1,))
+            + _frames_at_ids("g", 0, "02", (1,))
+            + _frames_at_ids("g", 1, "02", (1, 2, 3))
+            + _frames_at_ids("g", 1, "03", (1,))
+        )
+        assignment = split_source_videos(
+            frames, val_ratio=0.2, seed=3, target_delta=2
+        )
+        strata: dict[tuple[str, int], list[str]] = defaultdict(list)
+        for frame in frames:
+            strata[(frame.game, frame.label)].append(
+                source_video_uid(frame.game, frame.video_id)
+            )
+        for (game, label), uids in sorted(strata.items()):
+            self.assertEqual(
+                len({assignment[uid] for uid in uids}),
+                2,
+                f"stratum ({game},{label}) lost train or val presence",
+            )
+
+    def test_mixed_label_presence_holds_under_fuzz(self) -> None:
+        # Randomized invariant: no (game,label) stratum with at least two
+        # eligible source videos may end up entirely in one split, and no
+        # source video may straddle splits. This is the property that the
+        # old presence fix violated on mixed-label data.
+        import random
+
+        rng = random.Random(20260728)
+        for _ in range(150):
+            frames: list[FrameRecord] = []
+            for gi in range(rng.randint(1, 3)):
+                game = f"g{gi}"
+                for video_id in ("00", "01", "02"):
+                    if rng.random() < 0.6:
+                        frames.extend(
+                            _frames_at_ids(
+                                game, 0, video_id, tuple(range(rng.randint(1, 12)))
+                            )
+                        )
+                    if rng.random() < 0.6:
+                        frames.extend(
+                            _frames_at_ids(
+                                game, 1, video_id, tuple(range(rng.randint(1, 12)))
+                            )
+                        )
+            if not frames:
+                continue
+            assignment = split_source_videos(
+                frames,
+                val_ratio=rng.choice((0.1, 0.2, 0.3)),
+                seed=rng.randint(1, 9999),
+                target_delta=rng.choice((1, 2, 3)),
+                small_stratum_policy="warn",
+            )
+            groups = _group_frames(frames)
+            strata: dict[tuple[str, int], list[str]] = defaultdict(list)
+            for uid, group in groups.items():
+                for label in group["labels"]:
+                    strata[(group["game"], label)].append(uid)
+            # Replicate small_stratum_policy="warn": a uid in any <2-uid
+            # stratum is forced into train and is not eligible for presence.
+            forced: set[str] = set()
+            for uids in strata.values():
+                if len(uids) < 2:
+                    forced.update(uids)
+            for (game, label), uids in strata.items():
+                eligible = [uid for uid in uids if uid not in forced]
+                if len(eligible) < 2:
+                    continue
+                self.assertEqual(
+                    len({assignment[uid] for uid in eligible}),
+                    2,
+                    f"stratum ({game},{label}) lost train or val presence",
+                )
+
+    def test_write_split_manifest_leaves_no_temp_file(self) -> None:
+        # The manifest is written via a sibling temp file + os.replace so an
+        # interrupted rewrite cannot corrupt the long-term contract file.
+        frames = _dataset()
+        assignment = split_source_videos(frames, val_ratio=0.2, seed=5, target_delta=2)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "split_manifest.parquet"
+            write_split_manifest(
+                frames,
+                assignment,
+                manifest,
+                dataset_fingerprint=compute_dataset_fingerprint(frames),
+                seed=5,
+                val_ratio=0.2,
+                target_delta=2,
+            )
+            loaded = load_split_manifest(manifest)
+            self.assertEqual(loaded["assignment"], assignment)
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

@@ -1,33 +1,45 @@
 """Deterministic source-video-level train/validation split (step4 §二).
 
-The split unit is the *source video* (``game::video_id``), never an
-individual frame: adjacent frames and every delta pair of one source
-video must live in a single split, otherwise the near-duplicate frames
-leak across train/val. The splitter is fully deterministic: the same
-frames + seed + algorithm version produce byte-identical manifests, and a
-persistent manifest is the long-term contract so new data never silently
-reshuffles the existing validation set.
+The split unit is the *source video*, never an individual frame: adjacent
+frames and every delta pair of one source video must live in a single
+split, otherwise the near-duplicate frames leak across train/val. The
+splitter is fully deterministic: the same frames + seed + algorithm
+version produce byte-identical manifests, and a persistent manifest is the
+long-term contract so new data never silently reshuffles the existing
+validation set.
 
-Constraints honored from the project's hard rules:
+Source identity is pluggable through ``identity_mode``:
 
-* ``source_video_uid`` is label-independent and used exactly as in
-  ``indexing.source_video_uid`` — the existing strict audit treats any
-  overlap across splits as fatal.
-* No per-video metadata sidecar exists; balancing uses only fields that
-  are already in the frame/video index (``game``, ``label``, frame ids).
+* ``"game_video"`` (default) — ``source_video_uid`` is label-independent
+  and used exactly as in ``indexing.source_video_uid``; a video carrying
+  frames under both labels stays a single uid, so the strict audit treats
+  any overlap across splits as fatal.
+* ``"game_label_video"`` — the label is embedded in the uid, so each label
+  of a video becomes an independent identity.
+
+Under both modes per-label pair counts stay isolated: a ``target_delta``
+pair is counted only within one label's frame ids, never across labels. No
+per-video metadata sidecar exists; balancing uses only fields that are
+already in the frame/video index (``game``, ``label``, frame ids).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
 # Bump whenever the assignment rule, the fingerprint definition or the
 # manifest schema changes so stale manifests are rejected instead of reused
 # under a contract they were not written for.
-SPLIT_ALGORITHM_VERSION = 2
+SPLIT_ALGORITHM_VERSION = 3
+
+# Source identity contract: how a (game, video_id) (plus label) is reduced
+# to a single source_video_uid. Both modes keep pair counts per label.
+SOURCE_IDENTITY_MODES = ("game_video", "game_label_video")
+SOURCE_IDENTITY_MODE_DEFAULT = "game_video"
 
 # val_ratio round-trips through parquet float64; compare with a tolerance
 # rather than by identity so 0.2 never reads as "changed".
@@ -38,8 +50,31 @@ SPLIT_MANIFEST_FILENAME = "split_manifest.parquet"
 SPLIT_SUMMARY_FILENAME = "split_summary.json"
 
 
-def source_video_uid(game: str, video_id: str) -> str:
-    """Stable, label-independent identity of a source video."""
+def source_video_uid(
+    game: str,
+    video_id: str,
+    label=None,
+    *,
+    mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
+) -> str:
+    """Stable identity of a source video under ``mode``.
+
+    The default ``"game_video"`` identity is label-independent: a source
+    video keeps a single uid regardless of its labels, exactly the leakage
+    unit ``indexing.source_video_uid`` audits against. Under
+    ``"game_label_video"`` the label is embedded in the uid, so a video
+    that carries frames under both labels becomes two independent
+    identities and ``label`` is required.
+    """
+    if mode not in SOURCE_IDENTITY_MODES:
+        raise ValueError(
+            f"unknown source identity mode {mode!r}; expected one of "
+            f"{SOURCE_IDENTITY_MODES}"
+        )
+    if mode == "game_label_video":
+        if label is None:
+            raise ValueError("source_video_uid mode=game_label_video requires label")
+        return f"{game}::{int(label)}::{video_id}"
     return f"{game}::{video_id}"
 
 
@@ -98,43 +133,60 @@ def fingerprint_covers_content(frames) -> bool:
     return all(frame.content_sha256 for frame in frames)
 
 
-def _group_frames(frames) -> dict[str, dict]:
-    """Group frames by source_video_uid and precompute per-video stats.
+def _group_frames(
+    frames,
+    *,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
+) -> dict[str, dict]:
+    """Group frames by source_video_uid and precompute per-label stats.
 
-    Raises when one source video carries frames under more than one
-    ``(game, label)`` — such a uid cannot be placed without contradicting
-    the stratum balance, and silently assigning it would violate the
-    label-independent leakage contract.
+    Under ``"game_label_video"`` the uid embeds the label, so every group
+    has exactly one label. Under the default ``"game_video"`` a source
+    video that carries frames under both label 0 and label 1 lands in a
+    single group whose ``labels`` holds both: per-label frame ids and pair
+    counts stay isolated so pair counts never leak across labels.
     """
     grouped: dict[str, dict] = {}
     for frame in frames:
-        uid = source_video_uid(frame.game, frame.video_id)
+        uid = source_video_uid(
+            frame.game,
+            frame.video_id,
+            label=frame.label,
+            mode=identity_mode,
+        )
         group = grouped.setdefault(
             uid,
             {
                 "game": frame.game,
-                "label": frame.label,
-                "frame_ids": set(),
-                "paths": set(),
+                "labels": set(),
+                "frame_ids_by_label": defaultdict(set),
             },
         )
-        if (group["game"], group["label"]) != (
-            frame.game,
-            frame.label,
-        ):
-            raise ValueError(
-                f"source video {uid!r} spans multiple (game, label) "
-                "combinations; split by source video is undefined"
-            )
-        group["frame_ids"].add(int(frame.frame_id))
-        group["paths"].add(frame.path)
+        label = int(frame.label)
+        group["labels"].add(label)
+        group["frame_ids_by_label"][label].add(int(frame.frame_id))
     for group in grouped.values():
-        ids = group["frame_ids"]
-        group["frame_count"] = len(ids)
+        group["labels"] = tuple(sorted(group["labels"]))
+        frame_ids_by_label = dict(group["frame_ids_by_label"])
+        group["frame_ids_by_label"] = frame_ids_by_label
+        pair_counts_by_label = {
+            label: {
+                delta: sum(frame_id + delta in ids for frame_id in ids)
+                for delta in (1, 2, 3)
+            }
+            for label, ids in frame_ids_by_label.items()
+        }
+        group["pair_counts_by_label"] = pair_counts_by_label
+        # Source-level pairs: the sum over labels, never computed across
+        # labels (a delta pair with one frame in label 0 and the other in
+        # label 1 is not a valid pair).
         group["pair_counts"] = {
-            delta: sum(frame_id + delta in ids for frame_id in ids)
+            delta: sum(pair_counts_by_label[label][delta] for label in group["labels"])
             for delta in (1, 2, 3)
         }
+        group["frame_count"] = sum(len(ids) for ids in frame_ids_by_label.values())
+        group["frame_count_label0"] = len(frame_ids_by_label.get(0, ()))
+        group["frame_count_label1"] = len(frame_ids_by_label.get(1, ()))
     return grouped
 
 
@@ -143,6 +195,7 @@ def _validate_split_params(
     val_ratio: float,
     target_delta: int,
     small_stratum_policy: str,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> None:
     """Shared argument contract of the fresh-split and extend paths."""
     if not 0.0 < val_ratio < 1.0:
@@ -154,37 +207,225 @@ def _validate_split_params(
             f"small_stratum_policy must be 'error' or 'warn', got "
             f"{small_stratum_policy!r}"
         )
+    if identity_mode not in SOURCE_IDENTITY_MODES:
+        raise ValueError(
+            f"identity_mode must be one of {SOURCE_IDENTITY_MODES}, got "
+            f"{identity_mode!r}"
+        )
 
 
-def _greedy_val_members(
-    candidates: list[str],
-    groups: dict[str, dict],
-    *,
-    target_delta: int,
-    target_pairs: float,
-    start_pairs: int,
-    reserve_last_for_train: bool,
-) -> list[str]:
-    """Greedily pick candidates for ``val`` toward ``target_pairs``.
+def _build_strata(groups, target_delta) -> dict[tuple[str, int], dict]:
+    """Per-``(game, label)`` strata: member uids and total target pairs.
 
-    ``candidates`` must already be in stable rank order. ``start_pairs`` is
-    the val pair count already committed for this stratum (nonzero only when
-    extending an existing manifest), so the greedy walk continues from where
-    the previous split left off instead of restarting at zero.
+    A multi-label uid contributes to one stratum per label. ``total_pairs``
+    is the sum of that label's ``target_delta`` pair counts, so a stratum's
+    cost target never mixes labels.
     """
-    val_pairs = start_pairs
-    members: list[str] = []
-    for index, uid in enumerate(candidates):
-        pair_count = groups[uid]["pair_counts"][target_delta]
-        after = val_pairs + pair_count
-        closer = abs(after - target_pairs) < abs(val_pairs - target_pairs)
-        # Never take the last group into val: leaves at least one source
-        # video for train when the stratum has >= 2 groups.
-        can_leave_train = not reserve_last_for_train or index < len(candidates) - 1
-        if closer and can_leave_train:
-            val_pairs = after
-            members.append(uid)
-    return members
+    strata: dict[tuple[str, int], dict] = {}
+    for uid, group in groups.items():
+        for label in group["labels"]:
+            stratum = (group["game"], label)
+            entry = strata.setdefault(stratum, {"uids": [], "total_pairs": 0})
+            entry["uids"].append(uid)
+            entry["total_pairs"] += group["pair_counts_by_label"][label][target_delta]
+    for entry in strata.values():
+        entry["uids"].sort()
+    return strata
+
+
+def _contribution(uid, groups, target_delta) -> dict[tuple[str, int], int]:
+    """Val-pair contribution of ``uid``: per stratum its label pair count."""
+    group = groups[uid]
+    return {
+        (group["game"], label): group["pair_counts_by_label"][label][target_delta]
+        for label in group["labels"]
+    }
+
+
+def _global_cost(val_pairs, strata, *, val_ratio) -> float:
+    """How far the current val-pair counts sit from ``val_ratio`` per stratum.
+
+    Each stratum contributes ``abs(held - val_ratio * total)`` scaled by
+    its total, so a stratum with more pairs weighs more but zero-pair
+    strata still resolve deterministically.
+    """
+    cost = 0.0
+    for stratum, entry in strata.items():
+        total = entry["total_pairs"]
+        cost += abs(val_pairs.get(stratum, 0) - val_ratio * total) / max(total, 1)
+    return cost
+
+
+def _add_pairs(val_pairs: dict, contribution: dict) -> dict:
+    """Return ``val_pairs`` with ``contribution`` merged in."""
+    merged = dict(val_pairs)
+    for stratum, count in contribution.items():
+        merged[stratum] = merged.get(stratum, 0) + count
+    return merged
+
+
+def _sub_pairs(val_pairs: dict, contribution: dict) -> dict:
+    """Return ``val_pairs`` with ``contribution`` subtracted."""
+    merged = dict(val_pairs)
+    for stratum, count in contribution.items():
+        merged[stratum] = merged.get(stratum, 0) - count
+    return merged
+
+
+def _enforce_stratum_presence(
+    strata: dict,
+    groups: dict,
+    seed: int,
+    target_delta: int,
+    val_members: set,
+    val_pairs: dict,
+    *,
+    forced_train: set,
+    val_ratio: float,
+    immutable: set,
+) -> tuple[set, dict]:
+    """Guarantee every eligible stratum keeps at least one train and one val.
+
+    A stratum with at least two eligible uids (eligible = not forced into
+    train) must not end up entirely in one split. Only non-immutable uids
+    move; deterministic picks use the stable ``(seed, uid)`` rank.
+
+    Mixed-label uids (present in several strata) make a naive local fix
+    oscillate: ejecting a shared uid to give one stratum train presence can
+    empty another stratum's val, whose local fix then pulls the same uid
+    back -- the bounded loop exits mid-cycle with a stratum still in one
+    split (step7 regression). Two guards prevent that:
+
+    * *Safe moves* -- a pull/eject that would strip the last train (resp.
+      last val) member from any *other* stratum is deferred in favour of a
+      candidate that does not.
+    * *A move ledger* -- a uid that has already moved is only used again
+      when no other candidate exists, so a repair cannot bounce one uid
+      between two strata pass after pass.
+
+    The loop is bounded at ``2 * len(strata) + len(groups) + 1`` passes
+    (each move consumes at least one fresh uid, so the ledger bounds the
+    total) and stops early when a full pass changes nothing. Returns
+    ``(val_members, val_pairs)``.
+    """
+    val_members = set(val_members)
+    val_pairs = dict(val_pairs)
+    moved: set[str] = set()
+
+    def other_strata(uid: str, skip: tuple[str, int]):
+        for stratum, entry in strata.items():
+            if stratum != skip and uid in entry["uids"]:
+                yield stratum, entry
+
+    def eject_safe(uid: str, skip: tuple[str, int]) -> bool:
+        # Removing uid from val must not leave another stratum val-less.
+        for _, entry in other_strata(uid, skip):
+            if not any(
+                other != uid and other in val_members
+                for other in entry["uids"]
+                if other not in forced_train
+            ):
+                return False
+        return True
+
+    def pull_safe(uid: str, skip: tuple[str, int]) -> bool:
+        # Adding uid to val must not strip another stratum of its last train.
+        for _, entry in other_strata(uid, skip):
+            if not any(
+                other != uid and other not in val_members
+                for other in entry["uids"]
+                if other not in forced_train
+            ):
+                return False
+        return True
+
+    for _ in range(2 * len(strata) + len(groups) + 1):
+        changed = False
+        for stratum in sorted(strata):
+            eligible = [
+                uid for uid in strata[stratum]["uids"] if uid not in forced_train
+            ]
+            if len(eligible) < 2:
+                continue
+            present = [uid for uid in eligible if uid in val_members]
+            if not present:
+                # Val presence: pull a train uid into val, preferring an
+                # unmoved uid whose pull does not starve another stratum.
+                candidates = [
+                    uid
+                    for uid in eligible
+                    if uid not in val_members and uid not in immutable
+                ]
+                candidates.sort(key=lambda uid: _stable_rank(seed, uid))
+                pick = _presence_pick(candidates, stratum, pull_safe, moved)
+                if pick is None:
+                    continue
+                val_members.add(pick)
+                val_pairs = _add_pairs(
+                    val_pairs, _contribution(pick, groups, target_delta)
+                )
+                moved.add(pick)
+                changed = True
+            elif len(present) == len(eligible):
+                # Train presence: all eligible uids are in val; eject the
+                # val uid whose removal minimizes the global cost (tie-break:
+                # min stable rank) without starving another stratum of val.
+                candidates = [
+                    uid
+                    for uid in eligible
+                    if uid in val_members and uid not in immutable
+                ]
+                candidates.sort(
+                    key=lambda uid: (
+                        _global_cost(
+                            _sub_pairs(
+                                val_pairs,
+                                _contribution(uid, groups, target_delta),
+                            ),
+                            strata,
+                            val_ratio=val_ratio,
+                        ),
+                        _stable_rank(seed, uid),
+                    )
+                )
+                pick = _presence_pick(candidates, stratum, eject_safe, moved)
+                if pick is None:
+                    continue
+                val_members.remove(pick)
+                val_pairs = _sub_pairs(
+                    val_pairs, _contribution(pick, groups, target_delta)
+                )
+                moved.add(pick)
+                changed = True
+        if not changed:
+            break
+    return val_members, val_pairs
+
+
+def _presence_pick(
+    candidates: list[str],
+    stratum: tuple[str, int],
+    safe,
+    moved: set[str],
+) -> str | None:
+    """Deterministic move candidate for :func:`_enforce_stratum_presence`.
+
+    Order of preference: an unmoved uid whose move is safe for other strata,
+    then a safe uid (even if already moved), then an unmoved uid, then the
+    first candidate. The moved ledger prevents a shared mixed-label uid from
+    being pulled and ejected across passes, which is what made the old loop
+    oscillate.
+    """
+    for uid in candidates:
+        if uid not in moved and safe(uid, stratum):
+            return uid
+    for uid in candidates:
+        if safe(uid, stratum):
+            return uid
+    for uid in candidates:
+        if uid not in moved:
+            return uid
+    return candidates[0] if candidates else None
 
 
 def split_source_videos(
@@ -194,15 +435,20 @@ def split_source_videos(
     seed: int,
     target_delta: int = 2,
     small_stratum_policy: str = "error",
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> dict[str, str]:
     """Assign each source video to ``train`` or ``val``.
 
-    Within every ``(game, label)`` stratum the groups are ordered by the
-    stable ``(seed, uid)`` hash, then greedily moved into ``val`` so the
-    stratum's ``target_delta`` pair ratio lands as close as possible to
-    ``val_ratio``. Groups are indivisible; ``small_stratum_policy="error"``
+    The unit of assignment is the source video under ``identity_mode``:
+    ``"game_video"`` (default) keeps a mixed-label video as one indivisible
+    uid, ``"game_label_video"`` treats each label of a video as a separate
+    uid. Uids are walked in stable ``(seed, uid)`` rank order and greedily
+    moved into ``val`` while that strictly lowers the global stratum cost
+    toward ``val_ratio`` at ``target_delta``; every ``(game, label)``
+    stratum with at least two eligible videos is then forced to hold at
+    least one train and one val video. ``small_stratum_policy="error"``
     rejects strata with fewer than two source videos (cannot split without
-    leakage) instead of silently breaking frames apart.
+    leakage); ``"warn"`` puts those lone videos in train.
 
     Returns ``{source_video_uid: "train" | "val"}``.
     """
@@ -210,51 +456,53 @@ def split_source_videos(
         val_ratio=val_ratio,
         target_delta=target_delta,
         small_stratum_policy=small_stratum_policy,
+        identity_mode=identity_mode,
     )
 
-    groups = _group_frames(frames)
-    strata: dict[tuple[str, int], list[str]] = defaultdict(list)
-    for uid, group in groups.items():
-        strata[(group["game"], group["label"])].append(uid)
+    groups = _group_frames(frames, identity_mode=identity_mode)
+    strata = _build_strata(groups, target_delta)
 
-    assignment: dict[str, str] = {}
-    for (game, label), uids in sorted(strata.items()):
-        if len(uids) < 2:
+    forced_train: set[str] = set()
+    for (game, label), entry in sorted(strata.items()):
+        if len(entry["uids"]) < 2:
             message = (
-                f"(game={game!r}, label={label}) has only {len(uids)} "
+                f"(game={game!r}, label={label}) has only {len(entry['uids'])} "
                 "source video(s); cannot split without frame-level "
                 "leakage. Collect more source videos or raise val_ratio."
             )
             if small_stratum_policy == "error":
                 raise ValueError(message)
-            # warn: place the lone video in train so validation is not
-            # contaminated and training keeps every source.
-            assignment[uids[0]] = "train"
+            forced_train.update(entry["uids"])
+
+    val_members: set[str] = set()
+    val_pairs: dict[tuple[str, int], int] = {}
+    for uid in sorted(groups, key=lambda u: _stable_rank(seed, u)):
+        if uid in forced_train:
             continue
-        ordered = sorted(uids, key=lambda uid: _stable_rank(seed, uid))
-        total_pairs = sum(groups[uid]["pair_counts"][target_delta] for uid in ordered)
-        if total_pairs <= 0:
-            # No legal target_delta pairs in this stratum: keep all in
-            # train (validation cannot rely on a delta with no support).
-            for uid in ordered:
-                assignment[uid] = "train"
+        contribution = _contribution(uid, groups, target_delta)
+        if all(count <= 0 for count in contribution.values()):
+            # No legal target_delta pairs anywhere: adding this video to val
+            # cannot move any stratum toward the target, so it stays train.
             continue
-        val_members = _greedy_val_members(
-            ordered,
-            groups,
-            target_delta=target_delta,
-            target_pairs=val_ratio * total_pairs,
-            start_pairs=0,
-            reserve_last_for_train=True,
-        )
-        # Guard: a huge first group can make every step "not closer" and
-        # leave val empty; force the first ordered group in so validation
-        # actually has data.
-        if not val_members and len(ordered) >= 2:
-            val_members.append(ordered[0])
-        for uid in ordered:
-            assignment[uid] = "val" if uid in set(val_members) else "train"
-    return assignment
+        after = _add_pairs(val_pairs, contribution)
+        if _global_cost(after, strata, val_ratio=val_ratio) < _global_cost(
+            val_pairs, strata, val_ratio=val_ratio
+        ):
+            val_members.add(uid)
+            val_pairs = after
+
+    val_members, val_pairs = _enforce_stratum_presence(
+        strata,
+        groups,
+        seed,
+        target_delta,
+        val_members,
+        val_pairs,
+        forced_train=forced_train,
+        val_ratio=val_ratio,
+        immutable=set(),
+    )
+    return {uid: "val" if uid in val_members else "train" for uid in groups}
 
 
 def extend_split(
@@ -265,15 +513,17 @@ def extend_split(
     seed: int,
     target_delta: int = 2,
     small_stratum_policy: str = "error",
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> tuple[dict[str, str], dict]:
     """Place only the source videos absent from ``existing``.
 
-    Every uid already in ``existing`` keeps its split, so the validation set
-    a model was selected against never reshuffles. New uids are ordered by
-    the same stable ``(seed, uid)`` rank and greedily added to ``val``, but
-    the greedy walk starts from the pair count the stratum *already* has in
-    val, so the stratum converges on ``val_ratio`` over the union rather
-    than over the new groups alone.
+    Every uid already in ``existing`` keeps its split, so the validation
+    set a model was selected against never reshuffles. Fresh uids are
+    ordered by the same stable ``(seed, uid)`` rank and greedily added to
+    ``val``, but the greedy walk starts from the pairs val *already* holds,
+    so each stratum converges on ``val_ratio`` over the union rather than
+    over the new groups alone. Only brand-new single-video strata trigger
+    ``small_stratum_policy``; existing strata are untouched.
 
     Uids in the manifest that no longer appear in ``frames`` are dropped:
     they cannot be indexed, and keeping them would inflate the summary
@@ -283,70 +533,76 @@ def extend_split(
         val_ratio=val_ratio,
         target_delta=target_delta,
         small_stratum_policy=small_stratum_policy,
+        identity_mode=identity_mode,
     )
 
-    groups = _group_frames(frames)
+    groups = _group_frames(frames, identity_mode=identity_mode)
     dropped = sorted(set(existing) - set(groups))
     assignment = {uid: existing[uid] for uid in groups if uid in existing}
+    immutable = set(existing)
 
-    strata: dict[tuple[str, int], list[str]] = defaultdict(list)
-    for uid, group in groups.items():
-        strata[(group["game"], group["label"])].append(uid)
+    strata = _build_strata(groups, target_delta)
+    fresh = [uid for uid in groups if uid not in existing]
 
-    added: list[str] = []
-    for (game, label), uids in sorted(strata.items()):
-        fresh = sorted(
-            (uid for uid in uids if uid not in assignment),
-            key=lambda uid: _stable_rank(seed, uid),
-        )
-        if not fresh:
-            continue
-        added.extend(fresh)
-        known = [uid for uid in uids if uid in assignment]
-        if not known and len(uids) < 2:
-            # A brand-new single-video stratum is the same unsplittable
-            # case the fresh path rejects.
+    forced_train: set[str] = set()
+    for (game, label), entry in sorted(strata.items()):
+        known = [uid for uid in entry["uids"] if uid in assignment]
+        if not known and len(entry["uids"]) < 2:
             message = (
-                f"(game={game!r}, label={label}) has only {len(uids)} "
+                f"(game={game!r}, label={label}) has only {len(entry['uids'])} "
                 "source video(s); cannot split without frame-level "
                 "leakage. Collect more source videos or raise val_ratio."
             )
             if small_stratum_policy == "error":
                 raise ValueError(message)
-            assignment[fresh[0]] = "train"
+            forced_train.update(entry["uids"])
+
+    # Seed the walk from the pairs val already holds in each stratum.
+    val_members: set[str] = set()
+    val_pairs: dict[tuple[str, int], int] = {}
+    for uid, target in assignment.items():
+        if target == "val":
+            val_members.add(uid)
+            val_pairs = _add_pairs(val_pairs, _contribution(uid, groups, target_delta))
+
+    for uid in sorted(fresh, key=lambda u: _stable_rank(seed, u)):
+        if uid in forced_train:
+            assignment[uid] = "train"
             continue
-        total_pairs = sum(groups[uid]["pair_counts"][target_delta] for uid in uids)
-        if total_pairs <= 0:
-            for uid in fresh:
-                assignment[uid] = "train"
+        contribution = _contribution(uid, groups, target_delta)
+        if all(count <= 0 for count in contribution.values()):
+            assignment[uid] = "train"
             continue
-        val_pairs_held = sum(
-            groups[uid]["pair_counts"][target_delta]
-            for uid in known
-            if assignment[uid] == "val"
-        )
-        # Only reserve a train slot when the stratum has no train member
-        # yet; otherwise an existing train video already covers the
-        # constraint and every new group may legitimately go to val.
-        reserve_last = not any(assignment[uid] == "train" for uid in known)
-        val_members = _greedy_val_members(
-            fresh,
-            groups,
-            target_delta=target_delta,
-            target_pairs=val_ratio * total_pairs,
-            start_pairs=val_pairs_held,
-            reserve_last_for_train=reserve_last,
-        )
-        if not known and not val_members and len(fresh) >= 2:
-            val_members.append(fresh[0])
-        chosen = set(val_members)
-        for uid in fresh:
-            assignment[uid] = "val" if uid in chosen else "train"
+        after = _add_pairs(val_pairs, contribution)
+        if _global_cost(after, strata, val_ratio=val_ratio) < _global_cost(
+            val_pairs, strata, val_ratio=val_ratio
+        ):
+            val_members.add(uid)
+            val_pairs = after
+            assignment[uid] = "val"
+        else:
+            assignment[uid] = "train"
+
+    val_members, val_pairs = _enforce_stratum_presence(
+        strata,
+        groups,
+        seed,
+        target_delta,
+        val_members,
+        val_pairs,
+        forced_train=forced_train,
+        val_ratio=val_ratio,
+        immutable=immutable,
+    )
+    # Known uids were fixed at the start; apply the final membership only
+    # to the fresh uids.
+    for uid in fresh:
+        assignment[uid] = "val" if uid in val_members else "train"
 
     stats = {
-        "added_source_videos": len(added),
+        "added_source_videos": len(fresh),
         "dropped_source_videos": len(dropped),
-        "added_source_video_uids": sorted(added),
+        "added_source_video_uids": sorted(fresh),
         "dropped_source_video_uids": dropped,
     }
     return assignment, stats
@@ -360,21 +616,32 @@ def _manifest_rows(
     seed: int,
     val_ratio: float,
     target_delta: int,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> list[dict]:
-    """Per-source-video rows for the split manifest parquet."""
-    groups = _group_frames(frames)
+    """Per-source-video rows for the split manifest parquet (v3 schema).
+
+    Per-label stats are recorded per label so a mixed-label video's
+    manifest row stays usable under either identity mode.
+    """
+    groups = _group_frames(frames, identity_mode=identity_mode)
     rows: list[dict] = []
     for uid, group in sorted(groups.items()):
+        label0_pairs = group["pair_counts_by_label"].get(0, {})
+        label1_pairs = group["pair_counts_by_label"].get(1, {})
         rows.append(
             {
                 "source_video_uid": uid,
                 "game": group["game"],
-                "label": group["label"],
+                "labels": list(group["labels"]),
+                "frame_count_label0": group["frame_count_label0"],
+                "frame_count_label1": group["frame_count_label1"],
+                "valid_pair_count_label0_delta1": label0_pairs.get(1, 0),
+                "valid_pair_count_label0_delta2": label0_pairs.get(2, 0),
+                "valid_pair_count_label0_delta3": label0_pairs.get(3, 0),
+                "valid_pair_count_label1_delta1": label1_pairs.get(1, 0),
+                "valid_pair_count_label1_delta2": label1_pairs.get(2, 0),
+                "valid_pair_count_label1_delta3": label1_pairs.get(3, 0),
                 "split": assignment[uid],
-                "frame_count": group["frame_count"],
-                "valid_pair_count_delta1": group["pair_counts"][1],
-                "valid_pair_count_delta2": group["pair_counts"][2],
-                "valid_pair_count_delta3": group["pair_counts"][3],
                 "dataset_fingerprint": dataset_fingerprint,
                 "split_seed": seed,
                 "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
@@ -382,6 +649,7 @@ def _manifest_rows(
                 # under the same balancing contract, not just the same data.
                 "split_val_ratio": float(val_ratio),
                 "split_target_delta": int(target_delta),
+                "split_source_identity_mode": identity_mode,
             }
         )
     return rows
@@ -396,6 +664,7 @@ def write_split_manifest(
     seed: int,
     val_ratio: float,
     target_delta: int,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> None:
     """Write the split manifest parquet (one row per source video)."""
     from .indexing import _pyarrow  # local import avoids a cycle
@@ -408,10 +677,22 @@ def write_split_manifest(
         seed=seed,
         val_ratio=val_ratio,
         target_delta=target_delta,
+        identity_mode=identity_mode,
     )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(rows), path)
+    # Write to a sibling temp file and atomically swap it in so an
+    # interrupted rewrite (crash/power loss) can never leave the manifest
+    # half-written. os.replace is atomic on the same filesystem; a live
+    # reference from load_split_manifest does not block it because
+    # pq.read_table opens with FILE_SHARE_DELETE on Windows.
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        pq.write_table(pa.Table.from_pylist(rows), tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def load_split_manifest(path: str | Path) -> dict:
@@ -419,7 +700,8 @@ def load_split_manifest(path: str | Path) -> dict:
 
     ``split_val_ratio``/``split_target_delta`` are absent from manifests
     written by algorithm version 1 and come back as ``None``; the version
-    check rejects those before the values are ever compared.
+    check rejects those before the values are ever compared. Manifests
+    older than the identity-mode record default to ``"game_video"``.
     """
     from .indexing import _pyarrow
 
@@ -442,6 +724,9 @@ def load_split_manifest(path: str | Path) -> dict:
             "split_algorithm_version": int(first["split_algorithm_version"]),
             "split_val_ratio": None if ratio is None else float(ratio),
             "split_target_delta": None if delta is None else int(delta),
+            "split_source_identity_mode": str(
+                first.get("split_source_identity_mode", "game_video")
+            ),
         }
     return {
         "assignment": {},
@@ -450,6 +735,7 @@ def load_split_manifest(path: str | Path) -> dict:
         "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
         "split_val_ratio": None,
         "split_target_delta": None,
+        "split_source_identity_mode": "game_video",
     }
 
 
@@ -460,8 +746,9 @@ def _manifest_mismatches(
     seed: int,
     val_ratio: float,
     target_delta: int,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> dict[str, str]:
-    """Which of the five reuse fields disagree with the manifest.
+    """Which of the six reuse fields disagree with the manifest.
 
     Keys are field names; values are printable ``manifest=... config=...``
     descriptions. An empty dict means the manifest may be reused verbatim.
@@ -485,6 +772,9 @@ def _manifest_mismatches(
     found_delta = existing.get("split_target_delta")
     if found_delta is None or int(found_delta) != int(target_delta):
         note("split_target_delta", found_delta, target_delta)
+    found_mode = existing.get("split_source_identity_mode", "game_video")
+    if found_mode != identity_mode:
+        note("split_source_identity_mode", found_mode, identity_mode)
     if existing["dataset_fingerprint"] != dataset_fingerprint:
         note(
             "dataset_fingerprint",
@@ -502,9 +792,10 @@ def split_summary(
     seed: int,
     val_ratio: float,
     target_delta: int,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> dict:
     """Per-split aggregate summary used by ``split_summary.json``."""
-    groups = _group_frames(frames)
+    groups = _group_frames(frames, identity_mode=identity_mode)
     splits: dict[str, dict] = {}
     for split in ("train", "val"):
         members = {uid for uid, target in assignment.items() if target == split}
@@ -512,9 +803,29 @@ def split_summary(
         splits[split] = {
             "source_video_count": len(members),
             "frame_count": sum(g["frame_count"] for g in split_groups),
+            "frame_count_label0": sum(g["frame_count_label0"] for g in split_groups),
+            "frame_count_label1": sum(g["frame_count_label1"] for g in split_groups),
             "pair_count_delta1": sum(g["pair_counts"][1] for g in split_groups),
             "pair_count_delta2": sum(g["pair_counts"][2] for g in split_groups),
             "pair_count_delta3": sum(g["pair_counts"][3] for g in split_groups),
+            "pair_count_label0_delta1": sum(
+                g["pair_counts_by_label"].get(0, {}).get(1, 0) for g in split_groups
+            ),
+            "pair_count_label0_delta2": sum(
+                g["pair_counts_by_label"].get(0, {}).get(2, 0) for g in split_groups
+            ),
+            "pair_count_label0_delta3": sum(
+                g["pair_counts_by_label"].get(0, {}).get(3, 0) for g in split_groups
+            ),
+            "pair_count_label1_delta1": sum(
+                g["pair_counts_by_label"].get(1, {}).get(1, 0) for g in split_groups
+            ),
+            "pair_count_label1_delta2": sum(
+                g["pair_counts_by_label"].get(1, {}).get(2, 0) for g in split_groups
+            ),
+            "pair_count_label1_delta3": sum(
+                g["pair_counts_by_label"].get(1, {}).get(3, 0) for g in split_groups
+            ),
         }
     # Report the ratio for the delta that actually drove the balancing, not
     # a hardcoded delta=2 that would silently misreport a delta=1/3 split.
@@ -531,6 +842,7 @@ def split_summary(
         "split_seed": seed,
         "target_val_ratio": val_ratio,
         "target_delta": target_delta,
+        "split_source_identity_mode": identity_mode,
         # Ratio on the balancing delta, under a delta-independent name.
         "val_ratio_achieved": achieved[f"val_ratio_achieved_delta{target_delta}"],
         **achieved,
@@ -546,6 +858,73 @@ def write_split_summary(summary: dict, path: str | Path) -> None:
     )
 
 
+def source_identity_precheck(
+    frames,
+    *,
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
+) -> dict:
+    """Analyze how source videos map to labels under ``identity_mode``.
+
+    Reports how many uids are single-label vs mixed-label, the per-label
+    delta pair support, and whether assignment stays atomic per source
+    video. Always ``supported: True``: the mixed-label case is handled by
+    keeping per-label pair counts isolated and never summing across labels.
+    """
+    groups = _group_frames(frames, identity_mode=identity_mode)
+    mixed = sorted(uid for uid, group in groups.items() if len(group["labels"]) > 1)
+    pair_counts_label0 = {delta: 0 for delta in (1, 2, 3)}
+    pair_counts_label1 = {delta: 0 for delta in (1, 2, 3)}
+    for group in groups.values():
+        for delta in (1, 2, 3):
+            pair_counts_label0[delta] += (
+                group["pair_counts_by_label"].get(0, {}).get(delta, 0)
+            )
+            pair_counts_label1[delta] += (
+                group["pair_counts_by_label"].get(1, {}).get(delta, 0)
+            )
+    return {
+        "identity_mode": identity_mode,
+        "source_video_count": len(groups),
+        "single_label_videos": len(groups) - len(mixed),
+        "mixed_label_videos": len(mixed),
+        "mixed_label_examples": [
+            {"source_video_uid": uid, "labels": list(groups[uid]["labels"])}
+            for uid in mixed
+        ],
+        "pair_counts_label0": pair_counts_label0,
+        "pair_counts_label1": pair_counts_label1,
+        "supported": True,
+        "atomic_split_enforced": True,
+    }
+
+
+def format_source_identity_precheck(report: dict) -> str:
+    """Render a :func:`source_identity_precheck` report as plain text."""
+    lines = ["Source identity analysis"]
+    lines.append(f"Source videos:           {report['source_video_count']}")
+    lines.append(f"Single-label videos:     {report['single_label_videos']}")
+    lines.append(f"Mixed-label videos:      {report['mixed_label_videos']}")
+    if report["mixed_label_examples"]:
+        lines.append("Mixed-label examples:")
+        for example in report["mixed_label_examples"]:
+            lines.append(
+                f"  {example['source_video_uid']}  labels={example['labels']}"
+            )
+    label0 = report["pair_counts_label0"]
+    label1 = report["pair_counts_label1"]
+    lines.append(
+        f"label0 pairs: delta1={label0[1]} delta2={label0[2]} delta3={label0[3]}"
+    )
+    lines.append(
+        f"label1 pairs: delta1={label1[1]} delta2={label1[2]} delta3={label1[3]}"
+    )
+    supported = "yes" if report["supported"] else "no"
+    enforced = "yes" if report["atomic_split_enforced"] else "no"
+    lines.append(f"Supported: {supported}")
+    lines.append(f"Atomic split enforced: {enforced}")
+    return "\n".join(lines)
+
+
 def resolve_split(
     frames,
     *,
@@ -555,12 +934,14 @@ def resolve_split(
     manifest_path: str | Path | None = None,
     on_new_groups: str = "error",
     small_stratum_policy: str = "error",
+    identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> tuple[dict[str, str], dict]:
     """High-level entry: reuse a matching manifest or compute a fresh split.
 
     * No manifest -> compute and (when ``manifest_path`` is given) persist.
-    * All five reuse fields matching (algorithm version, seed, ``val_ratio``,
-      ``target_delta``, dataset fingerprint) -> reuse the assignment verbatim.
+    * All six reuse fields matching (algorithm version, seed, ``val_ratio``,
+      ``target_delta``, source identity mode, dataset fingerprint) -> reuse
+      the assignment verbatim.
     * Any field *other than* the fingerprint differing -> always raise. The
       manifest was written under a different balancing contract, so neither
       reusing nor extending it would mean what the config asks for.
@@ -598,6 +979,7 @@ def resolve_split(
             seed=seed,
             val_ratio=val_ratio,
             target_delta=target_delta,
+            identity_mode=identity_mode,
         )
         summary["manifest_reused"] = reused
         summary["manifest_extended"] = extended
@@ -615,6 +997,7 @@ def resolve_split(
             seed=seed,
             val_ratio=val_ratio,
             target_delta=target_delta,
+            identity_mode=identity_mode,
         )
         if not mismatches:
             return finish(existing["assignment"], reused=True, extended=False)
@@ -629,9 +1012,10 @@ def resolve_split(
                 "split_manifest.parquet was written under different split "
                 "parameters, so it cannot be reused or extended: "
                 + "; ".join(parameter_mismatches)
-                + ". Restore the original parameters, or delete the manifest "
-                "to re-split from scratch (this changes the validation set, "
-                "so previously reported metrics are no longer comparable)."
+                + ". Restore the original parameters, or Delete/rebuild the "
+                "manifest to re-split from scratch (this changes the "
+                "validation set, so previously reported metrics are no "
+                "longer comparable)."
             )
 
         if on_new_groups == "error":
@@ -650,6 +1034,7 @@ def resolve_split(
             seed=seed,
             target_delta=target_delta,
             small_stratum_policy=small_stratum_policy,
+            identity_mode=identity_mode,
         )
         if manifest_path:
             # Persist the extended assignment under the new fingerprint so
@@ -663,6 +1048,7 @@ def resolve_split(
                 seed=seed,
                 val_ratio=val_ratio,
                 target_delta=target_delta,
+                identity_mode=identity_mode,
             )
         return finish(
             assignment,
@@ -677,6 +1063,7 @@ def resolve_split(
         seed=seed,
         target_delta=target_delta,
         small_stratum_policy=small_stratum_policy,
+        identity_mode=identity_mode,
     )
     if manifest_path:
         Path(manifest_path).parent.mkdir(parents=True, exist_ok=True)
@@ -688,6 +1075,7 @@ def resolve_split(
             seed=seed,
             val_ratio=val_ratio,
             target_delta=target_delta,
+            identity_mode=identity_mode,
         )
     # The manifest was just computed and written (or omitted entirely), so
     # nothing was reused even though the file now exists on disk.

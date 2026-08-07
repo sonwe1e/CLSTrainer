@@ -216,6 +216,13 @@ SCHEMA: dict[str, Any] = {
             "dict",
             "Source-video-level train/validation split configuration (step4 §二).",
         ),
+        "source_video_identity": _k(
+            "dict",
+            "Source video identity contract (step7): how a source video uid "
+            "is derived. game_video (default) treats video_id as unique per "
+            "game; game_label_video treats video_id as unique per "
+            "(game,label) and prints a leakage warning.",
+        ),
         "minimum_pairs_per_game_label_delta": _k(
             "dict",
             "Minimum legal pairs per (game,label) for each delta, e.g. {2: 1}.",
@@ -966,6 +973,15 @@ _SPLIT_KEYS: dict[str, Any] = {
 # Dotted paths whose Key is a dict but still validate nested leaves.
 _NESTED_KEY_SCHEMAS: dict[str, dict[str, Any]] = {
     "data.split": _SPLIT_KEYS,
+    "data.source_video_identity": {
+        "mode": _k(
+            "str",
+            "game_video: uid = game::video_id (default, conservative). "
+            "game_label_video: uid = game::label::video_id -- assumes "
+            "identical video_id under different labels are unrelated videos.",
+            choices=("game_video", "game_label_video"),
+        ),
+    },
 }
 
 
@@ -1340,6 +1356,10 @@ def _apply_defaults(config: dict[str, Any]) -> None:
     export_cfg.setdefault("verify_samples", 8)
     export_cfg.setdefault("include_threshold", True)
     data["split"] = {**default_split, **(data.get("split") or {})}
+    data["source_video_identity"] = {
+        **{"mode": "game_video"},
+        **(data.get("source_video_identity") or {}),
+    }
 
     evaluation = config.setdefault("evaluation", {})
     evaluation.setdefault("selection_mode", "metric")

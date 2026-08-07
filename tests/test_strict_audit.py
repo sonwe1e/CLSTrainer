@@ -57,7 +57,10 @@ def valid_audit() -> dict:
                 "severity": "info",
             },
         },
-        "leakage": {"video_keys_across_splits": []},
+        "leakage": {
+            "video_keys_across_splits": [],
+            "source_identity_mode": "game_video",
+        },
     }
 
 
@@ -136,6 +139,43 @@ class StrictAuditTests(unittest.TestCase):
             "val__test": [],
         }
         validate_audit(audit)
+
+    def test_source_identity_mode_mismatch_is_fatal(self) -> None:
+        """An audit built under one identity mode cannot gate another."""
+        audit = valid_audit()
+        audit["leakage"]["source_identity_mode"] = "game_video"
+        with self.assertRaisesRegex(RuntimeError, "identity mode does not match"):
+            validate_audit(audit, identity_mode="game_label_video")
+        audit["leakage"]["source_identity_mode"] = "game_label_video"
+        validate_audit(audit, identity_mode="game_label_video")
+
+    def test_game_label_video_uid_overlap_is_fatal(self) -> None:
+        """game::label::video_id uids must not span splits either."""
+        from game_cls.data.splitter import source_video_uid
+
+        train = frame(
+            split="train", label=0, path="/train/0100001.png", sha256="hash-a"
+        )
+        test = frame(
+            split="test", label=0, path="/test/0100001.png", sha256="hash-b"
+        )
+        train_uid = source_video_uid(
+            train.game, train.video_id, train.label, mode="game_label_video"
+        )
+        test_uid = source_video_uid(
+            test.game, test.video_id, test.label, mode="game_label_video"
+        )
+        self.assertEqual(train_uid, "game_A::0::01")
+        self.assertEqual(test_uid, "game_A::0::01")
+        audit = valid_audit()
+        audit["leakage"]["source_identity_mode"] = "game_label_video"
+        audit["leakage"]["source_video_uid_overlap"] = {
+            "train__test": [train_uid],
+            "train__val": [],
+            "val__test": [],
+        }
+        with self.assertRaisesRegex(RuntimeError, "source videos span"):
+            validate_audit(audit, identity_mode="game_label_video")
 
     def test_rejects_insufficient_game_label_delta_coverage(self) -> None:
         audit = valid_audit()

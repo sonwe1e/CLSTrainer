@@ -144,6 +144,9 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
                     "minimum_pairs_per_game_label_delta", {}
                 ).items()
             },
+            identity_mode=(data_cfg.get("source_video_identity") or {}).get(
+                "mode", "game_video"
+            ),
         )
         if rank == 0:
             for warning in audit_warning_messages(audit):

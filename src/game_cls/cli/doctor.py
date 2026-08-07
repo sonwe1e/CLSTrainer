@@ -117,6 +117,60 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             )
         else:
             check(True, "split roles", "train / validation / test")
+        identity_mode = (data_cfg.get("source_video_identity") or {}).get(
+            "mode", "game_video"
+        )
+        check(
+            identity_mode in ("game_video", "game_label_video"),
+            "data.source_video_identity.mode",
+            str(identity_mode),
+        )
+        if identity_mode == "game_label_video":
+            check(
+                None,
+                "source identity warning",
+                "identical video_id values under different labels are "
+                "assumed to be physically unrelated source videos; if "
+                "false, train/validation leakage may occur",
+            )
+        split_cfg = data_cfg.get("split") or {}
+        manifest_name = split_cfg.get("manifest")
+        if manifest_name is None:
+            check(
+                None,
+                "split manifest identity mode",
+                "data.split.manifest not configured",
+            )
+        else:
+            index_dir = (
+                Path(data_cfg["audit_path"]).parent
+                if data_cfg.get("audit_path")
+                else Path("indexes")
+            )
+            manifest_path = Path(manifest_name)
+            if not manifest_path.is_absolute():
+                manifest_path = index_dir / manifest_path
+            if not manifest_path.is_file():
+                check(
+                    None,
+                    "split manifest identity mode",
+                    f"no manifest to cross-check ({manifest_path}); run "
+                    "dataset prepare first",
+                )
+            else:
+                try:
+                    from game_cls.data.splitter import load_split_manifest
+
+                    stored = load_split_manifest(manifest_path).get(
+                        "split_source_identity_mode"
+                    )
+                    check(
+                        stored == identity_mode,
+                        "split manifest identity mode",
+                        f"manifest={stored} config={identity_mode}",
+                    )
+                except Exception as exc:  # noqa: BLE001 - doctor reports any load failure
+                    check(False, "split manifest identity mode", str(exc))
         audit_path = data_cfg.get("audit_path")
         audit_exists = bool(audit_path) and Path(audit_path).is_file()
         audit_ok: bool | None = None

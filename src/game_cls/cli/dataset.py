@@ -50,6 +50,18 @@ def _run_split_prepare(
 
     data_config = config["data"]
     split = dict(data_config.get("split") or {})
+    identity_mode = (data_config.get("source_video_identity") or {}).get(
+        "mode", "game_video"
+    )
+    if identity_mode == "game_label_video":
+        print(
+            "[WARNING] source_video_identity.mode=game_label_video\n"
+            "The framework assumes identical video_id values under different labels "
+            "are\n"
+            "physically unrelated source videos. If this assumption is false, "
+            "train/validation\n"
+            "leakage may occur."
+        )
     if output_dir is None:
         # Match tools/build_index.py's default index output dir; the split
         # manifest is then written at output_dir/manifest (e.g.
@@ -64,6 +76,7 @@ def _run_split_prepare(
         DuplicatePolicy.from_config(data_config),
         split_config=split,
         compute_content_hash=True,
+        identity_mode=identity_mode,
     )
 
 
@@ -174,6 +187,10 @@ def cmd_dataset_prepare(args: argparse.Namespace) -> int:
     summary = audit.get("split") or audit
     delta = summary.get("target_delta", split.get("target_delta", 2))
     achieved = summary.get("val_ratio_achieved")
+    if "source_identity_precheck" in audit:
+        from game_cls.data.splitter import format_source_identity_precheck
+
+        print(format_source_identity_precheck(audit["source_identity_precheck"]))
     print("=== dataset prepare finished ===")
     print(f"split mode        : {split.get('mode')}")
     print(f"val ratio target  : {split.get('val_ratio')}")
@@ -238,6 +255,9 @@ def cmd_dataset_audit(args: argparse.Namespace) -> int:
                     "minimum_pairs_per_game_label_delta", {}
                 ).items()
             },
+            identity_mode=(data_config.get("source_video_identity") or {}).get(
+                "mode", "game_video"
+            ),
         )
         print("Strict dataset audit passed.")
     return 0

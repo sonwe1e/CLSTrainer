@@ -22,7 +22,7 @@ NPU 验收的完整工具链：
 
 | 能力 | 说明 |
 | --- | --- |
-| **数据闭环** | 源视频级 train/val 划分、SHA-256 泄漏审计、packed uint8 分片、逐视频 `negative_subtype` 元数据、困难负样本挖掘与 mixing |
+| **数据闭环** | 源视频级 train/val 划分（`data.source_video_identity.mode` 显式建模源身份，混合标签源视频原子划分）、SHA-256 泄漏审计、packed uint8 分片、逐视频 `negative_subtype` 元数据、困难负样本挖掘与 mixing |
 | **训练** | FPR 受约束的 `constrained` 模型选择、分阶段解冻（`trainable_rules`）、早停 selection 合约、top-k checkpoint 注册表 |
 | **评估** | 全局/最差游戏/亚型三维 FPR-recall 矩阵、固定 challenge 集验收、Brier/ECE/负样本尾部分位数 |
 | **导出** | TorchScript 权重 + ONNX 导出、部署 manifest（含阈值/输入形状）、release gate 自动拦截未达标模型 |
@@ -157,6 +157,50 @@ cls-trainer dataset audit --config configs/recipes/game_cls_production.yaml
 | 🛠 逐视频元数据 | `dataset annotate` | `negative_subtype` / `sample_weight` 侧车 |
 | 🔎 困难负样本 | `benchmark scan-negatives` → `dataset annotate --from-mining` | 闭环挖掘 |
 
+##### 源身份预检与混合标签视频
+
+`dataset prepare` 会在划分流程中打印 **Source identity analysis** 预检报告，
+统计单标签 / 混合标签源视频数量，让数据结构的任何异常尽早暴露（若划分失败，
+报告会直接附在错误信息里）：
+
+```text
+Source identity analysis
+──────────────────────────────────
+Source videos:             184
+Single-label videos:       162
+Mixed-label videos:         22
+
+Mixed-label examples:
+  MC::01  labels=[0,1]
+  MC::05  labels=[0,1]
+```
+
+**混合标签源视频**（同一原始视频既包含 label 0 也包含 label 1 的帧）现在被显式
+支持：整个源视频是一个**原子单位**，整体进入 train 或整体进入 val，绝不跨 split
+拆开，也不会跨 label 构造 pair。
+
+源身份由可选配置 `data.source_video_identity.mode` 显式建模：
+
+| 模式 | 源身份 `source_video_uid` | 适用场景 |
+| --- | --- | --- |
+| `game_video`（默认） | `game::video_id` | 一个源视频同时含两个 label 的帧；整个视频是一个原子单位，防泄漏最保守 |
+| `game_label_video` | `game::label::video_id` | 0/01 与 1/01 是物理上无关的两个独立视频、只是各自从 01 编号 |
+
+```yaml
+data:
+  source_video_identity:
+    mode: game_video   # 或 game_label_video
+```
+
+**`game_label_video` 会打印显著的泄漏警告**——框架假设不同 label 下相同的
+`video_id` 是物理无关的源视频；**仅当同一个物理视频不会同时包含两个 label 的帧
+时才能使用**，否则同一真实视频会被拆进 train/val，造成严重数据泄漏。默认必须
+保持 `game_video`。
+
+本次划分 manifest 的 schema 升级到 **v3**：每行新增按 label 分列的有效 pair 计数、
+`labels` 列与 `split_source_identity_mode` 字段。旧的 v2 manifest 会被明确拒绝并
+提示 "Delete/rebuild the manifest"（删除后重建即可）。
+
 ### 5. 高级选项
 
 #### 模型选择与早停
@@ -287,7 +331,8 @@ bash scripts/smoke_npu_8p.sh
   再按 `(global_recall, worst_game_recall, -negative_score_p999)` 三元键排序；
   top-k 注册表与早停遵循完全相同的合约。
 
-- 🛡 **数据闭环** — 源视频级自动划分、SHA-256 泄漏审计、逐视频 `negative_subtype`
+- 🛡 **数据闭环** — 源视频级自动划分，`data.source_video_identity.mode` 显式建模
+  源身份并支持混合标签源视频原子划分、SHA-256 泄漏审计、逐视频 `negative_subtype`
   元数据与困难负样本 mixing、固定 challenge 集验收、packed uint8 高吞吐 loader。
 
 - 🏗 **分阶段解冻** — `trainable_rules` 支持正则匹配 + `unfreeze_at_step` +
