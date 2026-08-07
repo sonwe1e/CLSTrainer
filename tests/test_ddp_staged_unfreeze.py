@@ -173,7 +173,13 @@ def _rewrap_stress_worker(
             loss.backward()
             # Mirror the training loop's structured teardown with live grads.
             optimizer.zero_grad(set_to_none=True)
-            model = _rewrap_distributed(model, bare_model, device, rank)
+            distributed_barrier = torch.distributed.barrier
+            distributed_barrier()
+            _old = model
+            model = None
+            del _old
+            import gc; gc.collect()
+            model = _rewrap_distributed(bare_model, device, rank)
         # One final optimizer step so synced weights move identically.
         optimizer.zero_grad(set_to_none=True)
         logits = model(images[:, 0], images[:, 1])
@@ -235,9 +241,6 @@ def _end_to_end_worker(
     config["device"]["accelerator"] = "cpu"
     config["distributed"] = {"enabled": True, "backend": "gloo"}
     config["model"]["trainable_rules"] = RULES
-    # No warmup: the 8-step budget would otherwise trip the live
-    # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
-    config["scheduler"]["warmup_steps"] = 0
     config["train"].update(
         {
             "max_steps": max_steps,

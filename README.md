@@ -295,15 +295,15 @@ cls-trainer benchmark evaluate --run <RUN_ID> --checkpoint best_selection
 
 ```bash
 # 导出 TorchScript 权重（含 input shape / 阈值 manifest）：
-cls-trainer export weights --run <RUN_ID> --checkpoint best_selection \
-  --output exports/model.pt
+cls-trainer export --format weights --run <RUN_ID> --checkpoint best_selection \
+  --out exports/model.pt
 
 # 导出 ONNX：
-cls-trainer export onnx --run <RUN_ID> --checkpoint best_selection \
-  --output exports/model.onnx
+cls-trainer export --format onnx --run <RUN_ID> --checkpoint best_selection \
+  --out exports/model.onnx
 
 # Release gate：校验指标是否满足 gate_metrics 阈值，不满足则以非零退出码拦截：
-cls-trainer benchmark gate --run <RUN_ID> \
+cls-trainer benchmark gate-check --run <RUN_ID> \
   --config configs/recipes/game_cls_release.yaml
 ```
 
@@ -318,7 +318,7 @@ cls-trainer train --fork   <run 目录>     # 以某 run 的配置为新起点
 cls-trainer run list
 cls-trainer run show    <RUN_ID>
 cls-trainer run compare <RUN_ID_A> <RUN_ID_B>
-cls-trainer run export-tensorboard --run <RUN_ID>
+cls-trainer run export-tensorboard <RUN_ID>
 ```
 
 #### NPU 单卡 / 八卡
@@ -375,7 +375,7 @@ bash scripts/smoke_npu_8p.sh
   `lr_scale`，rule fingerprint 防止 resume 谱系污染。
 
 - 📦 **导出 & Release Gate** — TorchScript / ONNX 导出 + 部署 manifest，
-  `benchmark gate` 自动拦截未达业务指标的候选模型。
+  `benchmark gate-check` 自动拦截未达业务指标的候选模型。
 
 ---
 

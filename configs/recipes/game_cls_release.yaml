@@ -37,10 +37,11 @@ model:
   checkpoint_path: REPLACE_ME/path/to/base_model.pt
   # Staged partial unfreeze: the head trains from step 0, the last backbone
   # stage joins at 8000 steps with a 10x smaller learning rate. Stages open in
-  # `priority` order when two rules match the same parameter (lowest wins).
-  # unfreeze_at_step is deliberately well past early_stopping.burn_in_steps
-  # (6000), so the plateau detector never fires on a stage boundary (audit
-  # PR-F: the previous values were 4000 < 6000, the opposite relationship).
+  # `priority` order when two rules match the same parameter (highest wins).
+  # burn_in_steps is deliberately past unfreeze_at_step (8000) so the backbone
+  # trains for ~2000 steps before the plateau detector starts consuming
+  # patience. The previous values (burn_in=6000, unfreeze=8000) were reversed:
+  # early stopping fired BEFORE the backbone unfroze (audit P1-unfreeze).
   trainable_rules:
     cls_head:
       pattern: "cls"
@@ -136,7 +137,7 @@ checkpoint:
 early_stopping:
   enabled: true
   full_validation_only: true
-  burn_in_steps: 6000
+  burn_in_steps: 10000
   patience_evaluations: 3
   min_delta: 0.001
   restore_best: true

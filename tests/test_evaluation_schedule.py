@@ -32,8 +32,6 @@ class EvaluationScheduleTests(unittest.TestCase):
             config = load_config("configs/recipes/example_debug.yaml")
             config["experiment"]["output_dir"] = str(Path(directory) / "run")
             # No warmup: max_steps=2 would otherwise trip the live
-            # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
-            config["scheduler"]["warmup_steps"] = 0
             config["train"].update(
                 {
                     "max_steps": 2,

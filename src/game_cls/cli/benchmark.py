@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -337,7 +338,13 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         )
 
         checkpoint_sha256 = file_sha256(checkpoint_path)
-        resolved_config_sha256 = file_sha256(run_dir / "resolved_config.json")
+        # P0-3: hash the finalized in-memory config, not the on-disk file.
+        # When --config points to a different YAML than the training run,
+        # file_sha256(run_dir/"resolved_config.json") would silently record
+        # the wrong provenance.
+        resolved_config_sha256 = hashlib.sha256(
+            json.dumps(config, sort_keys=True, default=str).encode()
+        ).hexdigest()
         challenge_dataset_fingerprint = file_sha256(
             challenge_packed_video_index or challenge_video_index
         )

@@ -1485,6 +1485,46 @@ def split_role_warnings(config: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def schedule_budget_warnings(config: dict[str, Any]) -> list[str]:
+    """Warn when scheduler.warmup_steps exceeds the effective training budget.
+
+    The scheduler already handles this gracefully at runtime — a run whose
+    warmup steps exceed the total budget simply stays in the linear ramp for
+    its entire duration, which is well-defined and safe.  The warning exists
+    so users do not accidentally train a full production run at a tiny fraction
+    of the intended learning rate without knowing it.
+
+    The check targets the *effective* step budget (``train.max_steps`` when
+    set, otherwise ``train.epochs × train.steps_per_epoch``) rather than
+    ``max_steps`` alone, closing the blind spot where ``max_steps`` is null
+    (e.g. the production recipe) and the true budget comes from epoch math.
+    """
+    warnings_out: list[str] = []
+    scheduler_cfg = config.get("scheduler") or {}
+    train_cfg = config.get("train") or {}
+    warmup = scheduler_cfg.get("warmup_steps")
+    if not isinstance(warmup, (int, float)) or int(warmup) <= 0:
+        return warnings_out
+    max_steps = train_cfg.get("max_steps")
+    epochs = train_cfg.get("epochs")
+    steps_per_epoch = train_cfg.get("steps_per_epoch")
+    if isinstance(max_steps, (int, float)):
+        total_steps: int | None = int(max_steps)
+    elif isinstance(epochs, (int, float)) and isinstance(steps_per_epoch, (int, float)):
+        total_steps = int(epochs) * int(steps_per_epoch)
+    else:
+        return warnings_out
+    if total_steps is not None and int(warmup) > total_steps:
+        warnings_out.append(
+            f"scheduler.warmup_steps ({int(warmup)}) exceeds the effective "
+            f"training budget ({total_steps} steps); the scheduler will stay "
+            f"in the linear warmup ramp for the entire run. "
+            f"Set scheduler.warmup_steps ≤ {total_steps} to reach the "
+            f"cosine decay phase."
+        )
+    return warnings_out
+
+
 def resolve_source_identity_namespaces(
     source_video_identity: dict | None,
 ) -> dict[str, str]:
@@ -1813,19 +1853,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
             f"sampler.{key} must sum to ~1 (got {sum(values):.4f}).",
         )
 
-    # Cross-field: warmup must fit inside the total step budget. The public
-    # field is scheduler.warmup_steps; train has no such key, and the old read
-    # of train.warmup_steps was dead because _walk rejects the unknown key
-    # before semantic validation runs (audit P1-5).
-    scheduler_cfg = config.get("scheduler") or {}
-    warmup = scheduler_cfg.get("warmup_steps")
-    max_steps = train_cfg.get("max_steps")
-    if isinstance(warmup, (int, float)) and isinstance(max_steps, (int, float)):
-        require(
-            warmup <= max_steps,
-            f"scheduler.warmup_steps ({warmup}) must not exceed "
-            f"train.max_steps ({max_steps}).",
-        )
+    # Cross-field warmup check moved to schedule_budget_warnings() (non-fatal).
 
     # Auto split: from_train only makes sense with a usable val_ratio and a
     # supported target_delta. source_root is deliberately NOT required here:

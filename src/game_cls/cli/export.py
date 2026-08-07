@@ -81,12 +81,8 @@ def _metric_summary(run_dir: Path, config: dict) -> dict[str, Any]:
     an error.
     """
     summary_path = run_dir / "training_summary.json"
-    selection_metric = (config.get("evaluation") or {}).get(
-        "selection_metric", "global_f1_at_decision_threshold"
-    )
     summary: dict[str, Any] = {
         "source": str(summary_path),
-        "selection_metric": selection_metric,
     }
     if not summary_path.is_file():
         summary["available"] = False
@@ -96,6 +92,17 @@ def _metric_summary(run_dir: Path, config: dict) -> dict[str, Any]:
     except (json.JSONDecodeError, OSError):
         summary["available"] = False
         return summary
+    # P1 (export manifest): prefer the annotated selection_metric from the
+    # checkpoint's best-selection record so constrained-selection runs don't
+    # fall back to the config default "global_f1_at_decision_threshold".
+    _best_sel = payload.get("best_selection")
+    selection_metric = (
+        (_best_sel.get("selection_metric") if isinstance(_best_sel, dict) else None)
+        or (config.get("evaluation") or {}).get(
+            "selection_metric", "global_f1_at_decision_threshold"
+        )
+    )
+    summary["selection_metric"] = selection_metric
     best = payload.get("best_validation_metrics") or payload.get(
         "best_observed_dev_test_metrics"
     )
@@ -141,6 +148,7 @@ def _export_manifest(
     artifact: dict[str, Any],
 ) -> dict[str, Any]:
     """Build the manifest shared by the weights and ONNX paths."""
+    _ms = _metric_summary(run_dir, config)
     return {
         "run_id": run_dir.name,
         "checkpoint": alias,
@@ -151,7 +159,11 @@ def _export_manifest(
         "model_factory": config["model"].get("factory"),
         "shape": list(input_shape),
         **artifact,
-        "metric_summary": _metric_summary(run_dir, config),
+        "metric_summary": _ms,
+        # P1 (export manifest): surface selection semantics so deployment tools
+        # can read why this checkpoint was selected without re-running training.
+        "selection_mode": _ms.get("selection_mode"),
+        "selection_eligible": _ms.get("selection_eligible"),
     }
 
 

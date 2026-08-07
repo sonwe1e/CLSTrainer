@@ -21,9 +21,6 @@ class ResumeIdentityTests(unittest.TestCase):
 
         config = load_config("configs/recipes/example_debug.yaml")
         config["device"]["accelerator"] = "cpu"
-        # No warmup: max_steps=4 would otherwise trip the live
-        # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
-        config["scheduler"]["warmup_steps"] = 0
         config["train"].update(
             {
                 "max_steps": 4,
@@ -171,9 +168,6 @@ class ResumeIdentityTests(unittest.TestCase):
             root = Path(directory)
             base = load_config("configs/recipes/example_debug.yaml")
             base["device"]["accelerator"] = "cpu"
-            # No warmup: max_steps=4 would otherwise trip the live
-            # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
-            base["scheduler"]["warmup_steps"] = 0
             base["train"].update(
                 {
                     "max_steps": 4,

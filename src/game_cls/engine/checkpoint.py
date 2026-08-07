@@ -294,6 +294,7 @@ def restore_training_checkpoint(
     scheduler=None,
     scaler=None,
     expected_base_checkpoint: str | Path | None = None,
+    current_config: dict | None = None,
 ) -> dict:
     import torch
 
@@ -312,6 +313,21 @@ def restore_training_checkpoint(
             "produced by this project may be resumed; use --fork to start "
             "a new run from an untrusted file."
         )
+    # P0-7: validate config identity against the checkpoint's stored config so
+    # every resume entry path (--resume, train.resume_path=, --fork, or any
+    # programmatic caller) is covered.  The CLI --resume gate alone was
+    # insufficient because train.resume_path= bypasses it entirely.
+    if current_config is not None and isinstance(checkpoint.get("config"), dict):
+        from game_cls.cli.common import check_resume_drift
+
+        _critical, _ = check_resume_drift(checkpoint["config"], current_config)
+        if _critical:
+            raise RuntimeError(
+                "Resume refused: critical config drift detected between the "
+                "checkpoint's stored config and the current run config:\n"
+                + "\n".join(f"  - {c}" for c in _critical)
+                + "\nUse --fork to start a new run from this checkpoint."
+            )
     state_mode = checkpoint.get("model_state_mode", "full")
     if state_mode == "trainable_only":
         stored_hash = checkpoint.get("base_checkpoint_sha256")

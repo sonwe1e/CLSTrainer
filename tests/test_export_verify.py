@@ -23,9 +23,7 @@ class ExportVerifyTests(unittest.TestCase):
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["train"].update(
             {
-                # Must stay above scheduler.warmup_steps (10) now that the
-                # cross-field check is live (audit P1-5).
-                "max_steps": 16,
+                "max_steps": 2,
                 "steps_per_epoch": 16,
                 "local_batch_size": 4,
                 "log_every_steps": 8,

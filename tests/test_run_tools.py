@@ -38,9 +38,6 @@ def _base_overrides(root: str) -> list[str]:
     return [
         "device.accelerator=cpu",
         f"experiment.output_dir={root}",
-        # No warmup: max_steps=2 would otherwise trip the live
-        # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
-        "scheduler.warmup_steps=0",
         "train.max_steps=2",
         "train.steps_per_epoch=2",
         "train.log_every_steps=1",

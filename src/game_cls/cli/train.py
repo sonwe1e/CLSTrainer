@@ -62,6 +62,8 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
         warnings.append("model.factory is still the placeholder.")
     if checkpoint_path and checkpoint_status == "MISSING":
         warnings.append(f"model.checkpoint_path does not exist: {checkpoint_path}")
+    from game_cls.config_schema import schedule_budget_warnings
+    warnings.extend(schedule_budget_warnings(config))
     quick_every = int(
         evaluation_cfg.get(
             "val_quick_every_steps",

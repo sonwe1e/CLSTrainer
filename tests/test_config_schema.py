@@ -82,12 +82,10 @@ class OverrideStrictnessTests(unittest.TestCase):
             load_config("configs/recipes/example_debug.yaml", ["optimizer.name=SGD"])
 
     def test_valid_override_applies(self) -> None:
-        # max_steps must stay above scheduler.warmup_steps (10 in this recipe)
-        # now that the cross-field check is live (audit P1-5).
         config = load_config(
-            "configs/recipes/example_debug.yaml", ["train.max_steps=20"]
+            "configs/recipes/example_debug.yaml", ["train.max_steps=2"]
         )
-        self.assertEqual(config["train"]["max_steps"], 20)
+        self.assertEqual(config["train"]["max_steps"], 2)
 
     def test_schema_known_path_missing_from_file_is_created(self) -> None:
         # cuda_debug.yaml has no dataloader.train section, but the schema
@@ -131,12 +129,16 @@ class SemanticValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigSchemaError, "all zero"):
             self._load(**{"sampler.class_probability": "{0: 0.0, 1: 0.0}"})
 
-    def test_warmup_exceeding_budget_is_rejected(self) -> None:
-        # Audit P1-5: the public field is scheduler.warmup_steps. The old test
-        # set train.warmup_steps, which only passed because the unknown-key
-        # walk rejected it first -- the semantic cross-field check never ran.
-        with self.assertRaisesRegex(ConfigSchemaError, "scheduler.warmup_steps"):
-            self._load(**{"scheduler.warmup_steps": "200", "train.max_steps": "100"})
+    def test_warmup_exceeding_budget_emits_warning_not_error(self) -> None:
+        # P0-1 fix: warmup>budget is numerically safe (scheduler stays in ramp);
+        # it is now a warning via schedule_budget_warnings(), not a hard error.
+        from game_cls.config_schema import schedule_budget_warnings
+
+        config = self._load(**{"scheduler.warmup_steps": "200", "train.max_steps": "100"})
+        warnings = schedule_budget_warnings(config)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("200", warnings[0])
+        self.assertIn("100", warnings[0])
 
     def test_constrained_mode_rejects_dead_composite_keys(self) -> None:
         # Audit P1-4: under selection_mode=constrained the rank key is
@@ -384,12 +386,10 @@ class SourceTrackingTests(unittest.TestCase):
         self.assertIn("experiment.seed", sources)
 
     def test_overrides_are_recorded_as_sources(self) -> None:
-        # max_steps must stay above scheduler.warmup_steps (10) now that the
-        # cross-field check is live (audit P1-5).
         _, sources = load_config_with_sources(
-            "configs/recipes/example_debug.yaml", ["train.max_steps=12"]
+            "configs/recipes/example_debug.yaml", ["train.max_steps=2"]
         )
-        self.assertEqual(sources["train.max_steps"], "override:train.max_steps=12")
+        self.assertEqual(sources["train.max_steps"], "override:train.max_steps=2")
 
     def test_known_paths_cover_consumed_keys(self) -> None:
         paths = set(known_dotted_paths())

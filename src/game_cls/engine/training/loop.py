@@ -7,7 +7,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from game_cls.config_schema import finalize_config, split_role_warnings
+from game_cls.config_schema import (
+    finalize_config,
+    schedule_budget_warnings,
+    split_role_warnings,
+)
 from game_cls.data.image_spec import ImageSpec
 from game_cls.engine.checkpoint import (
     clone_checkpoint_pair,
@@ -148,21 +152,25 @@ def _wrap_distributed(bare_model, device, local_rank: int):
     )
 
 
-def _rewrap_distributed(model, bare_model, device, local_rank: int):
-    """Deterministically replace the live DDP wrapper over ``bare_model``.
+def _rewrap_distributed(bare_model, device, local_rank: int):
+    """Build and return a fresh DDP wrapper around ``bare_model``.
 
-    Audit P0-7: a second Reducer bound to the same parameters while the first
-    is still alive can abort inside the Reducer's native teardown on some
-    runtimes (observed as SIGABRT on Python 3.11 + torch 2.13). Plain
-    refcount-reassignment leaves that teardown to the interpreter's timing, so
-    this synchronizes every rank (none re-wraps while another is inside a
-    collective), drops the last wrapper reference, and forces a collection
-    before the new Reducer is built. Callers must already have released the
-    gradient bucket-view aliases (``optimizer.zero_grad(set_to_none=True)``).
+    The caller is responsible for releasing the last strong reference to the
+    old DDP wrapper and calling gc.collect() + distributed_barrier() BEFORE
+    calling this function, so that the old Reducer is provably dead before the
+    new one is constructed.  Pattern::
+
+        distributed_barrier()
+        _old = model
+        model = None
+        del _old
+        gc.collect()
+        model = _rewrap_distributed(bare_model, device, local_rank)
+
+    The ``model`` parameter was removed from this signature (audit P0-8) to
+    prevent the Python reference-counting trap where ``del model`` inside the
+    function has no effect on the caller's binding.
     """
-    distributed_barrier()
-    del model
-    gc.collect()
     return _wrap_distributed(bare_model, device, local_rank)
 
 
@@ -421,6 +429,8 @@ def run_training(
         if rank == 0:
             for warning in split_role_warnings(config):
                 print(f"[WARNING] {warning}", flush=True)
+            for warning in schedule_budget_warnings(config):
+                print(f"[WARNING] {warning}", flush=True)
             print(
                 "Data pipeline:", json.dumps(loaders.data_summary, ensure_ascii=False)
             )
@@ -561,12 +571,15 @@ def run_training(
                 # trainable set; the restored set is generally larger, so DDP
                 # has to be rebuilt before the first backward pass. No forward
                 # has run yet, so there are no gradient bucket-view aliases to
-                # release here; _rewrap_distributed still tears the wrapper down
-                # deterministically (audit P0-7).
+                # release here.  Release the old wrapper reference in caller
+                # scope so gc.collect() can actually free it (audit P0-8).
                 if world_size > 1:
-                    model = _rewrap_distributed(
-                        model, bare_model, device, local_rank
-                    )
+                    distributed_barrier()
+                    _old_model = model
+                    model = None
+                    del _old_model
+                    gc.collect()
+                    model = _rewrap_distributed(bare_model, device, local_rank)
                 optimizer = torch.optim.AdamW(
                     build_rule_groups(
                         bare_model,
@@ -586,6 +599,7 @@ def run_training(
                 scheduler,
                 scaler,
                 expected_base_checkpoint=config["model"].get("checkpoint_path"),
+                current_config=config,
             )
             global_step = int(checkpoint.get("global_step", 0))
             sampler_state = checkpoint.get("sampler_state", {})
@@ -725,9 +739,12 @@ def run_training(
                             # Release the gradients that alias the old
                             # Reducer's bucket views before it is discarded.
                             optimizer.zero_grad(set_to_none=True)
-                            model = _rewrap_distributed(
-                                model, bare_model, device, local_rank
-                            )
+                            distributed_barrier()
+                            _old_model = model
+                            model = None
+                            del _old_model
+                            gc.collect()
+                            model = _rewrap_distributed(bare_model, device, local_rank)
                             _set_train_mode(model, config["model"])
                         old_optimizer = optimizer
                         optimizer = torch.optim.AdamW(
