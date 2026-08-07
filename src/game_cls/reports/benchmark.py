@@ -30,12 +30,32 @@ silently reads ``metric absent`` after a full benchmark run.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 MINING_MANIFEST_VERSION = 1
+
+
+def file_sha256(path: str | Path) -> str:
+    """SHA-256 of a file's bytes; empty string when the file is absent."""
+    path = Path(path)
+    if not path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def gate_spec_fingerprint(gate_metrics: dict[str, Any] | None) -> str:
+    """Canonical SHA-256 of the gate contract (sorted, stable JSON)."""
+    return hashlib.sha256(
+        json.dumps(gate_metrics or {}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 # ---------------------------------------------------------------------------
 # Gate contract (step6): explicit metric name + comparison operator.
@@ -353,7 +373,13 @@ def scan_negative_pool(
                 if int(labels[index]) != 0:
                     continue
                 meta = batch["meta"][index]
-                uid = f"{meta['game']}::{meta['video_id']}"
+                # Audit P0-5: consume the persisted canonical uid from the batch
+                # meta instead of re-deriving ``game::video_id``; the legacy
+                # fallback only covers frame-based PairSample metas that never
+                # carried one.
+                uid = meta.get("source_video_uid") or (
+                    f"{meta['game']}::{meta['video_id']}"
+                )
                 p_positive = float(probability[index].item())
                 if score_threshold is not None and p_positive < score_threshold:
                     continue
@@ -474,18 +500,30 @@ def write_benchmark_report(
     gates: list[tuple[str, bool, str]],
     grouped_metrics: dict | None,
     gate_metrics: dict[str, Any] | None = None,
+    checkpoint_sha256: str = "",
+    resolved_config_sha256: str = "",
+    challenge_dataset_fingerprint: str = "",
+    gate_spec_fingerprint: str = "",
 ) -> Path:
     """Write ``benchmarks/<run>_<alias>/report.json`` and return its path.
 
     ``gate_metrics`` is the raw configured gate dict; recording it makes the
-    report self-describing, so ``config validate --release`` can tell a gate
-    that really passed from a report measured under a different contract.
+    report self-describing, so a release check can tell a gate that really
+    passed from a report measured under a different contract. The identity
+    fields (audit P0-4) bind the PASS to the exact artifact it was earned on:
+    ``checkpoint_sha256`` is the released model's hash, and the config /
+    challenge-dataset / gate-spec fingerprints pin the other three legs of the
+    release identity tuple.
     """
     report_dir = output_dir / f"{run_id or 'run'}_{checkpoint_alias}"
     report_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
         "checkpoint": checkpoint_alias,
+        "checkpoint_sha256": checkpoint_sha256,
+        "resolved_config_sha256": resolved_config_sha256,
+        "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
+        "gate_spec_fingerprint": gate_spec_fingerprint,
         "scores": _scores_from_metrics(metrics, gate_metrics),
         "gate_metrics": gate_metrics or {},
         "gates": [

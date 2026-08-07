@@ -86,7 +86,9 @@ jobs:
           set -euo pipefail
           unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
           export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
-          checkpoint=$(ls -t runs/npu_preflight_1p/*/checkpoints/checkpoint_last.pth | head -1)
+          # --run-mode fixed writes checkpoints directly under output_dir, so
+          # there is no extra date/run subdirectory level.
+          checkpoint=$(ls -t runs/npu_preflight_1p/checkpoints/checkpoint_last.pth | head -1)
           echo "resuming from ${checkpoint}"
           python -u tools/train.py --run-mode fixed \
             --config configs/recipes/npu_synthetic_smoke.yaml \

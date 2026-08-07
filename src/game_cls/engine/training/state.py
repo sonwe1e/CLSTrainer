@@ -23,20 +23,31 @@ def _distributed_sum_int(value: int) -> int:
     return sum(int(item) for item in values)
 
 
+def _schedule_factor(config: dict, total_steps: int, base_lr: float, step: int) -> float:
+    """The LambdaLR multiplier at ``step``.
+
+    Shared by ``_build_scheduler`` and the staged-unfreeze boundary so the
+    rebuilt scheduler can be positioned continuously: the unfreeze path must
+    place every new parameter group at the LR the schedule would have produced
+    at ``global_step`` (audit P1-3).
+    """
+    warmup = int(config.get("warmup_steps", 0))
+    min_lr = float(config.get("min_learning_rate", 0.0))
+    min_ratio = min_lr / base_lr if base_lr else 0.0
+    if warmup > 0 and step < warmup:
+        return max(1e-8, (step + 1) / warmup)
+    progress = (step - warmup) / max(1, total_steps - warmup)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    return min_ratio + (1.0 - min_ratio) * cosine
+
+
 def _build_scheduler(optimizer, config: dict, total_steps: int):
     import torch
 
-    warmup = int(config.get("warmup_steps", 0))
-    min_lr = float(config.get("min_learning_rate", 0.0))
     base_lr = max(group["lr"] for group in optimizer.param_groups)
-    min_ratio = min_lr / base_lr if base_lr else 0.0
 
     def factor(step: int) -> float:
-        if warmup > 0 and step < warmup:
-            return max(1e-8, (step + 1) / warmup)
-        progress = (step - warmup) / max(1, total_steps - warmup)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-        return min_ratio + (1.0 - min_ratio) * cosine
+        return _schedule_factor(config, total_steps, base_lr, step)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 

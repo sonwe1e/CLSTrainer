@@ -358,6 +358,7 @@ def _source_uid_content_classification(
     frames_by_split: dict[str, list[FrameRecord]],
     source_uids_by_split: dict[str, set[str]],
     namespaces_by_split: dict[str, str],
+    identity_mode: str,
 ) -> dict:
     """Per-colliding-uid diagnostic: how much frame content is shared.
 
@@ -374,10 +375,15 @@ def _source_uid_content_classification(
     for split, frames in frames_by_split.items():
         namespace = namespaces_by_split.get(split)
         for frame in frames:
+            # Audit B2: the classification key must use the SAME identity mode
+            # as the strict overlap set (source_uids_by_split), or a
+            # ``game_label_video`` audit would group label-distinct videos into
+            # one ``game::video`` bucket and emit a misleading diagnostic.
             uid = source_video_uid(
                 frame.game,
                 frame.video_id,
                 frame.label,
+                mode=identity_mode,
                 namespace=namespace,
             )
             grouped.setdefault(split, {}).setdefault(uid, []).append(frame)
@@ -508,7 +514,10 @@ def make_audit(
             sorted(namespaces_by_split.items())
         )
     classification = _source_uid_content_classification(
-        frames_by_split, source_uids_by_split, namespaces_by_split
+        frames_by_split,
+        source_uids_by_split,
+        namespaces_by_split,
+        identity_mode,
     )
     if classification["pairs"]:
         leakage["source_uid_overlap_content_classification"] = classification

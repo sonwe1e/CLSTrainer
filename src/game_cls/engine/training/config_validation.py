@@ -97,10 +97,15 @@ def validate_training_config(config: dict) -> None:
         raise ValueError(
             "Composite model selection requires positive selection weights"
         )
-    if not data_cfg.get("synthetic", False):
+    smoke_mode = bool((config.get("experiment") or {}).get("smoke_mode", False))
+    if not data_cfg.get("synthetic", False) and not smoke_mode:
         # Production acceptance gate: with every full-validation source
         # disabled there is no model selection at all; such a run would
-        # silently train blind.
+        # silently train blind. Smoke tests (experiment.smoke_mode=true) probe
+        # forward/spawn/augmentation/eval paths with full validation disabled
+        # on purpose, so the production policy is explicitly lifted for them
+        # (audit PR-E: test-env policy and production safety policy must not
+        # fight each other).
         full_every = int(evaluation_cfg.get("val_full_every_steps", 0))
         quick_every = int(evaluation_cfg.get("val_quick_every_steps", 0))
         full_at_end = bool(evaluation_cfg.get("val_full_at_end", True))
@@ -134,18 +139,16 @@ def validate_training_config(config: dict) -> None:
         if data_cfg.get("backend", "png") == "packed_uint8":
             if int(data_cfg.get("packed_max_open_shards", 16)) <= 0:
                 raise ValueError("data.packed_max_open_shards must be positive")
-            for key in ("train_packed_index", "test_packed_index"):
+            # Audit P0-6 / PR-C: the DataLoader genuinely requires the val
+            # packed index (PackedUint8Backend is built for train/val/test
+            # alike), so config validate must demand it to the same standard as
+            # train/test -- otherwise validation passes and the loader blows up.
+            for key in ("train_packed_index", "val_packed_index", "test_packed_index"):
                 packed_index = data_cfg.get(key)
                 if not packed_index or not Path(packed_index).is_file():
                     raise FileNotFoundError(
                         f"Packed backend requires existing data.{key}: {packed_index}"
                     )
-            val_packed_index = data_cfg.get("val_packed_index")
-            if val_packed_index and not Path(val_packed_index).is_file():
-                raise FileNotFoundError(
-                    f"Packed backend requires existing data.val_packed_index: "
-                    f"{val_packed_index}"
-                )
             for split in ("train", "val", "test"):
                 packed_index = data_cfg.get(f"{split}_packed_index")
                 if not packed_index:

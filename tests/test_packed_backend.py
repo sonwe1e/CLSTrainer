@@ -108,12 +108,72 @@ class PackedBackendTests(unittest.TestCase):
             self.assertEqual(manifest["width"], 448)
             self.assertEqual(manifest["height"], 208)
             self.assertEqual(manifest["channels"], 3)
+            # Audit P0-6: the manifest binds the shards to their source.
+            self.assertIn("source_frame_index_sha256", manifest)
+            self.assertIn("shard_sha256", manifest)
             with self.assertRaisesRegex(ValueError, "does not match configured shape"):
                 PackedUint8Backend(
                     packed_index,
                     image_spec=ImageSpec(width=208, height=448, channels=3),
                 )
             backend.close()
+
+    def test_stale_source_index_is_refused(self) -> None:
+        # Audit P0-6 / acceptance #4: modify the frame index after packing and
+        # the old shards must be refused before a DataLoader is built.
+        from game_cls.data.image_spec import ImageSpec
+        from game_cls.data.packed_backend import (
+            pack_frame_index,
+            verify_packed_provenance,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = []
+            for index in range(4):
+                array = np.full((208, 448, 3), index * 40, dtype=np.uint8)
+                path = root / f"image_{index}.png"
+                Image.fromarray(array).save(path)
+                rows.append(
+                    {
+                        "path": str(path),
+                        "game": "g",
+                        "label": 0,
+                        "video_id": "01",
+                        "frame_id": index,
+                    }
+                )
+            frame_index = root / "frames.parquet"
+            pq.write_table(pa.Table.from_pylist(rows), frame_index)
+            image_spec = ImageSpec(width=448, height=208, channels=3)
+            pack_frame_index(frame_index, root / "packed", image_spec=image_spec)
+            manifest = root / "packed" / "packed_manifest.json"
+            # Unchanged source index verifies cleanly.
+            verify_packed_provenance(manifest, frame_index)
+            # A regenerated (different) source index -> stale -> refused.
+            pq.write_table(
+                pa.Table.from_pylist(
+                    [dict(row, frame_id=index + 100) for index, row in enumerate(rows)]
+                ),
+                frame_index,
+            )
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                verify_packed_provenance(manifest, frame_index)
+
+    def test_manifest_without_provenance_is_refused(self) -> None:
+        # A manifest that predates the provenance binding cannot prove the
+        # shards match the current index; demand a repack instead of silently
+        # reading possibly-stale pixels.
+        import json as _json
+
+        from game_cls.data.packed_backend import verify_packed_provenance
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "packed_manifest.json"
+            manifest.write_text(_json.dumps({"shards": []}), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "predates"):
+                verify_packed_provenance(manifest, root / "frames.parquet")
 
     def test_packed_dataset_spawn_worker_owns_its_memmap(self) -> None:
         from torch.utils.data import DataLoader

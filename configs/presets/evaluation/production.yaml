@@ -21,11 +21,11 @@ evaluation:
   quick_save_error_limit: 200
   html_max_errors_per_group: 200
   parquet_row_group_size: 4096
-  selection_metric: composite
-  selection_weights:
-    global_f1: 0.40
-    macro_game_f1: 0.40
-    worst_game_f1: 0.20
+  # Audit P1-4: under selection_mode: constrained the rank key is
+  # (global recall, worst-game recall, -negative p99.9) and the composite F1
+  # weights are dead config -- they could not influence the best checkpoint.
+  # The dead keys were removed; a config that re-adds them alongside
+  # constrained mode is rejected by semantic validation.
   minimum_worst_game_f1: null
   selection_mode: constrained
   max_global_fpr: 0.01

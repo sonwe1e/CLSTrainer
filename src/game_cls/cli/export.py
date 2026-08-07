@@ -155,32 +155,47 @@ def _export_manifest(
     }
 
 
-def _check_benchmark_gate(run_dir: Path) -> None:
-    """Warn when a persisted gate report exists and recorded a failure.
+def _check_benchmark_gate(run_dir: Path, checkpoint_path: str) -> None:
+    """Refuse to export a checkpoint that has no PASS bound to it (audit P0-4).
 
-    The gate is advisory at export time (it already fired at benchmark
-    evaluation time), so this never raises or returns a non-zero code.
-    If ``benchmark_gate.json`` is absent, the gate simply hasn't been run
-    yet — also fine.
+    ``benchmark_gate.json`` records the ``checkpoint_sha256`` of the artifact
+    it was earned on. A missing gate report, a recorded FAILURE, or a report
+    bound to a different checkpoint hash all mean "this artifact has no PASS"
+    and block the export -- a later run's checkpoint can never borrow a PASS.
+    Pass ``--skip-gate`` to explicitly export an unverified artifact.
     """
+    from game_cls.reports.benchmark import file_sha256
+
     gate_path = run_dir / "benchmark_gate.json"
     if not gate_path.is_file():
-        return
+        raise RuntimeError(
+            f"No benchmark gate report found at {gate_path}. Run "
+            "'cls-trainer benchmark evaluate' against this checkpoint before "
+            "exporting it (audit P0-4); pass --skip-gate to override."
+        )
     try:
         gate_data = json.loads(gate_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-    if not gate_data.get("passed", True):
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(f"Failed to read gate report {gate_path}: {exc}") from exc
+    checkpoint_sha = file_sha256(checkpoint_path)
+    recorded_sha = gate_data.get("checkpoint_sha256")
+    if recorded_sha and recorded_sha != checkpoint_sha:
+        raise RuntimeError(
+            f"The benchmark gate PASS at {gate_path} was earned by a different "
+            f"checkpoint (recorded sha256 {recorded_sha}; exporting sha256 "
+            f"{checkpoint_sha}). Re-run 'cls-trainer benchmark evaluate' "
+            "against this exact checkpoint before exporting it."
+        )
+    if not gate_data.get("passed", False):
         violations = gate_data.get("violations", [])
         detail = (
             "; ".join(v.get("metric", "?") for v in violations)
             if violations
             else "see " + str(gate_path)
         )
-        print(
-            f"WARNING: benchmark gate FAILED for run {run_dir.name} "
-            f"({detail}). Exporting anyway — gate is advisory at export time.",
-            file=sys.stderr,
+        raise RuntimeError(
+            f"benchmark gate FAILED for run {run_dir.name} ({detail}). Export "
+            "refused; the checkpoint did not pass acceptance."
         )
 
 
@@ -191,10 +206,6 @@ def cmd_export(args: argparse.Namespace) -> int:
     from game_cls.model.builder import build_model
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
-    # Advisory gate check: warn when benchmark_gate.json exists and recorded
-    # a failure, but never block the export — the gate already fired at
-    # benchmark evaluation time.
-    _check_benchmark_gate(run_dir)
     config_source = args.config or str(run_dir / "resolved_config.json")
     if not Path(config_source).is_file():
         print(
@@ -211,6 +222,15 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 2
 
     state_dict, checkpoint_path = _resolve_checkpoint_state(run_dir, args.checkpoint)
+    # Audit P0-4: the exported artifact must have a benchmark PASS bound to its
+    # exact checkpoint SHA, unless the caller explicitly opts out with
+    # --skip-gate.
+    if not getattr(args, "skip_gate", False):
+        try:
+            _check_benchmark_gate(run_dir, checkpoint_path)
+        except RuntimeError as exc:
+            print(f"Export refused: {exc}", file=sys.stderr)
+            return 2
     model = build_model(config["model"])
     unwrap_model(model).load_state_dict(state_dict, strict=True)
     model.eval()
@@ -221,6 +241,22 @@ def cmd_export(args: argparse.Namespace) -> int:
     # through finalize_config (which fills both keys).
     out_dir = Path(args.out or export_cfg.get("output_dir") or "exports")
     out_dir.mkdir(parents=True, exist_ok=True)
+    from game_cls.reports.benchmark import file_sha256
+
+    # Audit PR-F: immutable per-artifact layout
+    #   exports/<run_id>/<checkpoint_sha256>/model.{pt,onnx} + export_manifest.json
+    # A second export of the same artifact writes the same directory and is
+    # refused; a different checkpoint writes a different sha directory, so runs
+    # can never overwrite each other's deployment artifacts.
+    artifact_dir = out_dir / run_dir.name / file_sha256(checkpoint_path)
+    if artifact_dir.exists() and any(artifact_dir.iterdir()):
+        print(
+            f"Export refused: artifact already exists at {artifact_dir}; the "
+            "export layout is immutable (audit PR-F). Delete it to re-export.",
+            file=sys.stderr,
+        )
+        return 2
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     export_format = args.format or export_cfg.get("format") or "weights"
     include_threshold = bool(export_cfg.get("include_threshold", True))
     manifest_extra = (
@@ -230,11 +266,11 @@ def cmd_export(args: argparse.Namespace) -> int:
     )
     input_shape = _input_shape(config)
     if export_format == "weights":
-        model_only = out_dir / f"model_{args.checkpoint}.pth"
+        model_only = artifact_dir / "model.pt"
         import torch
 
         torch.save(unwrap_model(model).state_dict(), model_only)
-        manifest_path = out_dir / "export_manifest.json"
+        manifest_path = artifact_dir / "export_manifest.json"
         manifest_path.write_text(
             json.dumps(
                 _export_manifest(
@@ -269,7 +305,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             model,
             config,
             export_cfg,
-            out_dir,
+            artifact_dir,
             args.checkpoint,
             checkpoint_path,
             manifest_extra,
@@ -304,7 +340,7 @@ def _export_onnx(
         )
         return 2
     sample = torch.randn(*input_shape)
-    onnx_path = out_dir / f"model_{alias}.onnx"
+    onnx_path = out_dir / "model.onnx"
     try:
         torch.onnx.export(
             model,

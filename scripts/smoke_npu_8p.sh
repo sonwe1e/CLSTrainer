@@ -5,6 +5,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   tools/train.py --run-mode fixed \
   --config configs/recipes/game_cls_production.yaml \
+  experiment.smoke_mode=true \
   train.max_steps=100 \
   train.steps_per_epoch=100 \
   train.local_batch_size=8 \

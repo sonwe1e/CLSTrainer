@@ -11,8 +11,10 @@
 #   cls-trainer doctor          --config configs/recipes/game_cls_release.yaml
 #   cls-trainer train           --config configs/recipes/game_cls_release.yaml
 #   cls-trainer benchmark evaluate --config configs/recipes/game_cls_release.yaml \
-#       --checkpoint runs/game_cls_release/<run>/model_best_selection.pth
-#   cls-trainer config validate --config configs/recipes/game_cls_release.yaml --release
+#       --run <run_id> \
+#       --checkpoint runs/game_cls_release/<run_id>/checkpoints/model_best_selection.pth
+#   cls-trainer release check   --run <run_id> --checkpoint best_selection
+#   cls-trainer export          --run <run_id> --checkpoint best_selection
 #
 # `config validate --release` before training tells you the gate contract is
 # well-formed; the same command after `benchmark evaluate` re-judges the newest
@@ -34,10 +36,11 @@ model:
   factory: REPLACE_ME_PACKAGE.module:build_model
   checkpoint_path: REPLACE_ME/path/to/base_model.pt
   # Staged partial unfreeze: the head trains from step 0, the last backbone
-  # stage joins at 4000 steps with a 10x smaller learning rate. Stages open in
+  # stage joins at 8000 steps with a 10x smaller learning rate. Stages open in
   # `priority` order when two rules match the same parameter (lowest wins).
-  # Keep unfreeze_at_step well past early_stopping.burn_in_steps so the plateau
-  # detector never fires on a stage boundary.
+  # unfreeze_at_step is deliberately well past early_stopping.burn_in_steps
+  # (6000), so the plateau detector never fires on a stage boundary (audit
+  # PR-F: the previous values were 4000 < 6000, the opposite relationship).
   trainable_rules:
     cls_head:
       pattern: "cls"
@@ -47,7 +50,7 @@ model:
     backbone_late:
       pattern: "layer4"
       lr_scale: 0.1
-      unfreeze_at_step: 4000
+      unfreeze_at_step: 8000
       priority: 1
 
 data:

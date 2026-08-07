@@ -63,6 +63,154 @@ def _frames(
     ]
 
 
+class CanonicalContentAnchoredIdentityTests(unittest.TestCase):
+    """Audit P0-5: the persisted canonical uid is content-anchored.
+
+    The source identity namespaces are audit-boundary-only, so coincidentally
+    equal train/test local numbering must never collapse at the metadata layer.
+    The canonical ``source_video_uid`` therefore carries a content signature
+    (frame count + ordered per-frame hashes) that distinguishes distinct pools
+    without touching the namespace dimension.
+    """
+
+    def _content_frames(self, game, label, video_id, hashes):
+        return [
+            FrameRecord(
+                sample_id=f"x:{game}:{label}:{video_id}:{i:05d}",
+                split="train",
+                game=game,
+                label=label,
+                video_id=video_id,
+                frame_id=i,
+                path=f"/d/{game}/{label}/{video_id}{i:05d}.png",
+                width=448,
+                height=208,
+                channels=3,
+                file_size=1,
+                content_sha256=content_hash,
+            )
+            for i, content_hash in enumerate(hashes, start=1)
+        ]
+
+    def test_content_anchored_uid_distinguishes_coincidental_numbering(self) -> None:
+        from game_cls.data.video_index import build_video_entries
+
+        train_pool = self._content_frames("MC", 0, "01", ("a", "b", "c"))
+        test_pool = self._content_frames("MC", 0, "01", ("d", "e", "f"))
+        train_video = build_video_entries(train_pool)[0]
+        test_video = build_video_entries(test_pool)[0]
+        # Same (game, label, video_id), different pixels -> distinct uids.
+        self.assertNotEqual(train_video.source_video_uid, test_video.source_video_uid)
+        # The name part stays namespace-free and the label is always present.
+        for video in (train_video, test_video):
+            self.assertTrue(video.source_video_uid.startswith("MC::0::01#"))
+        self.assertEqual(train_video.source_video_uid.count("#"), 1)
+
+    def test_content_id_is_deterministic(self) -> None:
+        from game_cls.data.video_index import build_video_entries
+
+        frames = self._content_frames("MC", 0, "01", ("a", "b", "c"))
+        first = build_video_entries(frames)[0].source_video_uid
+        second = build_video_entries(frames)[0].source_video_uid
+        self.assertEqual(first, second)
+        # Identical content in both pools is the SAME video: uid must collide
+        # so the strict audit's SHA-256 layer can catch a real leak.
+        same = build_video_entries(self._content_frames("MC", 0, "01", ("a", "b", "c")))
+        self.assertEqual(same[0].source_video_uid, first)
+
+    def test_sidecar_join_never_bleeds_across_pools(self) -> None:
+        from game_cls.data.sidecar import apply_sidecar
+        from game_cls.data.video_index import build_video_entries
+
+        train_pool = self._content_frames("MC", 0, "01", ("a", "b", "c"))
+        test_pool = self._content_frames("MC", 0, "01", ("d", "e", "f"))
+        train_video = build_video_entries(train_pool)[0]
+        test_video = build_video_entries(test_pool)[0]
+        # Sidecar keyed by the train pool's canonical uid only.
+        sidecar = {
+            train_video.source_video_uid: {
+                "negative_subtype": "near_miss",
+                "sample_weight": 0.5,
+            }
+        }
+        applied = apply_sidecar([train_video, test_video], sidecar)
+        by_uid = {video.source_video_uid: video for video in applied}
+        # Before content anchoring both pools shared "MC::0::01" and the dict
+        # overwrote one of them; now each pool keeps its own metadata.
+        self.assertEqual(
+            by_uid[train_video.source_video_uid].negative_subtype, "near_miss"
+        )
+        self.assertIsNone(by_uid[test_video.source_video_uid].negative_subtype)
+        self.assertEqual(by_uid[test_video.source_video_uid].sample_weight, 1.0)
+
+    def test_collision_classification_uses_configured_identity_mode(self) -> None:
+        """Audit B2: the overlap diagnostic must group by the configured mode.
+
+        Under ``game_label_video`` the strict overlap set is keyed
+        ``game::label::video``. The classification used to re-derive uids with
+        the default ``game_video`` mode, so it grouped frames under ``game::
+        video`` and then looked up the label-qualified overlap uid in a mapping
+        that never contained it -- a KeyError instead of the friendly
+        diagnostic.
+        """
+        from game_cls.data.indexing import _source_uid_content_classification
+
+        def _one(split: str, content_hash: str) -> FrameRecord:
+            return FrameRecord(
+                sample_id=f"{split}:MC:0:01:1",
+                split=split,
+                game="MC",
+                label=0,
+                video_id="01",
+                frame_id=1,
+                path="/d/MC/0/01.png",
+                width=448,
+                height=208,
+                channels=3,
+                file_size=1,
+                content_sha256=content_hash,
+            )
+
+        frames_by_split = {
+            "train": [_one("train", "hash-a")],
+            "test": [_one("test", "hash-a")],
+        }
+        source_uids_by_split = {"train": {"MC::0::01"}, "test": {"MC::0::01"}}
+        classification = _source_uid_content_classification(
+            frames_by_split, source_uids_by_split, {}, "game_label_video"
+        )
+        entries = classification["pairs"].get("train__test", [])
+        self.assertEqual(
+            [entry["source_video_uid"] for entry in entries], ["MC::0::01"]
+        )
+        self.assertEqual(entries[0]["shared_content_frames"], 2)
+
+    def test_canonical_uid_roundtrips_through_parquet(self) -> None:
+        import tempfile
+
+        from game_cls.data.video_index import (
+            build_video_entries,
+            read_video_entries_parquet,
+            write_video_entries_parquet,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "videos.parquet"
+            videos = build_video_entries(
+                self._content_frames("MC", 0, "01", ("a", "b", "c"))
+            )
+            write_video_entries_parquet(videos, path)
+            restored = read_video_entries_parquet(path)
+            self.assertEqual(len(restored), 1)
+            self.assertEqual(
+                restored[0].source_video_uid, videos[0].source_video_uid
+            )
+            self.assertEqual(
+                restored[0].canonical_source_video_uid,
+                videos[0].canonical_source_video_uid,
+            )
+
+
 def write_png_header(path: Path, width: int = 448, height: int = 208) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(

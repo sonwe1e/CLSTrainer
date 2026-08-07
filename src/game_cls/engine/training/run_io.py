@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -28,6 +29,28 @@ from game_cls.runs import (
 
 # ``topk_monitor`` values that mean "rank by the selection contract".
 _SELECTION_TOPK_MONITORS = frozenset({"selection_score", "selection"})
+
+
+def acquire_resume_lock(run_dir: Path) -> Path:
+    """Exclusively claim a run directory for a resume (audit acceptance #6).
+
+    Two processes resuming the same run would both load the same checkpoint and
+    interleave their writes, corrupting the run. An ``O_CREAT | O_EXCL`` lock
+    file makes the second start fail loudly instead. The caller must release it
+    (``unlink``) in a ``finally`` block.
+    """
+    lock_path = run_dir / ".resume.lock"
+    try:
+        descriptor = os.open(
+            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        )
+    except FileExistsError:
+        raise RuntimeError(
+            f"Run {run_dir} is already being resumed (lock {lock_path} exists); "
+            "two processes must not resume the same run concurrently."
+        ) from None
+    os.close(descriptor)
+    return lock_path
 
 
 def _topk_entry_sort_value(entry: dict, *, lower_better: bool) -> list[float]:

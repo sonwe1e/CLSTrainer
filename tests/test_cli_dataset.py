@@ -458,6 +458,9 @@ pair:
                     video_id=video_id,
                     frame_ids=np.array([1, 2, 3]),
                     valid_start_positions={},
+                    # The mock stands in for an indexed parquet, whose rows
+                    # carry the persisted canonical uid (audit P0-5).
+                    canonical_source_video_uid=uid,
                 )
             )
         return entries

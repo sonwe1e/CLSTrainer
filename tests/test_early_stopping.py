@@ -183,19 +183,39 @@ class EarlyStoppingSelectionContractTests(unittest.TestCase):
         )
         self.assertEqual(state["best_step"], 40)
 
-    def test_burn_in_defers_the_stop(self) -> None:
+    def test_burn_in_defers_the_stop_without_burning_patience(self) -> None:
+        # Audit P1-1: unimproving evaluations inside burn-in must not consume
+        # patience, or a run that would normally stop well after the knee gets
+        # cut off the instant it crosses burn-in. Patience counting starts at
+        # the first evaluation at or past burn_in_steps.
         state = _early_stopping_defaults()
-        cfg = _early_cfg(burn_in_steps=100)
+        cfg = _early_cfg(burn_in_steps=100, patience_evaluations=2)
         evaluation = _constrained_cfg()
         _update_early_stopping(
             state, cfg, _metrics(worst_game_recall=0.9), 10, evaluation
         )
+        self.assertEqual(state["best_step"], 10)
+        # Unimproving evaluation inside burn-in: no stop, patience untouched.
         self.assertFalse(
             _update_early_stopping(
                 state, cfg, _metrics(worst_game_recall=0.1), 20, evaluation
             )
         )
+        self.assertEqual(state["bad_evaluation_count"], 0)
+        # Best is still tracked through burn-in.
+        self.assertEqual(state["best_step"], 10)
+        # Same run, first evaluation past burn-in: patience counting begins.
+        self.assertFalse(
+            _update_early_stopping(
+                state, cfg, _metrics(worst_game_recall=0.1), 110, evaluation
+            )
+        )
         self.assertEqual(state["bad_evaluation_count"], 1)
+        stop = _update_early_stopping(
+            state, cfg, _metrics(worst_game_recall=0.1), 120, evaluation
+        )
+        self.assertTrue(stop)
+        self.assertEqual(state["bad_evaluation_count"], 2)
 
     def test_explicit_numeric_monitor_keeps_the_float_comparison(self) -> None:
         # monitor: cross_entropy / mode: min is a legitimate config and must

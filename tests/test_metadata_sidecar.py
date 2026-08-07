@@ -35,22 +35,24 @@ class MetadataSidecarTests(unittest.TestCase):
     def test_write_read_apply_roundtrip(self) -> None:
         videos = _videos()
         rows = [
-            {"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"},
-            {"source_video_uid": "B::02", "negative_subtype": "flat_floor"},
+            {"source_video_uid": "A::0::01", "negative_subtype": "wooden_bridge"},
+            {"source_video_uid": "B::0::02", "negative_subtype": "flat_floor"},
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "video_metadata.parquet"
             fingerprint = write_metadata_sidecar(rows, path)
             sidecar = read_metadata_sidecar(path)
-            self.assertEqual(sidecar["A::01"]["negative_subtype"], "wooden_bridge")
-            self.assertEqual(sidecar["A::01"]["sample_weight"], 1.0)
+            self.assertEqual(
+                sidecar["A::0::01"]["negative_subtype"], "wooden_bridge"
+            )
+            self.assertEqual(sidecar["A::0::01"]["sample_weight"], 1.0)
             validate_sidecar_against_index(sidecar, videos)
             applied = apply_sidecar(videos, sidecar)
             by_uid = {video.source_video_uid: video for video in applied}
-            self.assertEqual(by_uid["A::01"].negative_subtype, "wooden_bridge")
-            self.assertEqual(by_uid["B::02"].negative_subtype, "flat_floor")
+            self.assertEqual(by_uid["A::0::01"].negative_subtype, "wooden_bridge")
+            self.assertEqual(by_uid["B::0::02"].negative_subtype, "flat_floor")
             # Untyped videos keep their default.
-            self.assertIsNone(by_uid["A::02"].negative_subtype)
+            self.assertIsNone(by_uid["A::0::02"].negative_subtype)
             # Fingerprint is deterministic and recorded.
             self.assertTrue(fingerprint)
             self.assertEqual(read_metadata_sidecar(path), sidecar)
@@ -79,14 +81,14 @@ class MetadataSidecarTests(unittest.TestCase):
 
     def test_sample_weight_applied(self) -> None:
         videos = _videos()
-        rows = [{"source_video_uid": "A::01", "sample_weight": 0.5}]
+        rows = [{"source_video_uid": "A::0::01", "sample_weight": 0.5}]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(rows, path)
             applied = apply_sidecar(videos, read_metadata_sidecar(path))
             by_uid = {video.source_video_uid: video for video in applied}
-            self.assertEqual(by_uid["A::01"].sample_weight, 0.5)
-            self.assertEqual(by_uid["A::02"].sample_weight, 1.0)
+            self.assertEqual(by_uid["A::0::01"].sample_weight, 0.5)
+            self.assertEqual(by_uid["A::0::02"].sample_weight, 1.0)
 
 
 class HardNegativeReadinessTests(unittest.TestCase):

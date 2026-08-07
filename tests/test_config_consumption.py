@@ -1,11 +1,18 @@
 """CI guard: every schema-known config key must have a code consumer.
 
 step1.md requires that no configuration field can exist without an actual
-consumer ("存在但不生效" is forbidden). This test scans the source tree
-and asserts that every schema leaf key appears as a string literal in the
-runtime code (outside the schema/config plumbing itself). A future config
-addition that forgets the consumer — or a consumer removal that orphans a
-key — fails CI.
+consumer ("存在但不生效" is forbidden). This test scans the source tree and
+asserts that every schema leaf key appears as a string literal in the runtime
+code (outside the schema/config plumbing itself), so a future config addition
+that forgets a consumer — or a consumer removal that orphans a key — fails CI.
+
+LIMITATION (audit G1, SS7): a bare-leaf scan proves only that the field's NAME
+appears somewhere; a consumer reading the WRONG section (e.g. the old
+``train.warmup_steps`` read of the ``scheduler.warmup_steps`` field) still
+passes. That section-awareness gap is closed by the behavior-based mutation
+tests in ``test_config_behavior_contract.py``, which change a field and assert
+the corresponding behavior actually changes. This test is the coarse orphan
+guard; it is not proof of consumption.
 """
 
 from __future__ import annotations

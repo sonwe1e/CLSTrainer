@@ -166,7 +166,16 @@ def _update_early_stopping(
         state["best_step"] = int(global_step)
         state["bad_evaluation_count"] = 0
         return False
+    burn_in = int(early_config.get("burn_in_steps", 0))
+    if global_step < burn_in:
+        # Burn-in: an unimproving evaluation must not consume patience. The
+        # ``improved`` branch above still advances ``best_step``/``best_value``
+        # inside burn-in, but a run inside burn-in can never stop early. Before
+        # this gate, bad evaluations inside burn-in were counted, so a run with
+        # val_full_every_steps=2000, burn_in_steps=6000, patience=3 stopped the
+        # instant it crossed burn-in instead of giving the schedule room to
+        # warm up (the audit P1-1).
+        return False
     state["bad_evaluation_count"] = int(state.get("bad_evaluation_count", 0)) + 1
     patience = int(early_config.get("patience_evaluations", 3))
-    burn_in = int(early_config.get("burn_in_steps", 0))
-    return state["bad_evaluation_count"] >= patience and global_step >= burn_in
+    return state["bad_evaluation_count"] >= patience

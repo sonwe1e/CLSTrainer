@@ -1,12 +1,81 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
 
 from .image_spec import ImageSpec
+
+
+def _file_sha256(path: str | Path | None) -> str:
+    """SHA-256 of a file's bytes; empty string when absent."""
+    if path is None:
+        return ""
+    path = Path(path)
+    if not path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_packed_provenance(
+    manifest_path: str | Path,
+    current_frame_index: str | Path | None,
+    *,
+    audit_path: str | Path | None = None,
+    split_manifest_path: str | Path | None = None,
+) -> None:
+    """Refuse stale packed data before a DataLoader is built (audit P0-6).
+
+    A packed shard set is bound to the exact frame index, audit and split
+    manifest it was generated from. If any of those changed after packing, the
+    shards no longer match the current indexes and training must refuse instead
+    of silently reading old pixels over new index files.
+    """
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Packed shard manifest is missing: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Packed manifest is unreadable: {manifest_path}: {exc}") from exc
+
+    def _check(field: str, current_path: str | Path | None) -> None:
+        recorded = manifest.get(field)
+        if not recorded:
+            # A manifest that predates the provenance binding cannot prove the
+            # shards match the current indexes; refuse and demand a repack.
+            raise RuntimeError(
+                f"Packed manifest {manifest_path} has no {field}; it predates "
+                "the provenance binding. Re-run 'cls-trainer dataset pack' to "
+                "regenerate provenance-bound shards."
+            )
+        current = _file_sha256(current_path)
+        if current and current != recorded:
+            raise RuntimeError(
+                f"Packed data is stale: {field} changed since packing "
+                f"(manifest {recorded[:16]}..., current {current[:16]}...). "
+                "The current indexes were regenerated but the shards were not; "
+                "re-run 'cls-trainer dataset pack'."
+            )
+
+    # The frame index binding is mandatory -- a manifest without it cannot
+    # prove anything. The audit/split-manifest bindings are optional: they are
+    # only checked when the packer recorded them (the pack may legitimately
+    # have had no audit/split-manifest to bind to).
+    _check("source_frame_index_sha256", current_frame_index)
+    if audit_path is not None and manifest.get("audit_fingerprint"):
+        _check("audit_fingerprint", audit_path)
+    if split_manifest_path is not None and manifest.get(
+        "split_manifest_fingerprint"
+    ):
+        _check("split_manifest_fingerprint", split_manifest_path)
 
 
 class PackedUint8Backend:
@@ -186,6 +255,8 @@ def pack_frame_index(
     *,
     image_spec: ImageSpec,
     images_per_shard: int = 4096,
+    audit_path: str | Path | None = None,
+    split_manifest_path: str | Path | None = None,
 ) -> Path:
     try:
         import numpy as np
@@ -282,13 +353,25 @@ def pack_frame_index(
                 pa.Table.from_pylist(row_buffer, schema=index_schema)
             )
         index_writer.close()
+    # Audit P0-6: bind the shards to the exact sources they were generated
+    # from, so a regenerated index or audit with stale shards is refused before
+    # a DataLoader is built. ``dataset_fingerprint`` and ``audit_fingerprint``
+    # are both derived from the audit file: the dataset's audit is its
+    # fingerprint, and the audit file hash pins the exact audit revision.
     manifest = {
-        "format_version": 2,
+        "format_version": 3,
         "channels": image_spec.channels,
         "height": image_spec.height,
         "width": image_spec.width,
         "image_bytes": (image_spec.channels * image_spec.height * image_spec.width),
         "frame_count": index,
+        "source_frame_index_sha256": _file_sha256(frame_index),
+        "dataset_fingerprint": _file_sha256(audit_path),
+        "audit_fingerprint": _file_sha256(audit_path),
+        "split_manifest_fingerprint": _file_sha256(split_manifest_path),
+        "shard_sha256": {
+            name: _file_sha256(output_dir / name) for name in shard_names
+        },
         "shards": shard_names,
     }
     (output_dir / "packed_manifest.json").write_text(

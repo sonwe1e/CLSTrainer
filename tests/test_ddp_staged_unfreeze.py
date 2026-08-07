@@ -134,6 +134,67 @@ def _worker(
         dist.destroy_process_group()
 
 
+def _rewrap_stress_worker(
+    rank: int, world_size: int, init_method: str, output_dir: str, iterations: int
+) -> None:
+    """Repeat the deterministic DDP teardown + re-wrap cycle ``iterations``
+    times with live gradients each cycle.
+
+    Audit P0-7: the SIGABRT was an intermittent Reducer native-teardown race
+    (observed on Python 3.11 + torch 2.13) when a fresh wrapper bound the same
+    bare model while the old Reducer was still alive. Running many cycles with
+    populated gradients means a teardown race cannot hide behind a lucky single
+    run.
+    """
+    from game_cls.engine.training.loop import _rewrap_distributed, _wrap_distributed
+    from game_cls.model.builder import build_demo_model
+    from game_cls.model.trainable_rules import apply_trainable_state, parse_rules
+
+    dist.init_process_group(
+        "gloo", init_method=init_method, rank=rank, world_size=world_size
+    )
+    try:
+        torch.manual_seed(0)  # identical initial weights on every rank
+        device = torch.device("cpu")
+        rules = parse_rules(RULES)
+        bare_model = build_demo_model({})
+        apply_trainable_state(bare_model, rules, UNFREEZE_STEP)
+        bare_model.to(device)
+        model = _wrap_distributed(bare_model, device, rank)
+        optimizer = torch.optim.AdamW(
+            [p for p in bare_model.parameters() if p.requires_grad], lr=0.05
+        )
+        images = torch.full((2, 2, 3, 4, 4), 0.25 * (rank + 1))
+        labels = torch.tensor([rank % 2, (rank + 1) % 2])
+        for _ in range(iterations):
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(images[:, 0], images[:, 1])
+            loss = torch.nn.functional.cross_entropy(logits, labels)
+            loss.backward()
+            # Mirror the training loop's structured teardown with live grads.
+            optimizer.zero_grad(set_to_none=True)
+            model = _rewrap_distributed(model, bare_model, device, rank)
+        # One final optimizer step so synced weights move identically.
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images[:, 0], images[:, 1])
+        loss = torch.nn.functional.cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
+        payload = {
+            "params": {
+                name: parameter.detach().flatten().tolist()
+                for name, parameter in bare_model.named_parameters()
+            }
+        }
+        target = Path(output_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / f"rank{rank}.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    finally:
+        dist.destroy_process_group()
+
+
 def _end_to_end_worker(
     rank: int,
     world_size: int,
@@ -174,6 +235,9 @@ def _end_to_end_worker(
     config["device"]["accelerator"] = "cpu"
     config["distributed"] = {"enabled": True, "backend": "gloo"}
     config["model"]["trainable_rules"] = RULES
+    # No warmup: the 8-step budget would otherwise trip the live
+    # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
+    config["scheduler"]["warmup_steps"] = 0
     config["train"].update(
         {
             "max_steps": max_steps,
@@ -273,6 +337,33 @@ class DdpStagedUnfreezeTests(unittest.TestCase):
                 rank0["params"]["backbone.0.weight"],
                 rank1["params"]["backbone.0.weight"],
             )
+
+    def test_rewrap_stress_50_iterations(self) -> None:
+        """Audit P0-7 / acceptance #2: 50 re-wraps must not abort and stay synced.
+
+        Repeats the deterministic DDP teardown + re-wrap cycle 50 times across
+        two Gloo ranks with live gradients every cycle, so the intermittent
+        Reducer native-teardown SIGABRT (Python 3.11 + torch 2.13) cannot hide
+        behind a lucky single re-wrap. All ranks must remain bitwise in sync.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rendezvous = root / "rendezvous_stress"
+            reports = root / "reports_stress"
+            mp.spawn(
+                _rewrap_stress_worker,
+                args=(2, rendezvous.as_uri(), str(reports), 50),
+                nprocs=2,
+                join=True,
+            )
+            rank0 = json.loads(
+                (reports / "rank0.json").read_text(encoding="utf-8")
+            )
+            rank1 = json.loads(
+                (reports / "rank1.json").read_text(encoding="utf-8")
+            )
+            for name, values in rank0["params"].items():
+                self.assertEqual(values, rank1["params"][name], f"{name} diverged")
 
     def test_end_to_end_training_loop_stays_in_sync(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

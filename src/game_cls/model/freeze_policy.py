@@ -48,9 +48,35 @@ def set_frozen_backbone_train_mode(
         raise RuntimeError("Training mode configuration requires torch") from exc
 
     model.eval()
+    # Put every module on a path to a trainable parameter into train mode. The
+    # legacy test was ``name_contains in module_name`` (the "cls" token), which
+    # left staged-unfreeze stages -- whose parameter names carry no "cls" token
+    # (e.g. ``layer4`` / ``backbone.stage4``) -- in eval mode while their
+    # weights were being updated: Dropout/DropPath never ran and the freshly
+    # unfrozen weights trained under inference semantics (audit P1-2). The
+    # ``requires_grad`` set reflects the current trainable rules, so it covers
+    # both the legacy token and the staged path.
+    trainable_subtrees = {
+        module_name
+        for module_name, module in model.named_modules()
+        if any(
+            parameter.requires_grad
+            for parameter in module.parameters(recurse=True)
+        )
+    }
     for module_name, module in model.named_modules():
-        if name_contains in module_name:
+        if module_name in trainable_subtrees:
             module.train()
+    # ``module.train()`` on a mixed container (e.g. the model root) recursively
+    # trains its frozen subtrees too; put any subtree that holds only frozen
+    # parameters back into eval so its Dropout/DropPath/stochastic-depth stay
+    # deterministic and match the frozen-parameter contract.
+    for _, module in model.named_modules():
+        parameters = list(module.parameters(recurse=True))
+        if parameters and not any(
+            parameter.requires_grad for parameter in parameters
+        ):
+            module.eval()
     if freeze_batchnorm_stats is not None:
         freeze_backbone_batchnorm_stats = freeze_batchnorm_stats
         freeze_cls_batchnorm_stats = freeze_batchnorm_stats

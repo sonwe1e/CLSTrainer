@@ -23,8 +23,10 @@ class ExportVerifyTests(unittest.TestCase):
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["train"].update(
             {
-                "max_steps": 8,
-                "steps_per_epoch": 8,
+                # Must stay above scheduler.warmup_steps (10) now that the
+                # cross-field check is live (audit P1-5).
+                "max_steps": 16,
+                "steps_per_epoch": 16,
                 "local_batch_size": 4,
                 "log_every_steps": 8,
             }
@@ -41,6 +43,14 @@ class ExportVerifyTests(unittest.TestCase):
         config.pop("early_stopping", None)
         result = run_training(config)
         return Path(result["output_dir"])
+
+    def _artifact_dir(self, export_dir: Path, run_dir: Path) -> Path:
+        """The immutable per-artifact export directory (audit PR-F):
+        ``export_dir/<run_id>/<checkpoint_sha256>/``."""
+        run_export = export_dir / run_dir.name
+        self.assertTrue(run_export.is_dir(), f"no run dir under {export_dir}")
+        (sha_dir,) = list(run_export.iterdir())
+        return sha_dir
 
     def test_weights_export_roundtrip(self) -> None:
         import torch
@@ -59,15 +69,17 @@ class ExportVerifyTests(unittest.TestCase):
                     "runs_root": str(Path(directory) / "runs"),
                     "config": None,
                     "checkpoint": "last",
+                    "skip_gate": True,
                     "format": "weights",
                     "out": str(export_dir),
                 },
             )()
             rc = cmd_export(args)
             self.assertEqual(rc, 0)
-            weights = export_dir / "model_last.pth"
+            artifact_dir = self._artifact_dir(export_dir, run_dir)
+            weights = artifact_dir / "model.pt"
             manifest = json.loads(
-                (export_dir / "export_manifest.json").read_text(encoding="utf-8")
+                (artifact_dir / "export_manifest.json").read_text(encoding="utf-8")
             )
             self.assertTrue(weights.is_file())
             self.assertEqual(manifest["decision.threshold"], 0.99)
@@ -80,6 +92,31 @@ class ExportVerifyTests(unittest.TestCase):
                 torch.load(weights, map_location="cpu", weights_only=True),
                 strict=True,
             )
+
+    def test_export_refuses_overwriting_an_existing_artifact(self) -> None:
+        # Audit PR-F: the export layout is immutable. Re-exporting the same
+        # checkpoint resolves to the same <run_id>/<sha> directory and must be
+        # refused instead of silently overwriting the deployment artifact.
+        from game_cls.cli.export import cmd_export
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = self._trained_run(directory)
+            export_dir = Path(directory) / "exports"
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": str(run_dir),
+                    "runs_root": str(Path(directory) / "runs"),
+                    "config": None,
+                    "checkpoint": "last",
+                    "skip_gate": True,
+                    "format": "weights",
+                    "out": str(export_dir),
+                },
+            )()
+            self.assertEqual(cmd_export(args), 0)
+            self.assertEqual(cmd_export(args), 2)
 
     def _export_config(self, base: Path, **data_overrides) -> Path:
         """Write a resolved config snapshot with data.* overridden."""
@@ -112,13 +149,15 @@ class ExportVerifyTests(unittest.TestCase):
                     "runs_root": str(base / "runs"),
                     "config": str(config),
                     "checkpoint": "last",
+                    "skip_gate": True,
                     "format": "weights",
                     "out": str(export_dir),
                 },
             )()
             self.assertEqual(cmd_export(args), 0)
+            artifact_dir = self._artifact_dir(export_dir, run_dir)
             manifest = json.loads(
-                (export_dir / "export_manifest.json").read_text(encoding="utf-8")
+                (artifact_dir / "export_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["shape"], [1, 2, 1, 48, 96])
 
@@ -137,6 +176,7 @@ class ExportVerifyTests(unittest.TestCase):
                 str(config),
                 "--checkpoint",
                 "last",
+                "--skip-gate",
             ]
         )
 
@@ -154,8 +194,11 @@ class ExportVerifyTests(unittest.TestCase):
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             self.assertEqual(self._export_via_cli(run_dir, base, config), 0)
-            self.assertTrue((configured_dir / "export_manifest.json").is_file())
-            self.assertFalse((Path("exports") / "export_manifest.json").is_file())
+            self.assertTrue(
+                (self._artifact_dir(configured_dir, run_dir) / "export_manifest.json").is_file()
+            )
+            # The CWD-relative default "exports" was never touched.
+            self.assertFalse((Path("exports") / run_dir.name).exists())
 
     def test_export_format_comes_from_the_config(self) -> None:
         # "onnx" is the only non-default value the schema allows, so it is the
@@ -177,12 +220,13 @@ class ExportVerifyTests(unittest.TestCase):
             # whether onnxruntime is installed decides between a traced graph
             # (0) and the friendly "install it or use --format weights" (2).
             # Either way the weights branch must not have run.
-            self.assertFalse((out_dir / "model_last.pth").is_file())
+            artifact_dir = self._artifact_dir(out_dir, run_dir)
+            self.assertFalse((artifact_dir / "model.pt").is_file())
             if code == 0:
-                self.assertTrue((out_dir / "model_last.onnx").is_file())
+                self.assertTrue((artifact_dir / "model.onnx").is_file())
             else:
                 self.assertEqual(code, 2)
-                self.assertFalse((out_dir / "export_manifest.json").is_file())
+                self.assertFalse((artifact_dir / "export_manifest.json").is_file())
 
     def test_manifest_records_base_checkpoint_sha_and_metric_summary(self) -> None:
         from game_cls.cli.export import cmd_export
@@ -231,13 +275,15 @@ class ExportVerifyTests(unittest.TestCase):
                     "runs_root": str(base / "runs"),
                     "config": str(config),
                     "checkpoint": "last",
+                    "skip_gate": True,
                     "format": "weights",
                     "out": str(export_dir),
                 },
             )()
             self.assertEqual(cmd_export(args), 0)
+            artifact_dir = self._artifact_dir(export_dir, run_dir)
             manifest = json.loads(
-                (export_dir / "export_manifest.json").read_text(encoding="utf-8")
+                (artifact_dir / "export_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(
                 manifest["base_checkpoint_sha256"], sha256_file(pretrained)
@@ -286,13 +332,15 @@ class ExportVerifyTests(unittest.TestCase):
                     "runs_root": str(base / "runs"),
                     "config": str(config),
                     "checkpoint": "last",
+                    "skip_gate": True,
                     "format": "weights",
                     "out": str(export_dir),
                 },
             )()
             self.assertEqual(cmd_export(args), 0)
+            artifact_dir = self._artifact_dir(export_dir, run_dir)
             manifest = json.loads(
-                (export_dir / "export_manifest.json").read_text(encoding="utf-8")
+                (artifact_dir / "export_manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["base_checkpoint_sha256"], "f" * 64)
 
@@ -344,18 +392,36 @@ class ReleaseGateTests(unittest.TestCase):
         import yaml
 
         from game_cls.cli.config_tools import cmd_config_validate
+        from game_cls.reports.benchmark import check_gates, write_benchmark_report
 
         with tempfile.TemporaryDirectory() as directory:
-            cfg_path = Path(directory) / "release.yaml"
+            base = Path(directory)
             config = yaml.safe_load(
                 Path("configs/recipes/game_cls_production.yaml").read_text(
                     encoding="utf-8"
                 )
             )
             config.setdefault("evaluation", {})["minimum_worst_game_f1"] = 0.75
-            config.setdefault("benchmark", {})["gate_metrics"] = {
+            gate_metrics = config.setdefault("benchmark", {})["gate_metrics"] = {
                 "global_fpr_at_decision_threshold": 0.01
             }
+            # Audit P0-3: a release-ready check with NO benchmark must fail, so
+            # this passing case needs an actual report.
+            config["benchmark"]["output_dir"] = str(base / "benchmarks")
+            metrics = {
+                "sample_count": 100,
+                "global_fpr_at_decision_threshold": 0.004,
+            }
+            write_benchmark_report(
+                base / "benchmarks",
+                run_id="run-1",
+                checkpoint_alias="best_selection",
+                metrics=metrics,
+                gates=check_gates(metrics, gate_metrics),
+                grouped_metrics=None,
+                gate_metrics=gate_metrics,
+            )
+            cfg_path = base / "release.yaml"
             cfg_path.write_text(
                 yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
             )

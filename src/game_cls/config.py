@@ -188,6 +188,7 @@ def _resolve_layer_file(recipe_path: Path, subdir: str, name: str, kind: str) ->
         candidates.append(tree_root / subdir / f"{name}.yaml")
         tree_root = tree_root.parent
     candidates.append(Path("configs") / subdir / f"{name}.yaml")
+    candidates.append(_configs_root() / subdir / f"{name}.yaml")
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -354,9 +355,31 @@ def load_config_with_sources(
     return finalize_config(merged), sources
 
 
+def _configs_root() -> Path:
+    """The configs tree root: CWD ``./configs`` when present (a repo checkout),
+    else the copy shipped inside the installed wheel (audit PR-F).
+
+    data-files install under ``sys.prefix`` (setuptools does not place them in
+    site-packages), so the installed tree may be either next to the package or
+    at the environment root.
+    """
+    import sys
+
+    cwd_root = Path("configs")
+    if cwd_root.is_dir():
+        return cwd_root
+    for candidate in (
+        Path(__file__).resolve().parent / "configs",
+        Path(sys.prefix) / "game_cls" / "configs",
+    ):
+        if candidate.is_dir():
+            return candidate
+    return Path(__file__).resolve().parent / "configs"
+
+
 def list_available_layers() -> dict[str, list[str]]:
     """Available task profiles/profiles/presets under ./configs, for errors and init."""
-    root = Path("configs")
+    root = _configs_root()
     result: dict[str, list[str]] = {}
     for subdir in ("task_profiles", "profiles"):
         directory = root / subdir

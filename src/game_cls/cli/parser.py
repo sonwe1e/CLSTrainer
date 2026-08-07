@@ -33,6 +33,7 @@ from game_cls.cli.config_tools import (
     cmd_config_reference,
     cmd_config_show,
     cmd_config_validate,
+    cmd_release_check,
 )
 from game_cls.cli.dataset import (
     cmd_dataset_annotate,
@@ -170,6 +171,25 @@ def build_parser() -> argparse.ArgumentParser:
         "reference", help="List every known config key with its meaning."
     )
     reference.set_defaults(func=cmd_config_reference)
+
+    release = subparsers.add_parser(
+        "release", help="Bind a release PASS to one exact artifact."
+    )
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+    release_check = release_sub.add_parser(
+        "check",
+        help="Verify one run's checkpoint against its own benchmark gate "
+        "(audit P0-4: a PASS cannot be borrowed from another artifact).",
+    )
+    release_check.add_argument("--run", required=True)
+    release_check.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Checkpoint alias (e.g. best_selection) or path to a model .pth.",
+    )
+    release_check.add_argument("--config")
+    release_check.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    release_check.set_defaults(func=cmd_release_check)
 
     run = subparsers.add_parser("run", help="Inspect recorded runs.")
     run_sub = run.add_subparsers(dest="run_command", required=True)
@@ -330,6 +350,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         default=None,
         help="Override export.output_dir (default: exports).",
+    )
+    export.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="Export even when this checkpoint has no benchmark PASS bound to "
+        "it. Default refuses: an artifact without an exact-checkpoint gate "
+        "report is not releasable (audit P0-4).",
     )
     export.set_defaults(func=cmd_export)
 

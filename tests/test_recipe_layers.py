@@ -116,10 +116,12 @@ class RecipeLayerTests(unittest.TestCase):
         config = load_config("configs/recipes/game_cls_production.yaml")
         self.assertEqual(config["device"]["accelerator"], "npu")
         self.assertTrue(config["distributed"]["enabled"])
-        self.assertEqual(config["evaluation"]["selection_metric"], "composite")
-        # Constrained low-FPR selection comes from the production preset, not
-        # from a recipe-local copy.
+        # Audit P1-4: constrained mode owns selection; the dead composite
+        # selection_metric/selection_weights keys were removed so they cannot
+        # masquerade as influencing the best checkpoint.
         self.assertEqual(config["evaluation"]["selection_mode"], "constrained")
+        self.assertNotIn("selection_weights", config["evaluation"])
+        self.assertNotEqual(config["evaluation"].get("selection_metric"), "composite")
 
 
 class InitCommandTests(unittest.TestCase):

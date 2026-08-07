@@ -105,13 +105,43 @@ def _file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _numpy_state_to_primitives(state) -> tuple:
+    """Serialize ``np.random.get_state()`` into weights_only-safe primitives.
+
+    ``np.random.get_state()`` returns ``(name, keys_ndarray, pos, has_gauss,
+    cached)``. ``numpy.ndarray`` is unpickled through the
+    ``numpy._core.multiarray._reconstruct`` global, which ``torch.load``'s
+    ``weights_only=True`` unpickler refuses by default (Audit P0-2). Storing the
+    RNG keys as a plain list keeps the internal training checkpoint loadable
+    with ``weights_only=True`` -- the actual security boundary -- without
+    widening torch's allowlist.
+    """
+    name, keys, pos, has_gauss, cached = state
+    return (name, keys.tolist(), pos, has_gauss, cached)
+
+
+def _numpy_state_from_primitives(state) -> tuple:
+    """Rebuild a numpy RNG state serialized by ``_numpy_state_to_primitives``.
+
+    Accepts both the primitives form (list keys, current format) and a legacy
+    raw ``np.random.get_state()`` tuple (ndarray keys) so old checkpoints still
+    restore.
+    """
+    import numpy as np
+
+    name, keys, pos, has_gauss, cached = state
+    if not isinstance(keys, np.ndarray):
+        keys = np.asarray(keys, dtype=np.uint32)
+    return (name, keys, pos, has_gauss, cached)
+
+
 def capture_random_state() -> dict:
     import numpy as np
     import torch
 
     state = {
         "python": random.getstate(),
-        "numpy": np.random.get_state(),
+        "numpy": _numpy_state_to_primitives(np.random.get_state()),
         "torch": torch.get_rng_state(),
     }
     if torch.cuda.is_available():
@@ -134,7 +164,7 @@ def restore_random_state(state: dict) -> None:
     if state.get("python") is not None:
         random.setstate(state["python"])
     if state.get("numpy") is not None:
-        np.random.set_state(state["numpy"])
+        np.random.set_state(_numpy_state_from_primitives(state["numpy"]))
     if state.get("torch") is not None:
         torch.set_rng_state(state["torch"])
     if state.get("cuda") is not None and torch.cuda.is_available():
@@ -267,11 +297,14 @@ def restore_training_checkpoint(
 ) -> dict:
     import torch
 
-    # Internal resume checkpoints carry optimizer/RNG/sampler state and
-    # must be unpickled with full fidelity (weights_only=False). They are
-    # trusted only when they carry the CLSTrainer marker; a checkpoint
-    # without it is refused.
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    # Internal resume checkpoints carry optimizer/RNG/sampler state. They load
+    # under weights_only=True (Audit P0-2): every stored object is a primitive,
+    # tensor or OrderedDict (see save_checkpoint_pair and
+    # capture_random_state), so a hostile pickle is refused by torch's
+    # restricted unpickler BEFORE anything executes. The CLSTrainer marker is
+    # then checked as a post-load contract so a foreign checkpoint is refused
+    # even when it happens to be pickle-safe.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if not checkpoint.get("cls_training_checkpoint"):
         raise RuntimeError(
             f"{path} is not a CLSTrainer internal training checkpoint "

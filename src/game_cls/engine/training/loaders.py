@@ -216,11 +216,28 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
 
     decoders: dict[str, Any] = {"train": None, "val": None, "test": None}
     if backend_name == "packed_uint8":
-        from game_cls.data.packed_backend import PackedUint8Backend
+        from game_cls.data.packed_backend import (
+            PackedUint8Backend,
+            verify_packed_provenance,
+        )
 
+        # Audit P0-6: refuse stale shards before a DataLoader is built. A
+        # regenerated index/audit with forgotten repacking would otherwise make
+        # the framework prove the new index while the model eats old pixels.
+        provenance_audit_path = data_cfg.get("audit_path") or str(
+            Path(data_cfg["train_index"]).parent / "audit.json"
+        )
         for split in ("train", "val", "test"):
             if split == "test" and test_videos is None:
                 continue
+            verify_packed_provenance(
+                Path(data_cfg[f"{split}_packed_index"]).with_name(
+                    "packed_manifest.json"
+                ),
+                data_cfg.get(f"{split}_index"),
+                audit_path=provenance_audit_path,
+                split_manifest_path=(data_cfg.get("split") or {}).get("manifest"),
+            )
             decoders[split] = PackedUint8Backend(
                 data_cfg[f"{split}_packed_index"],
                 image_spec=image_spec,

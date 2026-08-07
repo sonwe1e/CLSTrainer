@@ -87,6 +87,15 @@ SCHEMA: dict[str, Any] = {
             "allocate an immutable timestamped run directory under output_dir.",
             choices=("fixed", "unique"),
         ),
+        "smoke_mode": _k(
+            "bool",
+            "Mark a run as a smoke test so the production safety policy is "
+            "relaxed (e.g. the require-a-full-validation-source gate). Real "
+            "training must never set this; the NPU smoke stages disable full "
+            "validation to probe forward/spawn/augmentation/eval separately "
+            "(audit PR-E: test-env policy and production safety policy must "
+            "not fight each other).",
+        ),
     },
     "device": {
         "accelerator": _k(
@@ -1325,6 +1334,7 @@ def _apply_defaults(config: dict[str, Any]) -> None:
         experiment["seed"] = 20260728
     if "name" not in experiment:
         experiment["name"] = "run"
+    experiment.setdefault("smoke_mode", False)
 
     # An absent data.split block still yields the full dict so consumers can
     # rely on the documented defaults (split.mode=off keeps the legacy
@@ -1676,6 +1686,23 @@ def semantic_validate(config: dict[str, Any]) -> None:
             sum(float(value) for value in weights.values()) > 0,
             "evaluation.selection_weights must sum to a positive value.",
         )
+    # Audit P1-4: under selection_mode=constrained the rank key is
+    # (global recall, worst-game recall, -negative p99.9) and the composite F1
+    # weights can never influence the best checkpoint. A config carrying both
+    # is dead-config noise: fail it instead of letting a user believe the
+    # weights matter.
+    if evaluation_cfg.get("selection_mode") == "constrained":
+        require(
+            evaluation_cfg.get("selection_metric") != "composite",
+            "evaluation.selection_mode=constrained ignores a composite "
+            "selection_metric; remove selection_metric or drop constrained mode.",
+        )
+        require(
+            not evaluation_cfg.get("selection_weights"),
+            "evaluation.selection_mode=constrained ignores "
+            "evaluation.selection_weights; remove the weights or drop "
+            "constrained mode.",
+        )
 
     # Low-FPR evaluation protocol: FPR/recall bounds must be true
     # probabilities in (0, 1). Every gate is optional (null disables it), so
@@ -1786,13 +1813,17 @@ def semantic_validate(config: dict[str, Any]) -> None:
             f"sampler.{key} must sum to ~1 (got {sum(values):.4f}).",
         )
 
-    # Cross-field: warmup must fit inside the total step budget.
-    warmup = train_cfg.get("warmup_steps")
+    # Cross-field: warmup must fit inside the total step budget. The public
+    # field is scheduler.warmup_steps; train has no such key, and the old read
+    # of train.warmup_steps was dead because _walk rejects the unknown key
+    # before semantic validation runs (audit P1-5).
+    scheduler_cfg = config.get("scheduler") or {}
+    warmup = scheduler_cfg.get("warmup_steps")
     max_steps = train_cfg.get("max_steps")
     if isinstance(warmup, (int, float)) and isinstance(max_steps, (int, float)):
         require(
             warmup <= max_steps,
-            f"train.warmup_steps ({warmup}) must not exceed "
+            f"scheduler.warmup_steps ({warmup}) must not exceed "
             f"train.max_steps ({max_steps}).",
         )
 

@@ -326,6 +326,22 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         distributed_barrier()
         metrics = dict(result.metrics or {})
         gates = check_gates(metrics, gate_metrics)
+        # Audit P0-4: bind the gate verdict to the exact artifact it was earned
+        # on, so a later run's checkpoint can never borrow this PASS. The
+        # release identity tuple is (run_id, checkpoint_sha256,
+        # resolved_config_sha256, challenge_dataset_fingerprint,
+        # gate_spec_fingerprint).
+        from game_cls.reports.benchmark import (
+            file_sha256,
+            gate_spec_fingerprint,
+        )
+
+        checkpoint_sha256 = file_sha256(checkpoint_path)
+        resolved_config_sha256 = file_sha256(run_dir / "resolved_config.json")
+        challenge_dataset_fingerprint = file_sha256(
+            challenge_packed_video_index or challenge_video_index
+        )
+        gate_spec_hash = gate_spec_fingerprint(gate_metrics)
         # Persist the gate verdict to run_dir so export and CI can read it
         # without re-running evaluation.
         all_passed = all(passed for _, passed, _ in gates)
@@ -334,6 +350,10 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
             "run_id": run_dir.name,
             "checkpoint": args.checkpoint,
+            "checkpoint_sha256": checkpoint_sha256,
+            "resolved_config_sha256": resolved_config_sha256,
+            "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
+            "gate_spec_fingerprint": gate_spec_hash,
             "gate_metrics": gate_metrics,
             "actual_metrics": {
                 name: metrics.get(str(name)) for name in gate_metrics
@@ -361,6 +381,10 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             gates=gates,
             grouped_metrics=result.grouped_metrics,
             gate_metrics=gate_metrics,
+            checkpoint_sha256=checkpoint_sha256,
+            resolved_config_sha256=resolved_config_sha256,
+            challenge_dataset_fingerprint=challenge_dataset_fingerprint,
+            gate_spec_fingerprint=gate_spec_hash,
         )
         print(f"challenge_metadata: {challenge_metadata}", file=sys.stderr)
         unmet = [name for name, passed, _ in gates if not passed]

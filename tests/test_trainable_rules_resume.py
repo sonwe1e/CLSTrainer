@@ -119,6 +119,47 @@ class TrainableRulesResumeTests(unittest.TestCase):
             self.assertEqual(len(resumed["optimizer"]["param_groups"]), groups_at_save)
             self.assertIn("backbone.0.weight", resumed["trainable_state"])
 
+    def test_unfreeze_keeps_lr_continuous_under_warmup(self) -> None:
+        """Audit P1-3: the unfreeze boundary must not jump the learning rate.
+
+        The rebuilt scheduler only recorded ``last_epoch`` without recomputing
+        the group LRs, so the first optimizer step after the boundary used
+        ``factor(0)`` -- a transient drop off the continuous schedule that is
+        catastrophic inside warmup. Capture the actual group LR used at every
+        optimizer step and assert the boundary step is continuous with the
+        warmup ramp (base_lr * (step+1)/warmup_steps).
+        """
+        from unittest import mock
+
+        from game_cls.engine.trainer import run_training
+
+        recorded: list[list[float]] = []
+
+        class RecordingAdamW(torch.optim.AdamW):
+            def step(self, closure=None):
+                recorded.append([float(group["lr"]) for group in self.param_groups])
+                return super().step(closure)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(directory)
+            config["model"]["trainable_rules"] = STAGED_RULES  # unfreeze at 4
+            config["train"]["max_steps"] = 12
+            config["train"]["steps_per_epoch"] = 12
+            config["scheduler"]["warmup_steps"] = 12
+            base_lr = float(config["optimizer"]["learning_rate"])
+            with mock.patch.object(torch.optim, "AdamW", RecordingAdamW):
+                run_training(config)
+            # One recording per optimizer step (batch 0 uses factor(0)); the
+            # unfreeze fires at the start of the batch with global_step == 4.
+            self.assertGreaterEqual(len(recorded), 5)
+            expected = base_lr * (4 + 1) / 12
+            self.assertAlmostEqual(recorded[4][0], expected, places=8)
+            # The pre-fix behavior was factor(0) = base_lr * 1/12; make sure
+            # the boundary step is not that broken value.
+            self.assertGreater(recorded[4][0], base_lr * 2 / 12)
+            # The newly unfrozen backbone group uses its lr_scale (0.1).
+            self.assertAlmostEqual(recorded[4][-1], 0.1 * expected, places=8)
+
     def test_changed_rules_block_resume(self) -> None:
         from game_cls.engine.trainer import run_training
 

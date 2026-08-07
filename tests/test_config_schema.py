@@ -82,10 +82,12 @@ class OverrideStrictnessTests(unittest.TestCase):
             load_config("configs/recipes/example_debug.yaml", ["optimizer.name=SGD"])
 
     def test_valid_override_applies(self) -> None:
+        # max_steps must stay above scheduler.warmup_steps (10 in this recipe)
+        # now that the cross-field check is live (audit P1-5).
         config = load_config(
-            "configs/recipes/example_debug.yaml", ["train.max_steps=7"]
+            "configs/recipes/example_debug.yaml", ["train.max_steps=20"]
         )
-        self.assertEqual(config["train"]["max_steps"], 7)
+        self.assertEqual(config["train"]["max_steps"], 20)
 
     def test_schema_known_path_missing_from_file_is_created(self) -> None:
         # cuda_debug.yaml has no dataloader.train section, but the schema
@@ -130,8 +132,27 @@ class SemanticValidationTests(unittest.TestCase):
             self._load(**{"sampler.class_probability": "{0: 0.0, 1: 0.0}"})
 
     def test_warmup_exceeding_budget_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ConfigSchemaError, "warmup_steps"):
-            self._load(**{"train.warmup_steps": "200", "train.max_steps": "100"})
+        # Audit P1-5: the public field is scheduler.warmup_steps. The old test
+        # set train.warmup_steps, which only passed because the unknown-key
+        # walk rejected it first -- the semantic cross-field check never ran.
+        with self.assertRaisesRegex(ConfigSchemaError, "scheduler.warmup_steps"):
+            self._load(**{"scheduler.warmup_steps": "200", "train.max_steps": "100"})
+
+    def test_constrained_mode_rejects_dead_composite_keys(self) -> None:
+        # Audit P1-4: under selection_mode=constrained the rank key is
+        # (global recall, worst-game recall, -negative p99.9); a composite
+        # selection_metric/selection_weights can never influence the best
+        # checkpoint, so they must be a config error instead of silent noise.
+        with self.assertRaisesRegex(ConfigSchemaError, "constrained"):
+            self._load(
+                **{
+                    "evaluation.selection_mode": "constrained",
+                    "evaluation.selection_metric": "composite",
+                    "evaluation.selection_weights": (
+                        "{global_f1: 0.5, macro_game_f1: 0.5}"
+                    ),
+                }
+            )
 
     def test_negative_selection_weight_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigSchemaError, "selection_weights"):
@@ -363,10 +384,12 @@ class SourceTrackingTests(unittest.TestCase):
         self.assertIn("experiment.seed", sources)
 
     def test_overrides_are_recorded_as_sources(self) -> None:
+        # max_steps must stay above scheduler.warmup_steps (10) now that the
+        # cross-field check is live (audit P1-5).
         _, sources = load_config_with_sources(
-            "configs/recipes/example_debug.yaml", ["train.max_steps=3"]
+            "configs/recipes/example_debug.yaml", ["train.max_steps=12"]
         )
-        self.assertEqual(sources["train.max_steps"], "override:train.max_steps=3")
+        self.assertEqual(sources["train.max_steps"], "override:train.max_steps=12")
 
     def test_known_paths_cover_consumed_keys(self) -> None:
         paths = set(known_dotted_paths())

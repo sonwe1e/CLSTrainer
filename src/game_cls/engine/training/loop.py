@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import time
 from collections.abc import Callable
@@ -54,6 +55,7 @@ from game_cls.engine.training.run_io import (
     _record_run_failure,
     _write_resolved_config,
     _write_run_manifest,
+    acquire_resume_lock,
 )
 from game_cls.engine.training.selection import (
     _is_better_model,
@@ -64,6 +66,7 @@ from game_cls.engine.training.state import (
     _broadcast_object,
     _build_scheduler,
     _save_all_ranks,
+    _schedule_factor,
 )
 from game_cls.losses.threshold_loss import (
     combined_loss,
@@ -145,6 +148,24 @@ def _wrap_distributed(bare_model, device, local_rank: int):
     )
 
 
+def _rewrap_distributed(model, bare_model, device, local_rank: int):
+    """Deterministically replace the live DDP wrapper over ``bare_model``.
+
+    Audit P0-7: a second Reducer bound to the same parameters while the first
+    is still alive can abort inside the Reducer's native teardown on some
+    runtimes (observed as SIGABRT on Python 3.11 + torch 2.13). Plain
+    refcount-reassignment leaves that teardown to the interpreter's timing, so
+    this synchronizes every rank (none re-wraps while another is inside a
+    collective), drops the last wrapper reference, and forces a collection
+    before the new Reducer is built. Callers must already have released the
+    gradient bucket-view aliases (``optimizer.zero_grad(set_to_none=True)``).
+    """
+    distributed_barrier()
+    del model
+    gc.collect()
+    return _wrap_distributed(bare_model, device, local_rank)
+
+
 def _prune_unfrozen_from_snapshot(
     frozen_snapshot: dict | None, bare_model
 ) -> dict | None:
@@ -210,6 +231,7 @@ def run_training(
     run_id: str | None = None
     output_dir: Path | None = None
     global_step = 0
+    resume_lock: Path | None = None
     try:
         seed = int(config["experiment"]["seed"])
         _seed_everything(seed + rank)
@@ -230,6 +252,12 @@ def run_training(
             output_dir = config_output
             if rank == 0:
                 output_dir.mkdir(parents=True, exist_ok=True)
+        if resuming and rank == 0:
+            # Audit acceptance #6: two processes must not resume the same run
+            # concurrently (they would both load the same checkpoint and
+            # interleave writes). An O_EXCL lock makes the second start fail.
+            assert output_dir is not None
+            resume_lock = acquire_resume_lock(output_dir)
         if rank == 0:
             _write_resolved_config(output_dir, config)
             effective_run_id = _write_run_manifest(
@@ -502,7 +530,7 @@ def run_training(
                 )
                 from game_cls.model.trainable_rules import rules_fingerprint
 
-                peek = torch.load(resume_path, map_location="cpu", weights_only=False)
+                peek = torch.load(resume_path, map_location="cpu", weights_only=True)
                 saved_fingerprint = peek.get("trainable_rules_fingerprint")
                 if saved_fingerprint and saved_fingerprint != rules_fingerprint(rules):
                     raise RuntimeError(
@@ -531,9 +559,14 @@ def run_training(
                     )
                 # The wrapper built above froze its Reducer around the step-0
                 # trainable set; the restored set is generally larger, so DDP
-                # has to be rebuilt before the first backward pass.
+                # has to be rebuilt before the first backward pass. No forward
+                # has run yet, so there are no gradient bucket-view aliases to
+                # release here; _rewrap_distributed still tears the wrapper down
+                # deterministically (audit P0-7).
                 if world_size > 1:
-                    model = _wrap_distributed(bare_model, device, local_rank)
+                    model = _rewrap_distributed(
+                        model, bare_model, device, local_rank
+                    )
                 optimizer = torch.optim.AdamW(
                     build_rule_groups(
                         bare_model,
@@ -692,7 +725,9 @@ def run_training(
                             # Release the gradients that alias the old
                             # Reducer's bucket views before it is discarded.
                             optimizer.zero_grad(set_to_none=True)
-                            model = _wrap_distributed(bare_model, device, local_rank)
+                            model = _rewrap_distributed(
+                                model, bare_model, device, local_rank
+                            )
                             _set_train_mode(model, config["model"])
                         old_optimizer = optimizer
                         optimizer = torch.optim.AdamW(
@@ -708,7 +743,24 @@ def run_training(
                         scheduler = _build_scheduler(
                             optimizer, config["scheduler"], total_steps
                         )
+                        # Audit P1-3: the fresh LambdaLR starts every rebuilt
+                        # group at its pre-decay LR and only recording
+                        # ``last_epoch`` does not recompute the actual group
+                        # LR, so the first optimizer step after the boundary
+                        # would use factor(0) -- a transient jump off the
+                        # continuous schedule that is catastrophic inside
+                        # warmup. Position every group at the schedule's value
+                        # for this step without an out-of-order
+                        # ``scheduler.step()``.
+                        _base_lr = max(
+                            group["initial_lr"] for group in optimizer.param_groups
+                        )
+                        _factor = _schedule_factor(
+                            config["scheduler"], total_steps, _base_lr, global_step
+                        )
                         scheduler.last_epoch = global_step
+                        for group in optimizer.param_groups:
+                            group["lr"] = group["initial_lr"] * _factor
                         # Newly unfrozen parameters are allowed to change from
                         # here on, so they must leave the frozen snapshot.
                         frozen_snapshot = _prune_unfrozen_from_snapshot(
@@ -1339,27 +1391,8 @@ def run_training(
                 step_in_epoch = 0
 
         final_is_best = False
-        restored_best = False
         final_metrics: dict = {}
         early_cfg = config.get("early_stopping") or {}
-        best_selection_path = output_dir / "checkpoints" / "model_best_selection.pth"
-        if (
-            early_cfg.get("restore_best", True)
-            and evaluation_state["early_stopping"].get("best_step")
-            and best_selection_path.is_file()
-        ):
-            state_dict = torch.load(
-                best_selection_path, map_location="cpu", weights_only=True
-            )
-            unwrap_model(model).load_state_dict(state_dict)
-            restored_best = True
-            if rank == 0:
-                print(
-                    "[EARLY-STOP] restored best weights from "
-                    f"{best_selection_path.name} "
-                    f"(step {evaluation_state['early_stopping']['best_step']})",
-                    flush=True,
-                )
         if config["evaluation"].get("val_full_at_end", True):
             already_full = (
                 evaluation_state["last_full_metrics"].get("checkpoint_step")
@@ -1432,6 +1465,31 @@ def run_training(
                 evaluation_state=evaluation_state,
                 evaluation_cfg=config["evaluation"],
             )
+        # Audit P0-1: checkpoint_last must be the true terminal training state.
+        # The save above ran before any weight swap, so its model / optimizer /
+        # scheduler / sampler / RNG / global_step are mutually consistent and
+        # ``--resume checkpoint_last`` is an exact resume. ``restore_best`` is
+        # a deployment/display concern only: the selected weights are loaded
+        # AFTER the lineage is sealed so they can never leak into ``last``.
+        restored_best = False
+        best_selection_path = output_dir / "checkpoints" / "model_best_selection.pth"
+        if (
+            early_cfg.get("restore_best", True)
+            and evaluation_state["early_stopping"].get("best_step")
+            and best_selection_path.is_file()
+        ):
+            state_dict = torch.load(
+                best_selection_path, map_location="cpu", weights_only=True
+            )
+            unwrap_model(model).load_state_dict(state_dict)
+            restored_best = True
+            if rank == 0:
+                print(
+                    "[EARLY-STOP] restored best weights from "
+                    f"{best_selection_path.name} "
+                    f"(step {evaluation_state['early_stopping']['best_step']})",
+                    flush=True,
+                )
         if tb_writer is not None:
             tb_writer.close()
         distributed_barrier()
@@ -1512,4 +1570,6 @@ def run_training(
             )
         raise
     finally:
+        if resume_lock is not None:
+            resume_lock.unlink(missing_ok=True)
         cleanup_distributed()

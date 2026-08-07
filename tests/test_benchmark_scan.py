@@ -399,14 +399,16 @@ class ReleaseGateVerificationTests(unittest.TestCase):
             gate_metrics=gate_metrics,
         )
 
-    def test_missing_report_is_a_note_not_a_failure(self) -> None:
+    def test_missing_report_is_a_failure_not_a_pass(self) -> None:
+        # Audit P0-3: a release-ready check with no benchmark report must FAIL.
+        # "PASS + UNVERIFIED" claimed release readiness with zero evidence.
         with tempfile.TemporaryDirectory() as directory:
-            code, out, _ = self._validate(
+            code, _, err = self._validate(
                 Path(directory),
                 gate_metrics={"global_fpr_at_decision_threshold": 0.01},
             )
-            self.assertEqual(code, 0)
-            self.assertIn("UNVERIFIED", out)
+            self.assertEqual(code, 2)
+            self.assertIn("no benchmark report", err)
 
     def test_unproducible_gate_name_fails_validation(self) -> None:
         # min_positive_recall is a selection knob, not an evaluator metric.
@@ -520,6 +522,231 @@ class ReleaseGateVerificationTests(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertIn("fails gate global_specificity_at_decision_threshold", err)
+
+
+class ReleaseCheckTests(unittest.TestCase):
+    """Audit P0-4: a release PASS must be bound to one exact checkpoint.
+
+    ``config validate --release`` only proves the contract and that some
+    benchmark exists; ``release check --run --checkpoint`` refuses to let a
+    later run's checkpoint borrow a PASS earned by another artifact.
+    """
+
+    def _run_dir(self, base: Path, name: str, config: dict) -> Path:
+        run_dir = base / name
+        (run_dir / "checkpoints").mkdir(parents=True)
+        (run_dir / "checkpoints" / "model_best_selection.pth").write_bytes(
+            b"dummy-model-bytes"
+        )
+        (run_dir / "resolved_config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return run_dir
+
+    def _release_config(self, base: Path) -> dict:
+        from game_cls.config import load_config
+
+        config = load_config("configs/recipes/example_debug.yaml")
+        config["experiment"]["output_dir"] = str(base / "runs")
+        config["benchmark"] = {
+            "output_dir": str(base / "benchmarks"),
+            "gate_metrics": {"global_fpr_at_decision_threshold": 0.01},
+        }
+        config.setdefault("evaluation", {})["minimum_worst_game_f1"] = 0.75
+        return config
+
+    def _bound_report(self, base: Path, checkpoint_sha: str, gate_metrics: dict) -> None:
+        from game_cls.reports.benchmark import check_gates, write_benchmark_report
+
+        metrics = {"sample_count": 100, "global_fpr_at_decision_threshold": 0.004}
+        write_benchmark_report(
+            base / "benchmarks",
+            run_id="run-1",
+            checkpoint_alias="best_selection",
+            metrics=metrics,
+            gates=check_gates(metrics, gate_metrics),
+            grouped_metrics=None,
+            gate_metrics=gate_metrics,
+            checkpoint_sha256=checkpoint_sha,
+        )
+
+    def test_release_check_passes_only_for_the_bound_checkpoint(self) -> None:
+        import hashlib
+
+        from game_cls.cli.config_tools import cmd_release_check
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config = self._release_config(base)
+            run_dir = self._run_dir(base, "run-1", config)
+            checkpoint = run_dir / "checkpoints" / "model_best_selection.pth"
+            gate_metrics = config["benchmark"]["gate_metrics"]
+            self._bound_report(
+                base,
+                hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                gate_metrics,
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": str(run_dir),
+                    "checkpoint": "best_selection",
+                    "runs_root": str(base),
+                    "config": None,
+                },
+            )()
+            self.assertEqual(cmd_release_check(args), 0)
+            # A DIFFERENT artifact (different bytes => different sha) has no
+            # bound PASS and must fail -- it cannot borrow the run's PASS.
+            checkpoint.write_bytes(b"different-model-bytes")
+            self.assertEqual(cmd_release_check(args), 2)
+
+    def test_release_check_fails_without_any_report(self) -> None:
+        from game_cls.cli.config_tools import cmd_release_check
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config = self._release_config(base)
+            run_dir = self._run_dir(base, "run-1", config)
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": str(run_dir),
+                    "checkpoint": "best_selection",
+                    "runs_root": str(base),
+                    "config": None,
+                },
+            )()
+            self.assertEqual(cmd_release_check(args), 2)
+
+
+class ExportGateBindingTests(unittest.TestCase):
+    """Audit P0-4: export refuses an artifact without its own gate PASS."""
+
+    def _run_with_gate(self, base: Path, passed: bool) -> Path:
+        import hashlib
+
+        import torch
+
+        from game_cls.config import load_config
+        from game_cls.model.builder import build_demo_model
+
+        run_dir = base / "run"
+        (run_dir / "checkpoints").mkdir(parents=True)
+        checkpoint = run_dir / "checkpoints" / "model_best_selection.pth"
+        torch.save(build_demo_model({}).state_dict(), checkpoint)
+        config = load_config("configs/recipes/example_debug.yaml")
+        config["experiment"]["output_dir"] = str(run_dir)
+        config["export"]["output_dir"] = str(base / "exports")
+        (run_dir / "resolved_config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (run_dir / "benchmark_gate.json").write_text(
+            json.dumps(
+                {
+                    "passed": passed,
+                    "checkpoint": "best_selection",
+                    "checkpoint_sha256": hashlib.sha256(
+                        checkpoint.read_bytes()
+                    ).hexdigest(),
+                    "violations": [{"metric": "global_fpr"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    def test_export_blocks_when_gate_failed(self) -> None:
+        from game_cls.cli.export import cmd_export
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run_dir = self._run_with_gate(base, passed=False)
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": str(run_dir),
+                    "runs_root": str(base),
+                    "config": None,
+                    "checkpoint": "best_selection",
+                    "format": "weights",
+                    "out": str(base / "exports"),
+                    "skip_gate": False,
+                },
+            )()
+            self.assertEqual(cmd_export(args), 2)
+
+    def test_export_blocks_a_checkpoint_without_a_bound_pass(self) -> None:
+        import torch
+
+        from game_cls.cli.export import cmd_export
+        from game_cls.model.builder import build_demo_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run_dir = self._run_with_gate(base, passed=True)
+            # A different artifact: a valid model whose bytes differ, so the
+            # gate PASS bound to the original is not this artifact's PASS.
+            checkpoint = run_dir / "checkpoints" / "model_best_selection.pth"
+            other = build_demo_model({})
+            with torch.no_grad():
+                for parameter in other.parameters():
+                    parameter.add_(1.0)
+            torch.save(other.state_dict(), checkpoint)
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": str(run_dir),
+                    "runs_root": str(base),
+                    "config": None,
+                    "checkpoint": "best_selection",
+                    "format": "weights",
+                    "out": str(base / "exports"),
+                    "skip_gate": False,
+                },
+            )()
+            self.assertEqual(cmd_export(args), 2)
+
+    def test_export_skips_gate_with_flag(self) -> None:
+        import torch
+
+        from game_cls.cli.export import cmd_export
+        from game_cls.config import load_config
+        from game_cls.model.builder import build_demo_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            run_dir = base / "run"
+            (run_dir / "checkpoints").mkdir(parents=True)
+            torch.save(
+                build_demo_model({}).state_dict(),
+                run_dir / "checkpoints" / "model_best_selection.pth",
+            )
+            config = load_config("configs/recipes/example_debug.yaml")
+            config["experiment"]["output_dir"] = str(run_dir)
+            config["export"]["output_dir"] = str(base / "exports")
+            (run_dir / "resolved_config.json").write_text(
+                json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": str(run_dir),
+                    "runs_root": str(base),
+                    "config": None,
+                    "checkpoint": "best_selection",
+                    "format": "weights",
+                    "out": str(base / "exports"),
+                    "skip_gate": True,
+                },
+            )()
+            # --skip-gate explicitly opts out of the gate.
+            self.assertEqual(cmd_export(args), 0)
 
 
 if __name__ == "__main__":

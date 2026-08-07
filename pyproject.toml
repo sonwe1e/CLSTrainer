@@ -24,6 +24,18 @@ cls-trainer = "game_cls.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Audit PR-F: ship the recipe/profile/preset config tree inside the wheel so a
+# clean venv install (no repo checkout, no ./configs) can run
+# `init -> config validate -> synthetic train`. game_cls.config._configs_root()
+# falls back to this installed tree when CWD ./configs is absent.
+[tool.setuptools.data-files]
+"game_cls/configs/task_profiles" = ["configs/task_profiles/*.yaml"]
+"game_cls/configs/profiles" = ["configs/profiles/*.yaml"]
+"game_cls/configs/recipes" = ["configs/recipes/*.yaml"]
+"game_cls/configs/presets/augmentation" = ["configs/presets/augmentation/*.yaml"]
+"game_cls/configs/presets/dataloader" = ["configs/presets/dataloader/*.yaml"]
+"game_cls/configs/presets/evaluation" = ["configs/presets/evaluation/*.yaml"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

@@ -51,6 +51,7 @@ def _pair_references(
             "game": entry.game,
             "label": entry.label,
             "video_id": entry.video_id,
+            "source_video_uid": entry.source_video_uid,
             "frame0_id": frame0_id,
             "frame1_id": frame1_id,
             "delta": request.delta,

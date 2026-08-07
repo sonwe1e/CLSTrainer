@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,22 @@ from pathlib import Path
 import numpy as np
 
 from .records import FrameRecord
+
+
+def video_content_id(frame_count: int, ordered_content_hashes: list[str]) -> str | None:
+    """Deterministic content signature of a video (audit P0-5).
+
+    The signature hashes the frame count plus the per-frame content SHA-256s in
+    frame order, so two videos with coincidentally equal local numbering but
+    different pixels get distinct canonical uids even though the source
+    identity namespaces stay audit-boundary-only. Returns ``None`` when any
+    frame lacks a content hash, in which case the caller falls back to the
+    name-based uid.
+    """
+    if not ordered_content_hashes or any(not h for h in ordered_content_hashes):
+        return None
+    payload = str(frame_count) + "|" + "|".join(ordered_content_hashes)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -19,6 +36,13 @@ class VideoEntry:
     frame_paths: tuple[str, ...] = ()
     frame_locations: np.ndarray | None = None
     video_directory: str = ""
+    # The canonical, content-anchored source-video identity, computed once at
+    # indexing time and persisted (audit P0-5). Every consumer (sidecar join,
+    # hard-negative mining, subtype eval, error report) reads this instead of
+    # re-deriving ``game::video_id``, so coincidentally equal train/test local
+    # numbering can never collapse two distinct videos into one key. Empty when
+    # read from a legacy parquet that predates the column.
+    canonical_source_video_uid: str = ""
     # Optional per-video metadata joined from the sidecar AFTER split
     # (step5 P2). Never part of split/dedup identity; defaults keep the
     # legacy behavior byte-identical when no sidecar is configured.
@@ -27,7 +51,11 @@ class VideoEntry:
 
     @property
     def source_video_uid(self) -> str:
-        return f"{self.game}::{self.video_id}"
+        # The persisted canonical identity; the name-based fallback keeps the
+        # label so every consumer sees one consistent format.
+        return self.canonical_source_video_uid or (
+            f"{self.game}::{self.label}::{self.video_id}"
+        )
 
     def _reference(self, position: int) -> str | int:
         if self.frame_locations is not None:
@@ -91,6 +119,18 @@ def build_video_entries(
             )
             for delta in deltas
         }
+        # Audit P0-5: compute the content-anchored canonical uid here, once,
+        # from the ordered per-frame content hashes. The content signature
+        # distinguishes coincidentally equal numbering across distinct pools
+        # without touching the audit-only namespace dimension.
+        content_id = video_content_id(
+            len(ordered), [item.content_sha256 for item in ordered]
+        )
+        canonical_uid = (
+            f"{game}::{int(label)}::{video_id}#{content_id}"
+            if content_id is not None
+            else f"{game}::{int(label)}::{video_id}"
+        )
         entries.append(
             VideoEntry(
                 game=game,
@@ -100,6 +140,7 @@ def build_video_entries(
                 valid_start_positions=valid,
                 frame_paths=frame_paths,
                 video_directory=video_directory,
+                canonical_source_video_uid=canonical_uid,
             )
         )
     return entries
@@ -150,6 +191,10 @@ def read_video_entries_parquet(
                             else None
                         ),
                         video_directory=row.get("video_directory") or "",
+                        canonical_source_video_uid=row.get(
+                            "canonical_source_video_uid"
+                        )
+                        or "",
                         negative_subtype=row.get("negative_subtype"),
                         sample_weight=float(row.get("sample_weight", 1.0)),
                     )
@@ -200,6 +245,7 @@ def write_video_entries_parquet(
                 else None
             ),
             "video_directory": entry.video_directory or None,
+            "canonical_source_video_uid": entry.canonical_source_video_uid or None,
             "negative_subtype": entry.negative_subtype,
             "sample_weight": entry.sample_weight,
         }
@@ -224,5 +270,6 @@ def video_index_memory_bytes(entries: Iterable[VideoEntry]) -> int:
         + (entry.frame_locations.nbytes if entry.frame_locations is not None else 0)
         + sum(len(path.encode("utf-8")) for path in entry.frame_paths)
         + len(entry.video_directory.encode("utf-8"))
+        + len(entry.canonical_source_video_uid.encode("utf-8"))
         for entry in entries
     )

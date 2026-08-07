@@ -28,6 +28,23 @@ class ProductionConfigTests(unittest.TestCase):
             config["model"]["checkpoint_path"] = str(checkpoint)
             validate_training_config(config)
 
+    def test_smoke_mode_relaxes_the_full_validation_gate(self) -> None:
+        # Audit PR-E: the NPU smoke stages disable full validation on purpose;
+        # experiment.smoke_mode explicitly lifts the production safety policy
+        # instead of the two fighting each other.
+        config = load_config("configs/recipes/game_cls_production.yaml")
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "base.pth"
+            checkpoint.write_bytes(b"checkpoint")
+            config["model"]["factory"] = "real_model.factory:build"
+            config["model"]["checkpoint_path"] = str(checkpoint)
+            config["evaluation"]["val_full_every_steps"] = 0
+            config["evaluation"]["val_full_at_end"] = False
+            with self.assertRaisesRegex(RuntimeError, "full-validation"):
+                validate_training_config(config)
+            config["experiment"]["smoke_mode"] = True
+            validate_training_config(config)
+
 
 @unittest.skipIf(torch is None, "torch is not installed")
 class ProductionCheckpointTests(unittest.TestCase):

@@ -163,7 +163,16 @@ def _maybe_prepare_split(config: dict[str, Any]) -> None:
             "run 'cls-trainer dataset prepare' separately first. Missing "
             "artifacts: " + ", ".join(missing)
         )
-    _run_split_prepare(config, source_root, test_root)
+    # Audit PR-C: write into the CONFIGURED index directory, not the
+    # CWD-relative ./indexes default -- otherwise a config pointing
+    # data.train_index at /data/project/indexes_v2 would "prepare successfully"
+    # while the configured paths stayed missing and training still refused.
+    configured_index_dir = Path(
+        data_config.get("train_index", "indexes/train_frames.parquet")
+    ).parent
+    _run_split_prepare(
+        config, source_root, test_root, output_dir=str(configured_index_dir)
+    )
 
 
 def cmd_dataset_prepare(args: argparse.Namespace) -> int:
@@ -305,6 +314,11 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
         args.output_dir,
         image_spec=ImageSpec.from_config(config["data"]),
         images_per_shard=args.images_per_shard,
+        # Audit P0-6: bind the shards to the exact index/audit/split-manifest
+        # they were generated from, so a regenerated index with stale shards is
+        # refused at DataLoader creation.
+        audit_path=config["data"].get("audit_path"),
+        split_manifest_path=(config["data"].get("split") or {}).get("manifest"),
     )
     print(
         json.dumps(

@@ -20,6 +20,9 @@ def _fast_training_overrides(output_dir: str) -> dict:
     return {
         "device": {"accelerator": "cpu"},
         "experiment": {"output_dir": output_dir},
+        # No warmup: max_steps=2 would otherwise trip the live
+        # scheduler.warmup_steps <= train.max_steps check (audit P1-5).
+        "scheduler": {"warmup_steps": 0},
         "train": {
             "max_steps": 2,
             "steps_per_epoch": 2,
@@ -349,6 +352,7 @@ class CliWorkflowTests(unittest.TestCase):
                 "configs/recipes/example_debug.yaml",
                 "device.accelerator=cpu",
                 f"experiment.output_dir={root}",
+                "scheduler.warmup_steps=0",
                 "train.max_steps=2",
                 "train.steps_per_epoch=2",
                 "train.log_every_steps=1",

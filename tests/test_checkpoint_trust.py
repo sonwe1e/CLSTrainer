@@ -60,6 +60,44 @@ class CheckpointTrustTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cls_training_checkpoint"):
                 restore_training_checkpoint(path, model)
 
+    def test_marker_cannot_smuggle_pickled_code(self) -> None:
+        """Audit P0-2: a marker-carrying hostile pickle must not execute.
+
+        The old boundary loaded with weights_only=False and checked the
+        ``cls_training_checkpoint`` marker only AFTER unpickling, so a hostile
+        payload that also embeds the marker executed before the check. Internal
+        checkpoints now load with weights_only=True, so the restricted
+        unpickler refuses the payload during deserialization; the marker must
+        not weaken that boundary.
+        """
+        import os
+        import pickle
+
+        from game_cls.engine.checkpoint import restore_training_checkpoint
+        from game_cls.model.builder import build_demo_model
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker_file = root / "pwned.txt"
+            evil = root / "evil_marked.pth"
+            with evil.open("wb") as stream:
+                pickle.dump(
+                    {
+                        "cls_training_checkpoint": True,
+                        "model": {
+                            "__reduce__": (
+                                os.system,
+                                (f"echo pwned > {marker_file}",),
+                            )
+                        },
+                    },
+                    stream,
+                )
+            model = build_demo_model({"num_classes": 2})
+            with self.assertRaises((RuntimeError, pickle.UnpicklingError)):
+                restore_training_checkpoint(evil, model)
+            self.assertFalse(marker_file.exists(), "hostile pickle executed")
+
     def test_internal_checkpoint_with_marker_restores(self) -> None:
         from game_cls.engine.checkpoint import (
             capture_random_state,
@@ -90,7 +128,7 @@ class CheckpointTrustTests(unittest.TestCase):
             payload = torch.load(
                 output / "checkpoint_last.pth",
                 map_location="cpu",
-                weights_only=False,
+                weights_only=True,
             )
             self.assertTrue(payload.get("cls_training_checkpoint"))
             restored = restore_training_checkpoint(

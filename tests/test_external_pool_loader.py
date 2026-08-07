@@ -77,7 +77,7 @@ def _sidecar(root: Path, name: str = "pool_metadata.parquet") -> Path:
 
     path = root / name
     write_metadata_sidecar(
-        [{"source_video_uid": "game_a::01", "negative_subtype": "bridge"}], path
+        [{"source_video_uid": "game_a::0::01", "negative_subtype": "bridge"}], path
     )
     return path
 
@@ -129,7 +129,7 @@ class ExternalPoolLoaderTests(unittest.TestCase):
             self.assertIsInstance(loader.dataset.decoder, PackedUint8Backend)
             # The sidecar was joined, so subtype grouping is live.
             by_uid = {video.source_video_uid: video for video in videos}
-            self.assertEqual(by_uid["game_a::01"].negative_subtype, "bridge")
+            self.assertEqual(by_uid["game_a::0::01"].negative_subtype, "bridge")
             self.assertIn("game_label_subtype", loader.dataset.group_catalogs)
             # And the pairs actually decode at the configured shape.
             batch = next(iter(loader))

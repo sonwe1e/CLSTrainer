@@ -113,17 +113,24 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
 
 
 def _release_gate(config: dict) -> int:
-    """Validate the release contract: baseline, gate spec and real report.
+    """Validate the release contract: baseline, gate spec and a real report.
 
     Beyond "a gate exists", this checks the gate metric names and comparison
-    operators (so a gate cannot be unpassable by construction) and re-judges
-    the newest benchmark report under the configured gates, so a config whose
-    recorded run failed its own gates cannot be called releasable.
+    operators (so a gate cannot be unpassable by construction) and requires at
+    least one benchmark report to exist. A config with NO benchmark is not
+    release-ready and FAILS (audit P0-3) -- "PASS + UNVERIFIED" was a lie.
+
+    This command validates the CONTRACT and the existence of a benchmark; the
+    artifact-level gate is ``cls-trainer release check --run ... --checkpoint
+    ...``, which binds a PASS to the exact checkpoint SHA (audit P0-4).
     """
-    from game_cls.reports.benchmark import check_gates, validate_gate_metrics
+    from game_cls.reports.benchmark import (
+        check_gates,
+        gate_spec_fingerprint,
+        validate_gate_metrics,
+    )
 
     problems: list[str] = []
-    notes: list[str] = []
     evaluation_cfg = config["evaluation"]
     if evaluation_cfg.get("minimum_worst_game_f1") is None:
         problems.append(
@@ -142,10 +149,12 @@ def _release_gate(config: dict) -> int:
         Path(benchmark_cfg.get("output_dir", "benchmarks"))
     )
     if report is None:
-        notes.append(
-            "no benchmark report under "
-            f"{benchmark_cfg.get('output_dir', 'benchmarks')}; gates are "
-            "UNVERIFIED. Run 'cls-trainer benchmark evaluate' before release."
+        # Audit P0-3: a release-ready check with no benchmark must FAIL, not
+        # print PASS with an UNVERIFIED note.
+        problems.append(
+            f"no benchmark report under "
+            f"{benchmark_cfg.get('output_dir', 'benchmarks')}; run "
+            "'cls-trainer benchmark evaluate' before checking release."
         )
     elif not problems:
         problems.extend(_verify_report_against_gates(report, gate_metrics, check_gates))
@@ -154,11 +163,31 @@ def _release_gate(config: dict) -> int:
         for problem in problems:
             print(f"  - {problem}", file=sys.stderr)
         return 2
+    print("  release contract : OK")
     print("  release gate      : PASS")
-    for note in notes:
-        print(f"  release gate note : {note}")
     if report is not None:
+        payload = _read_report_payload(report)
         print(f"  benchmark report  : {report}")
+        checkpoint_sha = (payload or {}).get("checkpoint_sha256")
+        if checkpoint_sha:
+            print(f"  checkpoint sha256 : {checkpoint_sha}")
+        print(
+            "  note              : PASS is for the newest report; run "
+            "'cls-trainer release check --run <run> --checkpoint <alias|path>' "
+            "to bind a PASS to one exact checkpoint (audit P0-4)."
+        )
+        if (
+            payload
+            and payload.get("gate_spec_fingerprint")
+            and gate_metrics
+            and payload.get("gate_spec_fingerprint")
+            != gate_spec_fingerprint(gate_metrics)
+        ):
+            print(
+                "  note              : the report's gate contract differs "
+                "from this config; re-judging below.",
+                    file=sys.stderr,
+                )
     return 0
 
 
@@ -212,6 +241,140 @@ def _verify_report_against_gates(
             "the gate cannot be verified."
         )
     return problems
+
+
+def _read_report_payload(report: Path) -> dict | None:
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_checkpoint_path(run_dir: Path, name: str) -> str | None:
+    """Resolve a checkpoint alias/path to the artifact file without loading it."""
+    direct = Path(name)
+    if direct.is_file():
+        return str(direct)
+    checkpoints = run_dir / "checkpoints"
+    for candidate in (f"model_{name}.pth", f"checkpoint_{name}.pth"):
+        path = checkpoints / candidate
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _find_report_for_checkpoint(
+    output_dir: Path,
+    *,
+    checkpoint_sha: str,
+    run_id: str,
+    checkpoint_alias: str,
+) -> Path | None:
+    """The report whose ``checkpoint_sha256`` matches the target artifact.
+
+    Legacy reports predate the hash column, so fall back to an exact run_id +
+    alias match; a report that carries a DIFFERENT checkpoint hash is never a
+    match, so a later run's PASS cannot be borrowed (audit P0-4).
+    """
+    if not output_dir.is_dir():
+        return None
+    candidates = list(output_dir.glob("*/report.json"))
+    for report in candidates:
+        payload = _read_report_payload(report)
+        if not payload:
+            continue
+        if payload.get("checkpoint_sha256") == checkpoint_sha:
+            return report
+    # Legacy fallback: a report that predates the hash column is matched by
+    # exact run_id + alias. A report that CARRIES a different checkpoint hash
+    # is never a match -- a later artifact cannot borrow its PASS.
+    for report in candidates:
+        payload = _read_report_payload(report)
+        if not payload:
+            continue
+        if (
+            not payload.get("checkpoint_sha256")
+            and payload.get("run_id") == run_id
+            and payload.get("checkpoint") == checkpoint_alias
+        ):
+            return report
+    return None
+
+
+def cmd_release_check(args: argparse.Namespace) -> int:
+    """Bind a release PASS to one exact checkpoint (audit P0-4).
+
+    ``config validate --release`` can only prove the contract is well-formed
+    and that SOME benchmark exists. This command resolves a specific run +
+    checkpoint, hashes the checkpoint, and refuses to borrow a PASS earned by
+    any other artifact -- the acceptance "#5" gate for release/export.
+    """
+    from game_cls.cli.common import _resolve_run_dir
+    from game_cls.reports.benchmark import (
+        check_gates,
+        file_sha256,
+        validate_gate_metrics,
+    )
+
+    run_dir = _resolve_run_dir(args.run, Path(args.runs_root or "runs"))
+    if not run_dir.is_dir():
+        print(f"Run not found: {run_dir}", file=sys.stderr)
+        return 2
+    config_source = args.config or str(run_dir / "resolved_config.json")
+    if not Path(config_source).is_file():
+        print(
+            f"No config found for run {run_dir}: pass --config or ensure "
+            f"{run_dir / 'resolved_config.json'} exists.",
+            file=sys.stderr,
+        )
+        return 2
+    from game_cls.config import load_config
+
+    config = load_config(config_source)
+    benchmark_cfg = config.get("benchmark") or {}
+    gate_metrics = benchmark_cfg.get("gate_metrics") or {}
+    problems = list(validate_gate_metrics(gate_metrics))
+    if problems:
+        for problem in problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    checkpoint_path = _resolve_checkpoint_path(run_dir, args.checkpoint)
+    if checkpoint_path is None:
+        print(
+            f"Checkpoint '{args.checkpoint}' not found under "
+            f"{run_dir / 'checkpoints'}.",
+            file=sys.stderr,
+        )
+        return 2
+    checkpoint_sha = file_sha256(checkpoint_path)
+    report = _find_report_for_checkpoint(
+        Path(benchmark_cfg.get("output_dir", "benchmarks")),
+        checkpoint_sha=checkpoint_sha,
+        run_id=run_dir.name,
+        checkpoint_alias=args.checkpoint,
+    )
+    if report is None:
+        print(
+            f"Release check FAILED: no benchmark PASS is bound to checkpoint "
+            f"sha256={checkpoint_sha} ({checkpoint_path}). Run "
+            "'cls-trainer benchmark evaluate' against this exact checkpoint "
+            "before releasing it.",
+            file=sys.stderr,
+        )
+        return 2
+    verdict = _verify_report_against_gates(report, gate_metrics, check_gates)
+    if verdict:
+        print("Release check FAILED:", file=sys.stderr)
+        for problem in verdict:
+            print(f"  - {problem}", file=sys.stderr)
+        return 2
+    print("  release check    : PASS")
+    print(f"  run_id           : {run_dir.name}")
+    print(f"  checkpoint       : {checkpoint_path}")
+    print(f"  checkpoint sha256: {checkpoint_sha}")
+    print(f"  benchmark report : {report}")
+    return 0
 
 
 def cmd_config_reference(args: argparse.Namespace) -> int:
