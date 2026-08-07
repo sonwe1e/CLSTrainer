@@ -32,7 +32,7 @@ class TrainableRulesResumeTests(unittest.TestCase):
     def _config(self, directory: str, resume_path: str | None = None) -> dict:
         from game_cls.config import load_config
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["model"]["trainable_rules"] = RULES
         config["train"].update(

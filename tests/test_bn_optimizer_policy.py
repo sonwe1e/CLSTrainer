@@ -48,7 +48,7 @@ class BatchNormAndOptimizerTests(unittest.TestCase):
         from game_cls.config import load_config
         from game_cls.engine.trainer import validate_training_config
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config.setdefault("distributed", {})["enabled"] = True
         config["model"]["freeze_cls_batchnorm_stats"] = False
         with self.assertRaisesRegex(RuntimeError, "SyncBatchNorm"):

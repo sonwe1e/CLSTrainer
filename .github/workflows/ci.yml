@@ -41,7 +41,7 @@ jobs:
           && test -n "$(ls dist/*.whl 2>/dev/null)"
       - name: Synthetic training smoke
         run: >-
-          python tools/train.py --config configs/cuda_debug.yaml
+          python tools/train.py --config configs/recipes/example_debug.yaml
           train.max_steps=2
           evaluation.val_quick_every_steps=1
           evaluation.val_full_every_steps=2

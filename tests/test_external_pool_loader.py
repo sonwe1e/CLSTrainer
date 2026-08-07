@@ -85,7 +85,7 @@ def _sidecar(root: Path, name: str = "pool_metadata.parquet") -> Path:
 def _base_config(output_dir: Path) -> dict:
     from game_cls.config import load_config
 
-    config = load_config("configs/cuda_debug.yaml")
+    config = load_config("configs/recipes/example_debug.yaml")
     config["experiment"]["output_dir"] = str(output_dir / "runs")
     config["data"].update({"synthetic": False, "strict_audit": False})
     config["data"]["width"] = WIDTH

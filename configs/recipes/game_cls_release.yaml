@@ -116,12 +116,8 @@ train:
   log_every_steps: 50
 
 evaluation:
-  selection_mode: constrained
-  max_global_fpr: 0.01
-  max_worst_game_fpr: 0.02
-  min_positive_recall: 0.8
-  max_fpr_for_recall: 0.01
-  tail_calibration_enabled: true
+  # Release-specific floor on top of the evaluation/production preset's
+  # constrained selection.
   minimum_worst_game_f1: 0.75
 
 checkpoint:

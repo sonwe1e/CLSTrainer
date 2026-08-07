@@ -52,7 +52,7 @@ class BenchmarkDataTests(unittest.TestCase):
         from game_cls.config import load_config
 
         index = str(self._dataset(directory))
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(directory / "runs")
         config["data"].update(
             {

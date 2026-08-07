@@ -1,15 +1,18 @@
 # Data-free NPU preflight (step6 P0-4).
 #
-# The npu_1p / npu_8p configs point at production indexes, checkpoints and
-# a real dataset, so they can only run on a runner that has already been
-# provisioned. That made the NPU workflow unrepeatable: a fresh Ascend host
-# could not tell "the NPU stack is broken" from "this box has no data".
+# The production recipe (configs/recipes/game_cls_production.yaml) points at
+# production indexes, checkpoints and a real dataset, so it can only run on a
+# runner that has already been provisioned. That made the NPU workflow
+# unrepeatable: a fresh Ascend host could not tell "the NPU stack is broken"
+# from "this box has no data".
 #
-# This layer keeps the npu accelerator, HCCL and BF16 autocast paths but
+# This recipe keeps the npu accelerator, HCCL and BF16 autocast paths but
 # swaps in the synthetic dataset, so any Ascend runner can execute it. It
-# proves the device, the operators, DDP and save/resume work; it says
-# nothing about model quality and must never gate a release on its own.
-base: npu_production.yaml
+# proves the device, the operators, DDP and save/resume work; it says nothing
+# about model quality and must never gate a release on its own. The machine
+# flavor comes from the profile: npu_1p here; override `profile=npu_8p` for
+# the HCCL/DDP path.
+profile: npu_1p
 
 experiment:
   name: npu_synthetic_smoke
@@ -29,8 +32,8 @@ data:
     enabled: false
 
 model:
-  # npu_production.yaml ships a placeholder factory that only resolves once
-  # the deployment model is wired in. The preflight must run on a bare
+  # game_cls_production.yaml ships a placeholder factory that only resolves
+  # once the deployment model is wired in. The preflight must run on a bare
   # runner, so it uses the in-repo demo model: this tier proves the NPU
   # stack (operators, BF16, HCCL, DDP, save/resume), not the real network.
   factory: game_cls.model.builder:build_demo_model

@@ -169,7 +169,7 @@ def _end_to_end_worker(
 
     loop_module._wrap_distributed = _spy_wrap
 
-    config = load_config("configs/cuda_debug.yaml")
+    config = load_config("configs/recipes/example_debug.yaml")
     config["experiment"]["output_dir"] = str(Path(output_dir) / "run")
     config["device"]["accelerator"] = "cpu"
     config["distributed"] = {"enabled": True, "backend": "gloo"}

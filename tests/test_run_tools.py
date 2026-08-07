@@ -66,7 +66,7 @@ class RunToolsTests(unittest.TestCase):
             _cli(
                 "train",
                 "--config",
-                "configs/cuda_debug.yaml",
+                "configs/recipes/example_debug.yaml",
                 *_base_overrides(str(root)),
             )
             (run_a,) = _run_dirs(root)
@@ -237,7 +237,7 @@ class RunToolsTests(unittest.TestCase):
             _cli(
                 "train",
                 "--config",
-                "configs/cuda_debug.yaml",
+                "configs/recipes/example_debug.yaml",
                 *_base_overrides(str(root)),
             )
             (run_a,) = _run_dirs(root)

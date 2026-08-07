@@ -19,7 +19,7 @@ class ExportVerifyTests(unittest.TestCase):
         from game_cls.config import load_config
         from game_cls.engine.trainer import run_training
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["train"].update(
             {
@@ -85,7 +85,7 @@ class ExportVerifyTests(unittest.TestCase):
         """Write a resolved config snapshot with data.* overridden."""
         from game_cls.config import load_config
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["data"].update(data_overrides)
         path = base / "export_config.json"
         path.write_text(

@@ -117,10 +117,9 @@ class RecipeLayerTests(unittest.TestCase):
         self.assertEqual(config["device"]["accelerator"], "npu")
         self.assertTrue(config["distributed"]["enabled"])
         self.assertEqual(config["evaluation"]["selection_metric"], "composite")
-
-    def test_legacy_configs_still_load(self) -> None:
-        config = load_config("configs/npu_1p.yaml")
-        self.assertEqual(config["device"]["accelerator"], "npu")
+        # Constrained low-FPR selection comes from the production preset, not
+        # from a recipe-local copy.
+        self.assertEqual(config["evaluation"]["selection_mode"], "constrained")
 
 
 class InitCommandTests(unittest.TestCase):

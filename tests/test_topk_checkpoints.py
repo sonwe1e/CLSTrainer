@@ -59,7 +59,7 @@ class TopKCheckpointTests(unittest.TestCase):
     def _config(self, directory: str, save_topk: int) -> dict:
         from game_cls.config import load_config
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["train"].update(
             {
@@ -249,7 +249,7 @@ class ConstrainedTopKTests(unittest.TestCase):
         from game_cls.config import load_config
         from game_cls.engine.trainer import run_training
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["train"].update(
             {

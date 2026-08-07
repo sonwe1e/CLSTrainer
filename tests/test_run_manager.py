@@ -54,7 +54,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
             root = Path(directory) / "runs_root"
             created = []
             for _ in range(2):
-                config = load_config("configs/cuda_debug.yaml")
+                config = load_config("configs/recipes/example_debug.yaml")
                 _apply(config, _fast_training_overrides(str(root)))
                 config["experiment"]["run_mode"] = "unique"
                 result = run_training(config)
@@ -94,7 +94,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fixed_run"
-            config = load_config("configs/cuda_debug.yaml")
+            config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(output)))
             result = run_training(config)
             self.assertEqual(Path(result["output_dir"]), output)
@@ -106,7 +106,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
-            config = load_config("configs/cuda_debug.yaml")
+            config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(root)))
             config["experiment"]["run_mode"] = "unique"
             config["train"]["resume_path"] = str(root / "does_not_exist.pth")
@@ -136,14 +136,14 @@ class UniqueRunDirectoryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
-            config = load_config("configs/cuda_debug.yaml")
+            config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(root)))
             config["experiment"]["run_mode"] = "unique"
             config["checkpoint"]["save_last_every_steps"] = 1
             first = run_training(config)
             run_dir = Path(first["output_dir"])
 
-            resumed = load_config("configs/cuda_debug.yaml")
+            resumed = load_config("configs/recipes/example_debug.yaml")
             _apply(resumed, _fast_training_overrides(str(root)))
             resumed["experiment"]["run_mode"] = "fixed"
             resumed["experiment"]["output_dir"] = str(run_dir)
@@ -182,7 +182,7 @@ class RunIndexSelectionRecordTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
-            config = load_config("configs/cuda_debug.yaml")
+            config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(root)))
             config["experiment"]["run_mode"] = "unique"
             config["train"].update({"max_steps": 20, "steps_per_epoch": 20})
@@ -314,7 +314,7 @@ class CliWorkflowTests(unittest.TestCase):
             output = self._run_cli(
                 "train",
                 "--config",
-                "configs/cuda_debug.yaml",
+                "configs/recipes/example_debug.yaml",
                 "--dry-run",
                 f"experiment.output_dir={directory}/root",
             )
@@ -328,7 +328,7 @@ class CliWorkflowTests(unittest.TestCase):
             "config",
             "validate",
             "--config",
-            "configs/cuda_debug.yaml",
+            "configs/recipes/example_debug.yaml",
             "optimzier.learning_rate=0.0001",
             expect_failure=True,
         )
@@ -346,7 +346,7 @@ class CliWorkflowTests(unittest.TestCase):
             output = self._run_cli(
                 "train",
                 "--config",
-                "configs/cuda_debug.yaml",
+                "configs/recipes/example_debug.yaml",
                 "device.accelerator=cpu",
                 f"experiment.output_dir={root}",
                 "train.max_steps=2",

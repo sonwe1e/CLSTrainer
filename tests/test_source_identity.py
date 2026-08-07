@@ -151,13 +151,13 @@ class SourceIdentityPrecheckTests(unittest.TestCase):
 
 class SourceIdentityConfigTests(unittest.TestCase):
     def test_config_defaults_to_game_video(self) -> None:
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         self.assertEqual(
             config["data"]["source_video_identity"]["mode"], "game_video"
         )
 
     def test_config_unknown_mode_is_rejected(self) -> None:
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["data"]["source_video_identity"]["mode"] = "game_label"
         with self.assertRaisesRegex(ConfigSchemaError, "source_video_identity"):
             finalize_config(config)

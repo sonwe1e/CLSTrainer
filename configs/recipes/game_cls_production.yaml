@@ -6,7 +6,23 @@
 #
 # Business facts (threshold 0.99, delta=2 test pairs, cls-only training,
 # 448x208 frames) come from the task profile and are intentionally absent here.
-# NPU spawn/timeout/worker rules come from the profile.
+# NPU spawn/timeout/worker rules come from the profile (npu_8p by default).
+# Low-FPR constrained selection comes from the evaluation/production preset.
+#
+# For a single NPU, override the profile on the command line:
+#   cls-trainer train --config configs/recipes/game_cls_production.yaml \
+#     profile=npu_1p experiment.output_dir=runs/game_cls_1p
+#
+# For packed_uint8 data, override the backend and shard indexes:
+#   cls-trainer train --config configs/recipes/game_cls_production.yaml \
+#     data.backend=packed_uint8 \
+#     data.train_packed_index=/local_nvme/train_packed/packed_frames.parquet \
+#     data.val_packed_index=/local_nvme/val_packed/packed_frames.parquet \
+#     data.test_packed_index=/local_nvme/test_packed/packed_frames.parquet \
+#     data.train_packed_video_index=/local_nvme/train_packed/packed_video_entries.parquet \
+#     data.val_packed_video_index=/local_nvme/val_packed/packed_video_entries.parquet \
+#     data.test_packed_video_index=/local_nvme/test_packed/packed_video_entries.parquet \
+#     data.packed_max_open_shards=16
 profile: npu_8p
 
 presets:
@@ -87,17 +103,6 @@ train:
   local_batch_size: 64
   gradient_clip_norm: 5.0
   log_every_steps: 50
-
-# Low-FPR constrained selection (step4 §三.3), overriding the composite
-# selection of the evaluation/production preset. The decision threshold
-# stays decision.threshold (0.99); metrics use neutral names.
-evaluation:
-  selection_mode: constrained
-  max_global_fpr: 0.01
-  max_worst_game_fpr: 0.02
-  min_positive_recall: 0.8
-  max_fpr_for_recall: 0.01
-  tail_calibration_enabled: true
 
 checkpoint:
   save_last_every_steps: 1000

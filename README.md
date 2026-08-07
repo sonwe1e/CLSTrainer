@@ -111,9 +111,14 @@ configs/
 │   └── evaluation/     smoke | production
 └── recipes/
     ├── example_debug.yaml                  # 合成数据，开箱即跑
-    ├── game_cls_production.yaml            # 生产模板
+    ├── npu_synthetic_smoke.yaml            # NPU 预检：合成数据，可在未上数据的 Ascend 主机运行
+    ├── game_cls_production.yaml            # 生产模板（默认 8 卡）
     └── game_cls_release.yaml               # 带 release gate 的发布模板
 ```
+
+生产模板默认 `profile: npu_8p`；单卡或 packed 数据后端通过命令行覆写切换，例如
+`profile=npu_1p experiment.output_dir=runs/game_cls_1p` 或
+`data.backend=packed_uint8`（完整覆写示例见 `game_cls_production.yaml` 头部注释）。
 
 任何配置都会先经过**严格 Schema 校验**：未知键报错并给出候选，`decision.threshold`
 是唯一业务阈值来源。完整键表见

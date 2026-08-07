@@ -8,7 +8,7 @@ unset ASCEND_LAUNCH_BLOCKING || true
 
 # Establish that the model and NPU operators work without worker processes.
 python -u tools/train.py --run-mode fixed \
-  --config configs/npu_1p.yaml \
+  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
   train.max_steps=5 \
   train.steps_per_epoch=5 \
   train.local_batch_size=2 \
@@ -26,7 +26,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Start with one spawned worker before increasing worker concurrency.
 python -u tools/train.py --run-mode fixed \
-  --config configs/npu_1p.yaml \
+  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
   train.max_steps=10 \
   train.steps_per_epoch=10 \
   train.local_batch_size=2 \
@@ -42,7 +42,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Validate spawn worker startup and the augmented training path.
 python -u tools/train.py --run-mode fixed \
-  --config configs/npu_1p.yaml \
+  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
   train.max_steps=50 \
   train.steps_per_epoch=50 \
   train.local_batch_size=8 \
@@ -58,7 +58,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Add quick evaluation with non-persistent eval workers.
 python -u tools/train.py --run-mode fixed \
-  --config configs/npu_1p.yaml \
+  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
   train.max_steps=20 \
   train.steps_per_epoch=20 \
   train.local_batch_size=8 \
@@ -74,7 +74,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Run full evaluation only after the preceding stages have passed.
 python -u tools/train.py --run-mode fixed \
-  --config configs/npu_1p.yaml \
+  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
   train.max_steps=20 \
   train.steps_per_epoch=20 \
   train.local_batch_size=8 \

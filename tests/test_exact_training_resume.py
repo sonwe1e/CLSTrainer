@@ -20,7 +20,7 @@ class ExactTrainingResumeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            base = load_config("configs/cuda_debug.yaml")
+            base = load_config("configs/recipes/example_debug.yaml")
             base["device"]["accelerator"] = "cpu"
             base["train"].update(
                 {

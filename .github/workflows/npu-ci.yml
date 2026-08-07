@@ -62,7 +62,7 @@ jobs:
       - name: Device operator probe (bincount/scatter_add_/nonzero/index_select/GradScaler)
         run: python tools/check_npu_ops.py
       - name: Doctor on the synthetic config
-        run: cls-trainer doctor --config configs/npu_synthetic_smoke.yaml
+        run: cls-trainer doctor --config configs/recipes/npu_synthetic_smoke.yaml
 
   preflight-1p:
     name: preflight / 1P synthetic
@@ -79,7 +79,7 @@ jobs:
           unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
           export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
           python -u tools/train.py --run-mode fixed \
-            --config configs/npu_synthetic_smoke.yaml \
+            --config configs/recipes/npu_synthetic_smoke.yaml \
             experiment.output_dir=runs/npu_preflight_1p
       - name: 1P synthetic resume from the saved checkpoint
         run: |
@@ -89,7 +89,7 @@ jobs:
           checkpoint=$(ls -t runs/npu_preflight_1p/*/checkpoints/checkpoint_last.pth | head -1)
           echo "resuming from ${checkpoint}"
           python -u tools/train.py --run-mode fixed \
-            --config configs/npu_synthetic_smoke.yaml \
+            --config configs/recipes/npu_synthetic_smoke.yaml \
             train.max_steps=30 \
             train.steps_per_epoch=30 \
             train.resume_path="${checkpoint}" \
@@ -120,7 +120,7 @@ jobs:
           set -euo pipefail
           torchrun --standalone --nnodes=1 --nproc_per_node=8 \
             tools/train.py --run-mode fixed \
-            --config configs/npu_synthetic_smoke.yaml \
+            --config configs/recipes/npu_synthetic_smoke.yaml \
             distributed.enabled=true \
             distributed.backend=hccl \
             train.max_steps=40 \
@@ -152,12 +152,12 @@ jobs:
       - name: Assert the runner is provisioned
         # doctor already FAILs on a missing index / audit / checkpoint, so it
         # names the missing path before any training starts.
-        run: cls-trainer doctor --config configs/npu_1p.yaml
+        run: cls-trainer doctor --config configs/recipes/game_cls_production.yaml profile=npu_1p experiment.output_dir=runs/game_cls_1p
       - name: 1P staged smoke (forward/backward/BF16/eval/save+resume)
         run: bash scripts/smoke_npu_1p.sh
       - name: 1P full training smoke
         run: |
-          python tools/train.py --config configs/npu_1p.yaml \
+          python tools/train.py --config configs/recipes/game_cls_production.yaml profile=npu_1p \
             train.max_steps=${{ github.event.inputs.max_steps }} \
             experiment.output_dir=runs/npu_ci_1p
       - name: Upload run artifacts
@@ -184,13 +184,13 @@ jobs:
         # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
         run: python -m pip install -e . --no-deps
       - name: Assert the runner is provisioned
-        run: cls-trainer doctor --config configs/npu_8p.yaml
+        run: cls-trainer doctor --config configs/recipes/game_cls_production.yaml
       - name: 8P HCCL smoke (DDP / group metrics / checkpoint)
         run: bash scripts/smoke_npu_8p.sh
       - name: 8P full training smoke
         run: |
           torchrun --standalone --nnodes=1 --nproc_per_node=8 \
-            tools/train.py --config configs/npu_8p.yaml \
+            tools/train.py --config configs/recipes/game_cls_production.yaml \
             train.max_steps=${{ github.event.inputs.max_steps }} \
             experiment.output_dir=runs/npu_ci_8p
       - name: Upload run artifacts

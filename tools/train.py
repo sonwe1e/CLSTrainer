@@ -3,7 +3,7 @@
 Thin wrapper around the cls-trainer CLI ``train`` command so existing
 script invocations keep working:
 
-    python tools/train.py --config configs/cuda_debug.yaml key=value ...
+    python tools/train.py --config configs/recipes/example_debug.yaml key=value ...
 
 Note: runs are unique by default now — each start allocates a fresh
 timestamped directory under ``experiment.output_dir``. Pass

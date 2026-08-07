@@ -155,12 +155,13 @@ def _clear_legacy_thresholds_if_overridden(
 def load_config(path: str | Path, overrides: list[str] | None = None) -> dict[str, Any]:
     """Load, merge and validate a configuration file.
 
-    Two formats are supported:
+    A config may be either:
 
-    * Legacy flat configs (``base:`` inheritance chain).
-    * Recipes: ``profile`` + optional ``task_profile``/``presets`` plus only the
+    * A recipe: ``profile`` + optional ``task_profile``/``presets`` plus only the
       fields the user actually decides. Merge order is
       task_profile -> profile -> presets -> recipe -> CLI overrides.
+    * A resolved config (JSON, e.g. a run's ``resolved_config.json``): already
+      flattened, loaded as-is.
 
     The returned config is schema-validated: unknown keys, removed keys and
     type mismatches all raise ``ConfigSchemaError``. ``decision.threshold``
@@ -219,15 +220,20 @@ def _load_raw_with_sources(
             raw = _apply_recipe_overrides(raw, recipe_overrides, config_path)
         return _load_recipe_with_sources(config_path, raw)
 
+    if "base" in raw:
+        raise ConfigSchemaError(
+            [
+                f"{config_path}: the 'base:' inheritance mechanism was removed. "
+                "Convert this file to a recipe that composes profile/presets "
+                "(see configs/recipes/ for examples)."
+            ]
+        )
+    # Non-recipe configs (e.g. a run's resolved_config.json) are already
+    # flattened and load as-is.
     sources: dict[str, str] = {}
-    base_name = raw.pop("base", None)
-    if base_name:
-        base, sources = _load_raw_with_sources(config_path.parent / base_name)
-    else:
-        base = {}
     origin = str(config_path)
     _record_sources(sources, raw, origin)
-    return deep_merge(base, raw), sources
+    return raw, sources
 
 
 def _load_recipe_with_sources(
@@ -300,7 +306,13 @@ def _load_recipe_with_sources(
                     "be plain config sections, not recipes."
                 ]
             )
-        layer_raw.pop("base", None)
+        if "base" in layer_raw:
+            raise ConfigSchemaError(
+                [
+                    f"{layer_path}: layer files cannot use 'base:'. Put the "
+                    "inheritance in the recipe (profile/presets) instead."
+                ]
+            )
         _record_sources(sources, layer_raw, str(layer_path))
         merged = deep_merge(merged, layer_raw)
     _record_sources(sources, raw, str(recipe_path))
@@ -324,9 +336,9 @@ def load_config_with_sources(
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Like ``load_config`` but also reports where each value came from.
 
-    The sources map covers the full merge tree (task_profile/profile/presets or
-    base files, plus the entry file); command line overrides are recorded
-    as ``override:<item>``.
+    The sources map covers the full merge tree (task_profile/profile/presets,
+    plus the entry file); command line overrides are recorded as
+    ``override:<item>``.
     """
     config_path = Path(path).resolve()
     overrides = list(overrides or [])

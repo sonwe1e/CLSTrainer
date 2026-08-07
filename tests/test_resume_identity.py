@@ -19,7 +19,7 @@ class ResumeIdentityTests(unittest.TestCase):
     def _config(self) -> dict:
         from game_cls.config import load_config
 
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["device"]["accelerator"] = "cpu"
         config["train"].update(
             {
@@ -166,7 +166,7 @@ class ResumeIdentityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            base = load_config("configs/cuda_debug.yaml")
+            base = load_config("configs/recipes/example_debug.yaml")
             base["device"]["accelerator"] = "cpu"
             base["train"].update(
                 {

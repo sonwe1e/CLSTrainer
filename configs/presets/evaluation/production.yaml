@@ -3,6 +3,11 @@
 # Cadence recommendation (step2 plan): with the overfitting knee around
 # 10k steps, full validation every 2000 steps resolves 8k/10k/12k; the
 # old 5000-step cadence could only see 5k/10k/15k.
+#
+# Low-FPR constrained selection (step4 §三.3) lives here as the single
+# source of truth: production recipes no longer repeat these keys. The
+# decision threshold stays decision.threshold (0.99); metrics use neutral
+# names.
 evaluation:
   train_probe_every_steps: 1000
   train_probe_pairs_per_video: 32
@@ -22,3 +27,9 @@ evaluation:
     macro_game_f1: 0.40
     worst_game_f1: 0.20
   minimum_worst_game_f1: null
+  selection_mode: constrained
+  max_global_fpr: 0.01
+  max_worst_game_fpr: 0.02
+  min_positive_recall: 0.8
+  max_fpr_for_recall: 0.01
+  tail_calibration_enabled: true

@@ -15,7 +15,7 @@ from pathlib import Path
 from game_cls.config import load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PREFLIGHT = "configs/npu_synthetic_smoke.yaml"
+PREFLIGHT = "configs/recipes/npu_synthetic_smoke.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "npu-ci.yml"
 
 

@@ -15,12 +15,12 @@ from game_cls.engine.trainer import validate_training_config
 
 class ProductionConfigTests(unittest.TestCase):
     def test_npu_config_cannot_run_with_placeholder_model(self) -> None:
-        config = load_config("configs/npu_1p.yaml")
+        config = load_config("configs/recipes/game_cls_production.yaml")
         with self.assertRaisesRegex(RuntimeError, "placeholder"):
             validate_training_config(config)
 
     def test_real_factory_and_existing_checkpoint_pass_gate(self) -> None:
-        config = load_config("configs/npu_1p.yaml")
+        config = load_config("configs/recipes/game_cls_production.yaml")
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "base.pth"
             checkpoint.write_bytes(b"checkpoint")

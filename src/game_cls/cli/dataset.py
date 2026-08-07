@@ -2,7 +2,7 @@
 
 Workflows:
 
-    cls-trainer train --config configs/npu_1p.yaml [key=value ...]
+    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
     cls-trainer train --config ... --dry-run
     cls-trainer train --resume <run_dir>
     cls-trainer config show --config ... [--with-source]

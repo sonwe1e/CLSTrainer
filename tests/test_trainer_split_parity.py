@@ -27,7 +27,7 @@ class TrainerSplitParityTests(unittest.TestCase):
         from game_cls.engine.trainer import run_training
 
         directory = tempfile.mkdtemp()
-        config = load_config("configs/cuda_debug.yaml")
+        config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
         config["train"].update(
             {
