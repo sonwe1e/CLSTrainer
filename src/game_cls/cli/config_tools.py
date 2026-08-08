@@ -251,6 +251,78 @@ def _read_report_payload(report: Path) -> dict | None:
         return None
 
 
+def _release_identity_mismatches(
+    report: Path,
+    *,
+    run_id: str,
+    config: dict,
+    gate_metrics: dict,
+) -> list[str]:
+    """Compare a report's full release identity against the current one.
+
+    Audit P0-2: matching ``checkpoint_sha256`` alone is not sufficient to bind
+    a PASS. FPR, recall and selection eligibility are functions of
+    model + threshold + challenge set + preprocessing, not of the weights
+    alone, so two runs sharing one checkpoint but differing in config,
+    challenge bundle or gate spec have genuinely different benchmark results.
+    Re-judging the recorded scores (``_verify_report_against_gates``) catches a
+    changed gate contract, but it re-judges measurements taken under the OTHER
+    run's config -- so identity must be compared before the verdict is trusted.
+
+    A report that predates a field cannot prove it matches, so an absent field
+    is a failure rather than an implicit pass; this mirrors the existing
+    treatment of reports that predate the current gate set.
+    """
+    from game_cls.reports.benchmark import (
+        canonical_config_sha256,
+        file_sha256,
+        gate_spec_fingerprint,
+    )
+
+    payload = _read_report_payload(report)
+    if payload is None:
+        return [f"benchmark report {report} is unreadable"]
+    data_cfg = config.get("data") or {}
+    # Must mirror cmd_benchmark_evaluate's own fingerprint definition exactly,
+    # or identical inputs would compare unequal.
+    challenge_source = data_cfg.get("challenge_packed_video_index") or data_cfg.get(
+        "challenge_video_index"
+    )
+    expected = {
+        "run_id": run_id,
+        "resolved_config_sha256": canonical_config_sha256(config),
+        "challenge_dataset_fingerprint": (
+            file_sha256(challenge_source) if challenge_source else ""
+        ),
+        "gate_spec_fingerprint": gate_spec_fingerprint(gate_metrics),
+    }
+    problems: list[str] = []
+    for field, current in expected.items():
+        recorded = payload.get(field)
+        if not recorded:
+            problems.append(
+                f"report records no {field}; it predates the release identity "
+                "contract and cannot be bound to this artifact. Re-run "
+                "'cls-trainer benchmark evaluate'."
+            )
+        elif not current:
+            # The report claims an identity this side cannot reproduce (e.g.
+            # the challenge parquet is absent), so the PASS is unverifiable.
+            # A gate that cannot verify is not a gate: refuse rather than
+            # skip the comparison.
+            problems.append(
+                f"{field} cannot be recomputed here (report={recorded}); the "
+                "release identity is unverifiable. Ensure the challenge "
+                "bundle and config used for the benchmark are present."
+            )
+        elif str(recorded) != str(current):
+            problems.append(
+                f"{field} differs: report={recorded} current={current}. This "
+                "PASS was earned under a different release identity."
+            )
+    return problems
+
+
 def _resolve_checkpoint_path(run_dir: Path, name: str) -> str | None:
     """Resolve a checkpoint alias/path to the artifact file without loading it."""
     direct = Path(name)
@@ -360,6 +432,28 @@ def cmd_release_check(args: argparse.Namespace) -> int:
             f"sha256={checkpoint_sha} ({checkpoint_path}). Run "
             "'cls-trainer benchmark evaluate' against this exact checkpoint "
             "before releasing it.",
+            file=sys.stderr,
+        )
+        return 2
+    # Audit P0-2: a matching checkpoint hash is NOT a release identity. FPR,
+    # recall and selection eligibility are functions of model + threshold +
+    # dataset + preprocessing, so a PASS earned under a different config,
+    # challenge set or gate contract must never be borrowed -- even when the
+    # weights are byte-identical.
+    identity = _release_identity_mismatches(
+        report,
+        run_id=run_dir.name,
+        config=config,
+        gate_metrics=gate_metrics,
+    )
+    if identity:
+        print("Release check FAILED: release identity mismatch:", file=sys.stderr)
+        for problem in identity:
+            print(f"  - {problem}", file=sys.stderr)
+        print(
+            "The benchmark PASS was earned by a different release identity. "
+            "Re-run 'cls-trainer benchmark evaluate' under this exact "
+            "config/challenge/gate contract.",
             file=sys.stderr,
         )
         return 2

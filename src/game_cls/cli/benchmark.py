@@ -341,10 +341,10 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         # P0-3: hash the finalized in-memory config, not the on-disk file.
         # When --config points to a different YAML than the training run,
         # file_sha256(run_dir/"resolved_config.json") would silently record
-        # the wrong provenance.
-        resolved_config_sha256 = hashlib.sha256(
-            json.dumps(config, sort_keys=True, default=str).encode()
-        ).hexdigest()
+        # the wrong provenance. Shared with release check via
+        # canonical_config_sha256 so both sides hash identically (P0-2);
+        # an inlined copy here would silently diverge.
+        resolved_config_sha256 = canonical_config_sha256(config)
         challenge_dataset_fingerprint = file_sha256(
             challenge_packed_video_index or challenge_video_index
         )

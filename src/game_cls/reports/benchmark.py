@@ -57,6 +57,25 @@ def gate_spec_fingerprint(gate_metrics: dict[str, Any] | None) -> str:
         json.dumps(gate_metrics or {}, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
+
+def canonical_config_sha256(config: dict[str, Any] | None) -> str:
+    """Canonical SHA-256 of a *finalized* config's content (audit P0-2/P0-3).
+
+    Hashing the config object rather than the file it came from is what makes
+    the provenance honest: ``benchmark evaluate --config OTHER.yaml`` evaluates
+    OTHER.yaml, so recording ``file_sha256(run_dir/"resolved_config.json")``
+    would describe a config the run never used (audit P0-3).
+
+    Both the writer (``benchmark evaluate``) and the reader (``release
+    check``) MUST route through this one function. Two call sites that
+    canonicalize even slightly differently -- a different ``default=``, an
+    unsorted dump -- produce different digests for identical configs, which
+    would turn the P0-2 identity comparison into an unconditional failure.
+    """
+    return hashlib.sha256(
+        json.dumps(config or {}, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
 # ---------------------------------------------------------------------------
 # Gate contract (step6): explicit metric name + comparison operator.
 # ---------------------------------------------------------------------------
