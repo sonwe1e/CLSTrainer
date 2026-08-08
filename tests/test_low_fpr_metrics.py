@@ -17,7 +17,7 @@ except ImportError:
 
 from game_cls.data.collate import pair_collate
 from game_cls.data.image_spec import ImageSpec
-from game_cls.engine.trainer import SyntheticPairDataset
+from game_cls.engine.training.synthetic import SyntheticPairDataset
 from game_cls.losses.threshold_loss import probability_threshold_to_margin
 
 NEW_METRIC_KEYS = (

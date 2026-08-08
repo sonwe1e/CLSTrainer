@@ -16,6 +16,12 @@ except ImportError:
 @unittest.skipIf(torch is None, "torch is not installed")
 class ExportVerifyTests(unittest.TestCase):
     def _authorize_export(self, run_dir: Path, config_path: Path | None = None) -> None:
+        import numpy as np
+        from PIL import Image
+
+        from game_cls.data.image_spec import ImageSpec
+        from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+        from game_cls.data.indexing import write_external_bundle
         from game_cls.release import release_identity
         from game_cls.reports.benchmark import (
             check_gates,
@@ -25,9 +31,30 @@ class ExportVerifyTests(unittest.TestCase):
 
         path = config_path or (run_dir / "resolved_config.json")
         config = json.loads(path.read_text(encoding="utf-8"))
-        challenge = path.parent / "challenge.identity"
-        challenge.write_bytes(b"fixed challenge bundle")
-        config["data"]["challenge_index"] = str(challenge)
+        source = path.parent / "challenge_source" / "game_a" / "0"
+        source.mkdir(parents=True, exist_ok=True)
+        channels = int(config["data"]["channels"])
+        shape = (
+            int(config["data"]["height"]),
+            int(config["data"]["width"]),
+        ) + (() if channels == 1 else (channels,))
+        Image.fromarray(np.zeros(shape, dtype=np.uint8)).save(source / "0100001.png")
+        challenge_dir = path.parent / "challenge_bundle"
+        write_external_bundle(
+            path.parent / "challenge_source",
+            challenge_dir,
+            ImageSpec.from_config(config["data"]),
+            ScanPolicy.from_config(config["data"]),
+            DuplicatePolicy.from_config(config["data"]),
+            pool="challenge",
+            identity_mode=(config["data"].get("source_video_identity") or {}).get(
+                "mode", "game_video"
+            ),
+        )
+        config["data"]["challenge_index"] = str(challenge_dir / "frames.parquet")
+        config["data"]["challenge_video_index"] = str(
+            challenge_dir / "video_entries.parquet"
+        )
         gates = {"global_fpr_at_decision_threshold": {"op": "<=", "value": 0.01}}
         benchmark_dir = path.parent / "benchmarks"
         config["benchmark"]["gate_metrics"] = gates
@@ -59,7 +86,7 @@ class ExportVerifyTests(unittest.TestCase):
 
     def _trained_run(self, directory: str) -> Path:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
@@ -85,12 +112,12 @@ class ExportVerifyTests(unittest.TestCase):
         return Path(result["output_dir"])
 
     def _artifact_dir(self, export_dir: Path, run_dir: Path) -> Path:
-        """The immutable per-artifact export directory (audit PR-F):
-        ``export_dir/<run_id>/<checkpoint_sha256>/``."""
+        """Return ``<run>/<checkpoint_sha>/<format>`` for this export."""
         run_export = export_dir / run_dir.name
         self.assertTrue(run_export.is_dir(), f"no run dir under {export_dir}")
         (sha_dir,) = list(run_export.iterdir())
-        return sha_dir
+        (format_dir,) = list(sha_dir.iterdir())
+        return format_dir
 
     def test_weights_export_roundtrip(self) -> None:
         import torch
@@ -239,7 +266,9 @@ class ExportVerifyTests(unittest.TestCase):
             )
             self.assertEqual(self._export_via_cli(run_dir, base, config), 0)
             self.assertTrue(
-                (self._artifact_dir(configured_dir, run_dir) / "export_manifest.json").is_file()
+                (
+                    self._artifact_dir(configured_dir, run_dir) / "export_manifest.json"
+                ).is_file()
             )
             # The CWD-relative default "exports" was never touched.
             self.assertFalse((Path("exports") / run_dir.name).exists())
@@ -271,7 +300,7 @@ class ExportVerifyTests(unittest.TestCase):
             else:
                 self.assertEqual(code, 2)
                 # Transactional export publishes nothing on a failed trace.
-                self.assertEqual(list((out_dir / run_dir.name).iterdir()), [])
+                self.assertFalse((out_dir / run_dir.name).exists())
 
     def test_manifest_records_base_checkpoint_sha_and_metric_summary(self) -> None:
         from game_cls.cli.export import cmd_export
@@ -450,7 +479,7 @@ class ReleaseGateTests(unittest.TestCase):
             )
             config.setdefault("evaluation", {})["minimum_worst_game_f1"] = 0.75
             gate_metrics = config.setdefault("benchmark", {})["gate_metrics"] = {
-                "global_fpr_at_decision_threshold": 0.01
+                "global_fpr_at_decision_threshold": {"op": "<=", "value": 0.01}
             }
             # Audit P0-3: a release-ready check with NO benchmark must fail, so
             # this passing case needs an actual report.

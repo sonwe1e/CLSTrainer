@@ -37,7 +37,6 @@ class VideoBalancedPairBatchSampler:
         game_alpha: float = 0.25,
         class_probability: dict[int, float] | None = None,
         delta_probability: dict[int, float] | None = None,
-        deduplicate_within_global_batch: bool | None = None,
         dedup_level: str = "pair",
         on_exhaustion: str = "warn_and_relax",
         hard_negative_cfg: dict | None = None,
@@ -54,13 +53,6 @@ class VideoBalancedPairBatchSampler:
             raise ValueError(
                 f"on_exhaustion must be error|warn_and_relax; got {on_exhaustion!r}"
             )
-        if deduplicate_within_global_batch is not None:
-            # Legacy boolean: True -> pair, False -> none. The explicit
-            # dedup_level wins when both are given.
-            if dedup_level == "pair" and not deduplicate_within_global_batch:
-                dedup_level = "none"
-            if dedup_level == "none" and deduplicate_within_global_batch:
-                dedup_level = "pair"
         if hard_negative_cfg and hard_negative_cfg.get("max_pairs_per_video"):
             # Deterministic per-video cap: only the first N start positions
             # of each video are eligible, so the model cannot memorize a few
@@ -247,7 +239,12 @@ class VideoBalancedPairBatchSampler:
         if self._hard_negative_enabled and label == 0:
             video_index = self._sample_negative_video(rng, delta, game)
         else:
-            video_index = rng.choice(self._support[delta][game][label])
+            candidates = self._support[delta][game][label]
+            video_index = _choice(
+                rng,
+                candidates,
+                [self.videos[index].sample_weight for index in candidates],
+            )
         valid_starts = self.videos[video_index].valid_start_positions[delta]
         start_position = int(rng.choice(valid_starts))
         return PairRequest(
@@ -278,7 +275,13 @@ class VideoBalancedPairBatchSampler:
             candidates = list(buckets.get(other) or [])
         if not candidates:
             candidates = list(self._support[delta][game][0])
-        return int(rng.choice(candidates))
+        return int(
+            _choice(
+                rng,
+                candidates,
+                [self.videos[index].sample_weight for index in candidates],
+            )
+        )
 
     def __iter__(self) -> Iterator[list[PairRequest]]:
         rng = random.Random(self.seed + self.epoch * 1_000_003)
@@ -307,23 +310,26 @@ class VideoBalancedPairBatchSampler:
                     )
                 attempts += 1
                 if dedup_active and identity in used:
-                    if attempts < max_attempts:
-                        # Re-sample INSIDE the same delta so the effective
-                        # per-delta distribution stays the configured one.
-                        while identity in used and attempts < max_attempts:
-                            request = self._sample_for_delta(rng, delta)
-                            identity = (
-                                request.video_index
-                                if self.dedup_level == "video"
-                                else (
-                                    request.video_index,
-                                    request.delta,
-                                    request.start_position,
-                                )
+                    # Re-sample INSIDE the same delta so the effective
+                    # per-delta distribution stays the configured one.
+                    while identity in used and attempts < max_attempts:
+                        request = self._sample_for_delta(rng, delta)
+                        identity = (
+                            request.video_index
+                            if self.dedup_level == "video"
+                            else (
+                                request.video_index,
+                                request.delta,
+                                request.start_position,
                             )
-                            attempts += 1
-                            self.last_epoch_dedup_failures += 1
-                    elif self.on_exhaustion == "error":
+                        )
+                        attempts += 1
+                        self.last_epoch_dedup_failures += 1
+                    # The exhaustion policy is evaluated *after* the final
+                    # retry. Previously a duplicate produced on that retry was
+                    # appended silently because control never returned to the
+                    # pre-retry ``elif``.
+                    if identity in used and self.on_exhaustion == "error":
                         raise RuntimeError(
                             "Deduplication exhausted: could not fill a "
                             "global batch without repeating "
@@ -332,7 +338,7 @@ class VideoBalancedPairBatchSampler:
                             f"{global_batch_size}). Reduce the batch size "
                             "or set data.deduplication.on_exhaustion=warn_and_relax."
                         )
-                    else:
+                    if identity in used:
                         self.last_epoch_dedup_failures += 1
                 selected.append(request)
                 used.add(identity)

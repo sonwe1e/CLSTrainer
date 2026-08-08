@@ -44,15 +44,17 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
     from game_cls.engine.checkpoint import unwrap_model
-    from game_cls.engine.distributed import (
-        cleanup_distributed,
-        initialize_runtime,
-    )
     from game_cls.engine.training.loaders import build_external_pool_loader
     from game_cls.model.builder import build_model
     from game_cls.reports.benchmark import (
         scan_negative_pool,
         write_mining_manifest,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        cleanup as cleanup_distributed,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        init_runtime as initialize_runtime,
     )
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
@@ -87,7 +89,6 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
     pool_packed_index = mining.get("pool_packed_index")
     pool_packed_video_index = mining.get("pool_packed_video_index")
     pool_metadata = mining.get("pool_metadata")
-    mining_version = int(mining.get("version", 2))
     mining_enabled = bool(mining.get("enabled", False))
     has_plain_pool = bool(pool_index and pool_video_index)
     has_packed_pool = bool(pool_packed_index and pool_packed_video_index)
@@ -145,7 +146,6 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
                     "checkpoint": checkpoint_path,
                     "mined_negatives": len(rows),
                     "output": str(out_path),
-                    "mining_version": mining_version,
                     "pool_metadata": pool_metadata,
                 },
                 ensure_ascii=False,
@@ -186,7 +186,9 @@ def cmd_benchmark_data(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    out_dir = Path(config["benchmark"].get("output_dir", "benchmarks"))
+    from game_cls.reports.benchmark import benchmark_output_dir
+
+    out_dir = benchmark_output_dir(config, Path.cwd())
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "data_probe.json"
     out_path.write_text(
@@ -203,11 +205,6 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
     from game_cls.engine.checkpoint import unwrap_model
-    from game_cls.engine.distributed import (
-        cleanup_distributed,
-        distributed_barrier,
-        initialize_runtime,
-    )
     from game_cls.engine.evaluator import evaluate
     from game_cls.engine.training.loaders import build_external_pool_loader
     from game_cls.model.builder import build_model
@@ -215,6 +212,15 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         check_gates,
         validate_gate_metrics,
         write_benchmark_report,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        barrier as distributed_barrier,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        cleanup as cleanup_distributed,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        init_runtime as initialize_runtime,
     )
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
@@ -242,6 +248,11 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
     # and then surface as "metric absent". load_config already validates a
     # fresh config, but an older run's resolved_config.json predates that.
     gate_problems = validate_gate_metrics(gate_metrics)
+    if not gate_metrics:
+        gate_problems.append(
+            "benchmark.gate_metrics is empty; benchmark evaluate would be "
+            "informational rather than a release PASS"
+        )
     if gate_problems:
         for problem in gate_problems:
             print(f"Config error: {problem}", file=sys.stderr)
@@ -252,8 +263,9 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
     challenge_packed_video_index = config["data"].get("challenge_packed_video_index")
     challenge_metadata = config["data"].get("challenge_metadata")
     has_plain_challenge = bool(challenge_index and challenge_video_index)
+    packed_requested = bool(challenge_packed_index or challenge_packed_video_index)
     has_packed_challenge = bool(challenge_packed_index and challenge_packed_video_index)
-    if not has_plain_challenge and not has_packed_challenge:
+    if not has_plain_challenge or (packed_requested and not has_packed_challenge):
         print(
             "benchmark evaluate needs data.challenge_index and "
             "data.challenge_video_index (plain PNG), or "
@@ -276,9 +288,13 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
     )
 
     resolved_config_sha256 = canonical_config_sha256(config)
-    challenge_dataset_fingerprint, challenge_components = challenge_bundle_fingerprint(
-        config
-    )
+    try:
+        challenge_dataset_fingerprint, challenge_components = (
+            challenge_bundle_fingerprint(config)
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(f"Challenge identity verification failed: {exc}", file=sys.stderr)
+        return 2
     if challenge_components.get("covers_content") is False:
         print(
             "note: the challenge frame index carries no per-frame content "
@@ -364,8 +380,10 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         checkpoint_sha256 = file_sha256(checkpoint_path)
         gate_spec_hash = gate_spec_fingerprint(gate_metrics)
         all_passed = all(passed for _, passed, _ in gates)
+        from game_cls.reports.benchmark import benchmark_output_dir
+
         report_path = write_benchmark_report(
-            Path(config["benchmark"].get("output_dir", "benchmarks")),
+            benchmark_output_dir(config, run_dir),
             run_id=run_dir.name,
             checkpoint_alias=args.checkpoint,
             metrics=metrics,
@@ -425,7 +443,9 @@ def cmd_benchmark_gate_show(args: argparse.Namespace) -> int:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return 2
-    output_dir = Path((config.get("benchmark") or {}).get("output_dir", "benchmarks"))
+    from game_cls.reports.benchmark import benchmark_output_dir
+
+    output_dir = benchmark_output_dir(config, run_dir)
     reports = []
     for path in output_dir.rglob("report.json") if output_dir.is_dir() else ():
         try:
@@ -441,6 +461,11 @@ def cmd_benchmark_gate_show(args: argparse.Namespace) -> int:
                 "checkpoint": payload.get("checkpoint"),
                 "checkpoint_sha256": payload.get("checkpoint_sha256"),
                 "release_identity_sha256": payload.get("release_identity_sha256"),
+                "status": (
+                    "PASSED"
+                    if gates and all(bool(gate.get("passed")) for gate in gates)
+                    else ("FAILED" if gates else "UNGATED")
+                ),
                 "passed": bool(gates)
                 and all(bool(gate.get("passed")) for gate in gates),
             }

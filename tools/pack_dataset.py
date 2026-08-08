@@ -26,8 +26,6 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
     bundle = verify_split_bundle(Path(args.frame_index).parent)
-    if bundle is None:
-        raise RuntimeError("The source split bundle is not sealed.")
     split_manifest = Path(args.frame_index).parent / "split_manifest.parquet"
     index_path = pack_frame_index(
         args.frame_index,

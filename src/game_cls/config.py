@@ -133,25 +133,6 @@ def _apply_recipe_overrides(
     return raw
 
 
-def _clear_legacy_thresholds_if_overridden(
-    merged: dict[str, Any], overrides: list[str]
-) -> None:
-    """An explicit decision.threshold override wins over injected copies.
-
-    Resolved configs (resolved_config.json) carry loss.threshold and
-    evaluation.threshold mirrors of the old decision value; overriding
-    decision.threshold must not trip the conflict guard against those
-    stale mirrors.
-    """
-    override_keys = {item.split("=", 1)[0] for item in overrides if "=" in item}
-    if "decision.threshold" not in override_keys:
-        return
-    for section_name in ("loss", "evaluation"):
-        section = merged.get(section_name)
-        if isinstance(section, dict):
-            section.pop("threshold", None)
-
-
 def load_config(path: str | Path, overrides: list[str] | None = None) -> dict[str, Any]:
     """Load, merge and validate a configuration file.
 
@@ -164,9 +145,8 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> dict[st
       flattened, loaded as-is.
 
     The returned config is schema-validated: unknown keys, removed keys and
-    type mismatches all raise ``ConfigSchemaError``. ``decision.threshold``
-    is propagated to the loss and evaluation sections so the business
-    threshold has exactly one source of truth.
+    type mismatches all raise ``ConfigSchemaError``. ``decision.threshold`` is
+    the only business decision-threshold field.
     """
     config_path = Path(path).resolve()
     overrides = list(overrides or [])
@@ -174,7 +154,6 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> dict[st
     recipe_overrides, config_overrides = _split_overrides(peek, overrides)
     raw, _ = _load_raw_with_sources(config_path, recipe_overrides)
     merged = apply_overrides(raw, config_overrides)
-    _clear_legacy_thresholds_if_overridden(merged, config_overrides)
     return finalize_config(merged)
 
 
@@ -351,7 +330,6 @@ def load_config_with_sources(
             dotted_key = item.split("=", 1)[0]
             sources[dotted_key] = f"override:{item}"
     merged = apply_overrides(raw, config_overrides)
-    _clear_legacy_thresholds_if_overridden(merged, config_overrides)
     return finalize_config(merged), sources
 
 

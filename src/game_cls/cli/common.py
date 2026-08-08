@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -106,8 +88,8 @@ class _TeeContext:
 # Differences that are normal when resuming (never warned about).
 RESUME_EXPECTED_DIFFS = {
     "experiment.output_dir",
-    "experiment.run_mode",
     "train.resume_path",
+    "checkpoint.save_last_every_steps",
 }
 
 
@@ -139,11 +121,10 @@ RESUME_CRITICAL_DIFFS = {
     "data.train_packed_video_index",
     "data.val_packed_video_index",
     "data.test_packed_video_index",
-    "data.class_probability",
-    "data.delta_probability",
-    "data.game_alpha",
+    "sampler.class_probability",
+    "pair.train_delta_probability",
+    "sampler.game_alpha",
     "model.factory",
-    "model.trainable_name_contains",
     "model.trainable_rules",
     "model.num_classes",
     "model.checkpoint_path",
@@ -305,5 +286,4 @@ _CHECKPOINT_ALIASES = (
     "best_selection",
     "best_val_loss",
     "best_worst_game",
-    "best_observed_dev_test_selection",
 )

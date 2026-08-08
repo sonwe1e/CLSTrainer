@@ -10,12 +10,10 @@ from __future__ import annotations
 import json
 import unittest
 
-from game_cls.engine.trainer import (
+from game_cls.engine.training.selection import (
     _is_better_model,
     _selection_eligible,
     _selection_rank_key,
-)
-from game_cls.engine.training.selection import (
     selection_report_fields,
     selection_sort_value,
 )
@@ -292,8 +290,8 @@ class MetricAndCompositeSelectionTests(unittest.TestCase):
         self.assertTrue(_is_better_model(better, candidate, cfg))
 
     def test_metric_mode_without_explicit_mode_defaults_to_metric(self) -> None:
-        cfg = {"selection_metric": "global_f1_tau099"}
-        candidate = {"global_f1_tau099": 0.88}
+        cfg = {"selection_metric": "global_f1_at_decision_threshold"}
+        candidate = {"global_f1_at_decision_threshold": 0.88}
         self.assertTrue(_selection_eligible(candidate, cfg))
         self.assertEqual(_selection_rank_key(candidate, cfg), 0.88)
 

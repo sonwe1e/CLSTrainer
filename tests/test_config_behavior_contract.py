@@ -122,12 +122,12 @@ class ConfigBehaviorContractTests(unittest.TestCase):
 
     def test_identity_mode_changes_the_source_uid(self) -> None:
         # data.source_video_identity.mode must change the audit identity: the
-        # label-qualified mode yields a different source_video_uid than the
+        # label-qualified mode yields a different stable_source_id than the
         # label-independent default (audit P0-5 / step7).
-        from game_cls.data.splitter import source_video_uid
+        from game_cls.data.splitter import stable_source_id
 
-        plain = source_video_uid("MC", "01", 0, mode="game_video")
-        label_aware = source_video_uid("MC", "01", 0, mode="game_label_video")
+        plain = stable_source_id("MC", "01", 0, mode="game_video")
+        label_aware = stable_source_id("MC", "01", 0, mode="game_label_video")
         self.assertNotEqual(plain, label_aware)
         self.assertTrue(label_aware.startswith("MC::0::01"))
 
@@ -143,9 +143,16 @@ class ConfigBehaviorContractTests(unittest.TestCase):
             model = build_demo_model({})
             # The demo model's parameters default to all-trainable; freeze the
             # backbone so trainable_only and full actually differ.
-            from game_cls.model.freeze_policy import configure_trainable_parameters
+            from game_cls.model.trainable_rules import (
+                apply_trainable_state,
+                parse_rules,
+            )
 
-            configure_trainable_parameters(model, "cls")
+            apply_trainable_state(
+                model,
+                parse_rules({"head": {"pattern": r"^cls\.", "lr_scale": 1.0}}),
+                0,
+            )
             optimizer = torch.optim.AdamW(
                 [p for p in model.parameters() if p.requires_grad], lr=0.001
             )

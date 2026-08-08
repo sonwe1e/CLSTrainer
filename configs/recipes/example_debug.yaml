@@ -29,7 +29,6 @@ pair:
 sampler:
   game_alpha: 0.25
   class_probability: {0: 0.5, 1: 0.5}
-  deduplicate_within_global_batch: true
 
 optimizer:
   learning_rate: 0.001

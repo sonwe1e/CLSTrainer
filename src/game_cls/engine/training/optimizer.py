@@ -6,11 +6,9 @@ from game_cls.model.freeze_policy import (
 
 
 def _set_train_mode(model, model_config: dict) -> None:
-    legacy = model_config.get("freeze_batchnorm_stats")
     set_frozen_backbone_train_mode(
         model,
-        model_config.get("trainable_name_contains", "cls"),
-        legacy,
+        "cls",
         freeze_backbone_batchnorm_stats=model_config.get(
             "freeze_backbone_batchnorm_stats", True
         ),

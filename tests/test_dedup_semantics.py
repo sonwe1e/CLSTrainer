@@ -105,14 +105,14 @@ class DedupLevelTests(unittest.TestCase):
         self.assertEqual(len(batches[0]), 4)
         self.assertGreater(sampler.last_epoch_dedup_failures, 0)
 
-    def test_legacy_boolean_maps_to_level(self) -> None:
+    def test_dedup_level_is_explicit(self) -> None:
         entries = _videos(count=2, starts=1)
         disabled = VideoBalancedPairBatchSampler(
             entries,
             local_batch_size=4,
             steps_per_epoch=1,
             seed=3,
-            deduplicate_within_global_batch=False,
+            dedup_level="none",
         )
         self.assertEqual(disabled.dedup_level, "none")
         enabled = VideoBalancedPairBatchSampler(
@@ -120,7 +120,7 @@ class DedupLevelTests(unittest.TestCase):
             local_batch_size=4,
             steps_per_epoch=1,
             seed=3,
-            deduplicate_within_global_batch=True,
+            dedup_level="pair",
         )
         self.assertEqual(enabled.dedup_level, "pair")
 

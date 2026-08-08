@@ -43,13 +43,12 @@ class ResumeIdentityTests(unittest.TestCase):
         return config
 
     def test_resume_keeps_manifest_run_id_and_logs_resume_event(self) -> None:
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
             first = self._config()
-            first["experiment"]["run_mode"] = "unique"
             first["experiment"]["output_dir"] = str(root)
             first["train"]["stop_after_steps"] = 2
             result1 = run_training(first)
@@ -69,7 +68,6 @@ class ResumeIdentityTests(unittest.TestCase):
             # `cls-trainer train --resume <run_dir>` does.
             resumed = self._config()
             resumed["experiment"]["output_dir"] = str(run_dir)
-            resumed["experiment"]["run_mode"] = "fixed"
             resumed["train"]["resume_path"] = str(
                 run_dir / "checkpoints" / "checkpoint_last.pth"
             )
@@ -96,7 +94,7 @@ class ResumeIdentityTests(unittest.TestCase):
                 ),
                 initial_config,
             )
-            self.assertEqual(initial_config["experiment"]["run_mode"], "unique")
+            self.assertNotIn("run_mode", initial_config["experiment"])
 
             # status.json keeps the original `started` and records
             # `resumed_at` instead of overwriting it.
@@ -122,7 +120,7 @@ class ResumeIdentityTests(unittest.TestCase):
 
             # The append-only index is aggregated per run identity: the
             # pre-resume RUNNING/FAILED states must not shadow the final one.
-            from game_cls.cli import _find_index_records
+            from game_cls.cli.common import _find_index_records
 
             records = _find_index_records(root)
             self.assertEqual(len(records), 1)
@@ -136,7 +134,7 @@ class ResumeIdentityTests(unittest.TestCase):
     def test_resume_without_prior_manifest_creates_one(self) -> None:
         """A plain fixed-mode re-run of an existing dir must not clobber
         resolved_config.json without keeping the initial snapshot."""
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -144,16 +142,16 @@ class ResumeIdentityTests(unittest.TestCase):
             first = self._config()
             first["experiment"]["output_dir"] = str(root / "run")
             first["train"]["stop_after_steps"] = 2
-            run_training(first)
+            first_result = run_training(first)
+            run_dir = Path(first_result["output_dir"])
 
             second = self._config()
-            second["experiment"]["output_dir"] = str(root / "run")
+            second["experiment"]["output_dir"] = str(run_dir)
             second["train"]["resume_path"] = str(
-                root / "run" / "checkpoints" / "checkpoint_last.pth"
+                run_dir / "checkpoints" / "checkpoint_last.pth"
             )
             run_training(second)
 
-            run_dir = root / "run"
             self.assertTrue((run_dir / "resolved_config.initial.json").is_file())
             self.assertTrue((run_dir / "manifest.json").is_file())
             self.assertTrue((run_dir / "resume_events.jsonl").is_file())
@@ -162,7 +160,7 @@ class ResumeIdentityTests(unittest.TestCase):
 
     def test_resume_type_extends_when_max_steps_grows(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -187,13 +185,15 @@ class ResumeIdentityTests(unittest.TestCase):
             base["checkpoint"]["save_last_every_steps"] = 2
             base["experiment"]["output_dir"] = str(root / "run")
             base["train"]["stop_after_steps"] = 2
-            run_training(base)
+            base_result = run_training(base)
+            run_dir = Path(base_result["output_dir"])
 
             extended = copy.deepcopy(base)
             extended["train"].pop("stop_after_steps")
             extended["train"]["max_steps"] = 6
+            extended["experiment"]["output_dir"] = str(run_dir)
             extended["train"]["resume_path"] = str(
-                root / "run" / "checkpoints" / "checkpoint_last.pth"
+                run_dir / "checkpoints" / "checkpoint_last.pth"
             )
             run_training(
                 extended,
@@ -201,7 +201,7 @@ class ResumeIdentityTests(unittest.TestCase):
             )
             events = [
                 json.loads(line)
-                for line in (root / "run" / "resume_events.jsonl")
+                for line in (run_dir / "resume_events.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]

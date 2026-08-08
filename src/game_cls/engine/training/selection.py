@@ -2,38 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-# Legacy metric names that predate the neutral "at_decision_threshold"
-# naming; used as fallbacks so old configs keep working.
-_LEGACY_METRIC_ALIASES = {
-    "global_f1_at_decision_threshold": "global_f1_tau099",
-    "macro_game_f1_at_decision_threshold": "macro_game_f1_tau099",
-    "worst_game_f1_at_decision_threshold": "worst_game_f1_tau099",
-}
-
 
 def _metric_value(metrics: dict, name: str) -> Any:
-    """Read a metric by canonical name, falling back to its legacy alias."""
-    value = metrics.get(name)
-    if value is not None:
-        return value
-    alias = _LEGACY_METRIC_ALIASES.get(name)
-    if alias is not None:
-        return metrics.get(alias)
-    return None
+    """Read one canonical evaluator metric."""
+    return metrics.get(name)
 
 
 def _selection_mode(evaluation_config: dict) -> str:
-    """Resolve the selection strategy, defaulting to the legacy behavior.
-
-    When ``selection_mode`` is absent, a ``composite`` ``selection_metric``
-    implies composite selection; anything else stays plain metric selection.
-    """
-    mode = evaluation_config.get("selection_mode")
-    if mode is not None:
-        return str(mode)
-    if evaluation_config.get("selection_metric") == "composite":
-        return "composite"
-    return "metric"
+    """Resolve the configured selection strategy."""
+    return str(evaluation_config.get("selection_mode", "metric"))
 
 
 def _selection_score(metrics: dict, evaluation_config: dict) -> tuple[float, bool]:
@@ -290,9 +267,4 @@ def _is_better_model(candidate: dict, incumbent: dict, evaluation_config: dict) 
 
 
 def _save_best_enabled(checkpoint_config: dict) -> bool:
-    return bool(
-        checkpoint_config.get(
-            "save_best_selection",
-            checkpoint_config.get("save_best_test_f1", True),
-        )
-    )
+    return bool(checkpoint_config.get("save_best_selection", True))

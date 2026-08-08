@@ -7,9 +7,13 @@ from game_cls.data.image_spec import ImageSpec
 
 
 def has_independent_test(config: dict) -> bool:
-    """True when test is a real holdout, not validation in disguise."""
-    migration = (config.get("data") or {}).get("split_migration") or {}
-    return not bool(migration.get("test_used_as_validation", False))
+    """True when validation and test point to distinct contract-5 inputs."""
+    data = config.get("data") or {}
+    if data.get("synthetic", False):
+        return True
+    val_index = data.get("val_index")
+    test_index = data.get("test_index")
+    return bool(val_index and test_index and test_index != val_index)
 
 
 def _dataloader_option(
@@ -22,7 +26,11 @@ def _dataloader_option(
     scoped = root.get(role, {})
     if not isinstance(scoped, dict):
         raise TypeError(f"dataloader.{role} must be a mapping")
-    return scoped.get(name, root.get(name, default))
+    if name in scoped:
+        return scoped[name]
+    if name in {"multiprocessing_context", "timeout_seconds", "worker_num_threads"}:
+        return root.get(name, default)
+    return default
 
 
 def _validate_dataloader_config(config: dict) -> None:
@@ -63,6 +71,38 @@ def validate_training_config(config: dict) -> None:
     _validate_dataloader_config(config)
     data_cfg = config["data"]
     ImageSpec.from_config(data_cfg)
+    if not data_cfg.get("synthetic", False):
+        backend = str(data_cfg.get("backend", "png"))
+        video_key = (
+            "val_packed_video_index" if backend == "packed_uint8" else "val_video_index"
+        )
+        required_validation = {
+            "val_index": data_cfg.get("val_index"),
+            video_key: data_cfg.get(video_key),
+        }
+        missing_validation = [
+            key for key, value in required_validation.items() if not value
+        ]
+        if missing_validation:
+            raise ValueError(
+                "Real-data training requires dedicated validation inputs: "
+                + ", ".join(f"data.{key}" for key in missing_validation)
+            )
+        if data_cfg.get("test_index") == data_cfg.get("val_index"):
+            raise ValueError(
+                "data.test_index must be omitted or distinct from data.val_index."
+            )
+        test_video_key = (
+            "test_packed_video_index"
+            if backend == "packed_uint8"
+            else "test_video_index"
+        )
+        test_parts = (data_cfg.get("test_index"), data_cfg.get(test_video_key))
+        if any(test_parts) and not all(test_parts):
+            raise ValueError(
+                "An independent test split requires both data.test_index and "
+                f"data.{test_video_key}."
+            )
     model_cfg = config["model"]
     evaluation_cfg = config["evaluation"]
     evaluation_amp_dtype = str(
@@ -79,9 +119,6 @@ def validate_training_config(config: dict) -> None:
         "global_f1_at_decision_threshold",
         "macro_game_f1_at_decision_threshold",
         "worst_game_f1_at_decision_threshold",
-        "global_f1_tau099",
-        "macro_game_f1_tau099",
-        "worst_game_f1_tau099",
         "composite",
     }
     if selection_metric not in supported_selection_metrics:
@@ -143,7 +180,10 @@ def validate_training_config(config: dict) -> None:
             # packed index (PackedUint8Backend is built for train/val/test
             # alike), so config validate must demand it to the same standard as
             # train/test -- otherwise validation passes and the loader blows up.
-            for key in ("train_packed_index", "val_packed_index", "test_packed_index"):
+            packed_keys = ["train_packed_index", "val_packed_index"]
+            if has_independent_test(config):
+                packed_keys.append("test_packed_index")
+            for key in packed_keys:
                 packed_index = data_cfg.get(key)
                 if not packed_index or not Path(packed_index).is_file():
                     raise FileNotFoundError(
@@ -166,8 +206,8 @@ def validate_training_config(config: dict) -> None:
     ):
         raise RuntimeError(
             "data.require_independent_test is enabled but no independent "
-            "test split exists: add data.val_index/data.val_video_index so "
-            "the test split is held out for a single final evaluation."
+            "test split exists: configure dedicated data.test_index and "
+            "data.test_video_index inputs."
         )
     if config.get("distributed", {}).get("enabled", False) and not model_cfg.get(
         "freeze_cls_batchnorm_stats", True

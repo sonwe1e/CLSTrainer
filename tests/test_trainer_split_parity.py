@@ -1,6 +1,5 @@
-"""P1 golden guard: a synthetic training run writes the canonical artifacts.
+"""Golden guard: a synthetic training run writes the canonical artifacts.
 
-The old ``engine/trainer.py`` monolith was split into ``engine/training``.
 This test pins the observable output contract of ``run_training`` — the
 metric-name set, evaluation-history record keys, and run-dir artifacts — so
 any future refactor of the training loop that changes what it emits (or
@@ -24,7 +23,7 @@ except ImportError:
 class TrainerSplitParityTests(unittest.TestCase):
     def _run_short_training(self) -> Path:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         directory = tempfile.mkdtemp()
         config = load_config("configs/recipes/example_debug.yaml")
@@ -48,8 +47,8 @@ class TrainerSplitParityTests(unittest.TestCase):
         )
         config["checkpoint"].update({"save_topk": 0})
         config.pop("early_stopping", None)
-        run_training(config)
-        return Path(directory) / "run"
+        result = run_training(config)
+        return Path(result["output_dir"])
 
     def test_train_metrics_record_has_canonical_keys(self) -> None:
         output_dir = self._run_short_training()

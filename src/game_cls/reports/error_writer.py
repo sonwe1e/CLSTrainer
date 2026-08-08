@@ -6,6 +6,13 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
+from game_cls.contract import (
+    CONTRACT_VERSION,
+    PARQUET_CONTRACT_KEY,
+    stamp_parquet_table,
+    stamp_payload,
+)
+
 ERROR_FIELDS = [
     "game",
     "label",
@@ -66,7 +73,7 @@ def _report_schema():
             )
             for field in ERROR_FIELDS
         ]
-    )
+    ).with_metadata({PARQUET_CONTRACT_KEY: str(CONTRACT_VERSION).encode("ascii")})
 
 
 def _write_parquet(rows: list[dict], path: Path) -> None:
@@ -74,7 +81,7 @@ def _write_parquet(rows: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized = [{field: row.get(field) for field in ERROR_FIELDS} for row in rows]
     pq.write_table(
-        pa.Table.from_pylist(normalized, schema=_report_schema()),
+        stamp_parquet_table(pa.Table.from_pylist(normalized, schema=_report_schema())),
         path,
         compression="zstd",
     )
@@ -313,7 +320,8 @@ def write_evaluation_report(
     output_dir.mkdir(parents=True, exist_ok=True)
     grouped_metrics = grouped_metrics or {}
     (output_dir / "metrics.json").write_text(
-        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(stamp_payload(metrics), ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
     if not lightweight:
         _write_group_csv(

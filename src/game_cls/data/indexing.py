@@ -8,6 +8,13 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from game_cls.contract import (
+    CONTRACT_VERSION,
+    require_contract,
+    require_parquet_contract,
+    stamp_parquet_table,
+)
+
 from .image_spec import ImageSpec
 from .index_policy import DuplicatePolicy, ScanFindings, ScanPolicy
 from .records import (
@@ -18,9 +25,7 @@ from .records import (
     read_png_metadata,
     summarize_videos,
 )
-from .splitter import resolve_split, source_video_uid, write_split_summary
-
-AUDIT_FORMAT_VERSION = 3
+from .splitter import resolve_split, stable_source_id, write_split_summary
 
 # Ordered split roles of the train/validation/test protocol.
 SPLIT_ORDER = ("train", "val", "test")
@@ -45,7 +50,6 @@ def _sha256(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 BUNDLE_MANIFEST_FILENAME = "bundle_manifest.json"
-BUNDLE_MANIFEST_VERSION = 1
 
 # Every artifact a complete split bundle publishes, relative to the index dir.
 # Order is the publish order; the manifest is deliberately NOT in this list
@@ -64,13 +68,25 @@ BUNDLE_ARTIFACT_NAMES: tuple[str, ...] = (
     "audit.json",
 )
 
+EXTERNAL_BUNDLE_ARTIFACT_NAMES: tuple[str, ...] = (
+    "frames.parquet",
+    "video_entries.parquet",
+    "external_summary.json",
+    "audit.json",
+)
+
 
 class SplitBundleError(RuntimeError):
-    """A split bundle is unsealed, incomplete, corrupt, or mixed-generation."""
+    """A split bundle is unpublished, incomplete, corrupt, or mixed."""
 
 
 def _bundle_manifest_payload(
-    index_dir: Path, bundle_id: str, artifact_names: Iterable[str]
+    index_dir: Path,
+    bundle_id: str,
+    artifact_names: Iterable[str],
+    *,
+    bundle_kind: str = "split",
+    pool: str | None = None,
 ) -> dict:
     import datetime
 
@@ -79,14 +95,18 @@ def _bundle_manifest_payload(
         path = index_dir / name
         if path.is_file():
             artifacts[name] = _sha256(path)
-    return {
-        "format_version": BUNDLE_MANIFEST_VERSION,
+    payload = {
+        "contract_version": CONTRACT_VERSION,
         "bundle_id": bundle_id,
+        "bundle_kind": bundle_kind,
         "created_at": datetime.datetime.now(datetime.UTC)
         .isoformat()
         .replace("+00:00", "Z"),
         "artifacts": artifacts,
     }
+    if pool is not None:
+        payload["pool"] = pool
+    return payload
 
 
 def write_bundle_manifest(
@@ -94,22 +114,25 @@ def write_bundle_manifest(
     bundle_id: str,
     *,
     artifact_names: Iterable[str] | None = None,
+    bundle_kind: str = "split",
+    pool: str | None = None,
 ) -> Path:
     """Write ``bundle_manifest.json`` atomically -- the bundle's commit record.
 
     This is written LAST, after every artifact is in place, and via a temp file
     plus ``os.replace`` so it either exists complete or not at all. That
-    ordering is what makes a mixed-generation bundle detectable: a crash partway
-    through publishing leaves the PREVIOUS manifest (or none), whose recorded
-    hashes no longer match the files on disk, so ``verify_split_bundle`` refuses
-    instead of training on a train=NEW/test=OLD mixture in which every file
-    exists (audit P0-9).
+    ordering makes an interrupted publication detectable: recorded hashes must
+    match the complete artifact set before the bundle can be consumed.
     """
     import os
 
     index_dir = Path(index_dir)
     payload = _bundle_manifest_payload(
-        index_dir, bundle_id, artifact_names or BUNDLE_ARTIFACT_NAMES
+        index_dir,
+        bundle_id,
+        artifact_names or BUNDLE_ARTIFACT_NAMES,
+        bundle_kind=bundle_kind,
+        pool=pool,
     )
     target = index_dir / BUNDLE_MANIFEST_FILENAME
     temp = target.with_suffix(".json.tmp")
@@ -119,7 +142,7 @@ def write_bundle_manifest(
 
 
 def read_bundle_manifest(index_dir: str | Path) -> dict | None:
-    """The bundle manifest, or ``None`` when the directory is unsealed."""
+    """Return the bundle manifest, or ``None`` when none was published."""
     path = Path(index_dir) / BUNDLE_MANIFEST_FILENAME
     if not path.is_file():
         return None
@@ -128,7 +151,7 @@ def read_bundle_manifest(index_dir: str | Path) -> dict | None:
     except (OSError, ValueError) as exc:
         raise SplitBundleError(
             f"Bundle manifest is unreadable: {path}: {exc}. Re-run "
-            "'cls-trainer dataset prepare' or 'cls-trainer dataset seal'."
+            "'cls-trainer dataset prepare'."
         ) from exc
     return payload if isinstance(payload, dict) else None
 
@@ -143,68 +166,56 @@ def _stamped_bundle_id(path: Path) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
+    try:
+        require_contract(payload, f"Bundle artifact {path}")
+    except ValueError as exc:
+        raise SplitBundleError(str(exc)) from exc
     value = payload.get("bundle_id")
     return str(value) if value else None
 
 
-def verify_split_bundle(
-    index_dir: str | Path, *, require_manifest: bool = True
-) -> dict | None:
-    """Refuse a bundle that is not provably one generation (audit P0-9).
+def verify_split_bundle(index_dir: str | Path) -> dict:
+    """Require a complete, authenticated contract-5 split bundle.
 
-    ``write_split_bundle`` used to overwrite artifacts in place, in order:
-    train, val, test, video indexes, summary, audit. A crash partway through,
-    over a directory that already held a complete older bundle, left
-    ``train=NEW, test=OLD, audit=OLD`` with *every file present* -- so an
-    existence check reported nothing missing and training proceeded on a
-    silently mixed generation.
-
-    Existence checks cannot detect that, because existence is exactly what the
-    mixed state satisfies. This verifies the commit record instead:
+    This verifies the commit record:
 
     * the manifest exists (the bundle was published, not interrupted),
     * every artifact it lists is present and hashes to the recorded value,
     * ``audit.json`` and ``split_summary.json`` agree on ``bundle_id``.
 
-    Each failure gets its own message because each implies a different operator
-    action: seal an unsealed legacy directory, re-prepare a mixed one,
-    re-prepare or restore a corrupt artifact.
+    Each failure identifies whether the bundle must be rebuilt or an artifact
+    restored.
     """
     index_dir = Path(index_dir)
     manifest = read_bundle_manifest(index_dir)
     if manifest is None:
-        if not require_manifest:
-            return None
         raise SplitBundleError(
             f"Index bundle {index_dir} has no {BUNDLE_MANIFEST_FILENAME}, so a "
-            "mixed-generation bundle (e.g. train from a new prepare, test left "
-            "from an older one) cannot be ruled out -- every file can be "
-            "present and still disagree. Either rebuild the bundle:\n"
+            "complete published generation cannot be established. Rebuild it:\n"
             "    cls-trainer dataset prepare --config <config> "
             "--train-root <train_all> --test-root <test>\n"
-            "or, if you know this directory is one consistent generation, "
-            "adopt it:\n"
-            "    cls-trainer dataset seal --config <config>"
+            "This contract does not adopt uncommitted directories."
         )
-    version = int(manifest.get("format_version", 0))
-    if version != BUNDLE_MANIFEST_VERSION:
+    try:
+        require_contract(manifest, f"Bundle manifest {index_dir}")
+    except ValueError as exc:
+        raise SplitBundleError(str(exc)) from exc
+    if str(manifest.get("bundle_kind") or "") != "split":
         raise SplitBundleError(
-            f"Unsupported bundle manifest version {version} in {index_dir} "
-            f"(expected {BUNDLE_MANIFEST_VERSION}). Re-run "
-            "'cls-trainer dataset prepare'."
+            f"Index bundle {index_dir} is not a train/val/test split bundle."
         )
     bundle_id = str(manifest.get("bundle_id") or "")
     if not bundle_id:
         raise SplitBundleError(
             f"Bundle manifest in {index_dir} records no bundle_id, so its "
             "artifacts cannot be tied to one generation. Re-run "
-            "'cls-trainer dataset prepare' or 'cls-trainer dataset seal'."
+            "'cls-trainer dataset prepare'."
         )
     artifacts = manifest.get("artifacts") or {}
     if not artifacts:
         raise SplitBundleError(
             f"Bundle manifest in {index_dir} lists no artifacts; it cannot "
-            "prove the bundle is intact. Re-run 'cls-trainer dataset seal'."
+            "prove the bundle is intact. Re-run 'cls-trainer dataset prepare'."
         )
     missing: list[str] = []
     corrupt: list[str] = []
@@ -239,6 +250,49 @@ def verify_split_bundle(
                 f"carries bundle_id {stamped} but the manifest commits "
                 f"{bundle_id}. This file came from a different prepare; "
                 "re-run 'cls-trainer dataset prepare'."
+            )
+    return manifest
+
+
+def verify_external_bundle(index_dir: str | Path, *, pool: str | None = None) -> dict:
+    """Verify one immutable challenge/mining source bundle."""
+    index_dir = Path(index_dir)
+    manifest = read_bundle_manifest(index_dir)
+    if manifest is None:
+        raise SplitBundleError(
+            f"External bundle {index_dir} has no bundle_manifest.json; rebuild "
+            "it with 'cls-trainer dataset external-prepare'."
+        )
+    try:
+        require_contract(manifest, f"External bundle manifest {index_dir}")
+    except ValueError as exc:
+        raise SplitBundleError(str(exc)) from exc
+    if manifest.get("bundle_kind") != "external":
+        raise SplitBundleError(f"{index_dir} is not an external bundle.")
+    recorded_pool = str(manifest.get("pool") or "")
+    if pool is not None and recorded_pool != pool:
+        raise SplitBundleError(
+            f"External bundle role mismatch: expected {pool}, got {recorded_pool}."
+        )
+    bundle_id = str(manifest.get("bundle_id") or "")
+    artifacts = manifest.get("artifacts") or {}
+    if not bundle_id or not isinstance(artifacts, dict):
+        raise SplitBundleError(f"External bundle manifest is incomplete: {index_dir}")
+    absent = [name for name in EXTERNAL_BUNDLE_ARTIFACT_NAMES if name not in artifacts]
+    if absent:
+        raise SplitBundleError(
+            f"External bundle manifest omits required artifacts: {absent}."
+        )
+    for name, expected in artifacts.items():
+        path = index_dir / name
+        if not path.is_file() or _sha256(path) != str(expected):
+            raise SplitBundleError(
+                f"External bundle artifact is missing or changed: {path}."
+            )
+    for name in ("audit.json", "external_summary.json"):
+        if _stamped_bundle_id(index_dir / name) != bundle_id:
+            raise SplitBundleError(
+                f"External bundle {name} does not carry bundle_id={bundle_id}."
             )
     return manifest
 
@@ -395,13 +449,73 @@ def write_parquet(
     rows = [asdict(record) for record in records]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pylist(rows)
+    table = stamp_parquet_table(pa.Table.from_pylist(rows))
     pq.write_table(table, path)
 
 
 def read_frame_parquet(path: str | Path) -> list[FrameRecord]:
     _, pq = _pyarrow()
+    require_parquet_contract(path)
     return [FrameRecord(**row) for row in pq.read_table(path).to_pylist()]
+
+
+def verify_frame_content_integrity(path: str | Path) -> dict[str, Any]:
+    """Prove that the current PNG bytes match their recorded content hashes."""
+    index_path = Path(path)
+    require_parquet_contract(index_path)
+    _, pq = _pyarrow()
+    schema_names = set(pq.read_schema(index_path).names)
+    required = {"path", "content_sha256"}
+    missing_columns = required - schema_names
+    if missing_columns:
+        raise ValueError(
+            f"Frame index {index_path} is missing {sorted(missing_columns)}."
+        )
+    rows = pq.read_table(index_path, columns=["path", "content_sha256"]).to_pylist()
+    if not rows:
+        raise ValueError(f"Frame index is empty: {index_path}")
+    missing_hashes: list[str] = []
+    missing_files: list[str] = []
+    mismatches: list[str] = []
+    for row in rows:
+        frame_path = Path(row["path"])
+        content_sha256 = str(row.get("content_sha256") or "")
+        if not content_sha256:
+            missing_hashes.append(str(frame_path))
+            continue
+        if not frame_path.is_file():
+            missing_files.append(str(frame_path))
+            continue
+        actual = _sha256(frame_path)
+        if actual != content_sha256:
+            mismatches.append(f"{frame_path} (index={content_sha256}, actual={actual})")
+    problems: list[str] = []
+    if missing_hashes:
+        problems.append(
+            f"{len(missing_hashes)} frame(s) have no content_sha256, e.g. "
+            + ", ".join(missing_hashes[:3])
+        )
+    if missing_files:
+        problems.append(
+            f"{len(missing_files)} frame file(s) are missing, e.g. "
+            + ", ".join(missing_files[:3])
+        )
+    if mismatches:
+        problems.append(
+            f"{len(mismatches)} frame file(s) changed after indexing, e.g. "
+            + "; ".join(mismatches[:3])
+        )
+    if problems:
+        raise ValueError(
+            f"Frame content integrity check failed for {index_path}: "
+            + " | ".join(problems)
+            + ". Rebuild the index before continuing."
+        )
+    return {
+        "frame_index": str(index_path),
+        "frame_count": len(rows),
+        "content_verified": True,
+    }
 
 
 def analyze_content_duplicates(
@@ -530,8 +644,8 @@ def _video_key(frame: FrameRecord, namespace: str | None) -> tuple:
 
     Under a source namespace the key is the 4-tuple ``(namespace, game,
     label, video_id)`` so coincidentally equal local numbering in a
-    distinct source pool does not intersect; otherwise the legacy 3-tuple
-    keeps the default path byte-for-byte identical.
+    distinct source pool does not intersect; an un-namespaced pool uses the
+    local ``(game, label, video_id)`` identity.
     """
     if namespace is not None:
         return (namespace, frame.game, frame.label, frame.video_id)
@@ -541,9 +655,8 @@ def _video_key(frame: FrameRecord, namespace: str | None) -> tuple:
 def _video_key_entry(item: tuple) -> dict:
     """Render a cross-split video-key overlap entry for storage.
 
-    Namespaced keys (4-tuples) include a ``namespace`` field; the legacy
-    3-tuple keeps the ``{"game", "label", "video_id"}`` shape so
-    pre-namespace audit consumers are unchanged.
+    Namespaced keys (4-tuples) include a ``namespace`` field; local keys use
+    ``{"game", "label", "video_id"}``.
     """
     if len(item) == 4:
         namespace, game, label, video_id = item
@@ -582,7 +695,7 @@ def _source_uid_content_classification(
             # as the strict overlap set (source_uids_by_split), or a
             # ``game_label_video`` audit would group label-distinct videos into
             # one ``game::video`` bucket and emit a misleading diagnostic.
-            uid = source_video_uid(
+            uid = stable_source_id(
                 frame.game,
                 frame.video_id,
                 frame.label,
@@ -618,7 +731,7 @@ def _source_uid_content_classification(
                 )
                 entries.append(
                     {
-                        "source_video_uid": uid,
+                        "stable_source_id": uid,
                         "shared_content_frames": shared_frames,
                     }
                 )
@@ -649,7 +762,7 @@ def format_uid_overlap_content_classification(classification: dict) -> str:
                 else "likely same video, real leakage"
             )
             lines.append(
-                f"  {entry['source_video_uid']} "
+                f"  {entry['stable_source_id']} "
                 f"({pair_key.replace('__', '/')}): "
                 f"shared content frames={shared} -> {hint}"
             )
@@ -672,7 +785,7 @@ def make_audit(
         namespace = namespaces_by_split.get(split)
         video_keys_by_split[split] = {_video_key(frame, namespace) for frame in frames}
         source_uids_by_split[split] = {
-            source_video_uid(
+            stable_source_id(
                 frame.game,
                 frame.video_id,
                 frame.label,
@@ -697,13 +810,11 @@ def make_audit(
                 source_uids_by_split[left] & source_uids_by_split[right]
             )
     leakage: dict[str, object] = {
-        # Backwards-compatible train/test view.
-        "video_keys_across_splits": video_key_overlap.get("train__test", []),
         "split_pair_video_key_overlap": video_key_overlap,
-        "source_video_uid_overlap": source_uid_overlap,
+        "stable_source_id_overlap": source_uid_overlap,
         "source_identity_mode": identity_mode,
         "video_key_check_note": (
-            f"source_video_uid identity mode is {identity_mode}"
+            f"stable_source_id identity mode is {identity_mode}"
             + (
                 f" with source namespaces {dict(sorted(namespaces_by_split.items()))}"
                 if namespaces_by_split
@@ -725,7 +836,7 @@ def make_audit(
     if classification["pairs"]:
         leakage["source_uid_overlap_content_classification"] = classification
     return {
-        "audit_format_version": AUDIT_FORMAT_VERSION,
+        "contract_version": CONTRACT_VERSION,
         "expected": {
             "width": image_spec.width,
             "height": image_spec.height,
@@ -777,10 +888,10 @@ def validate_audit(
     namespaces_by_split: dict[str, str] | None = None,
 ) -> None:
     problems: list[str] = []
-    if audit.get("audit_format_version") not in (2, AUDIT_FORMAT_VERSION):
-        problems.append(
-            "audit format is obsolete; rebuild indexes with tools/build_index.py"
-        )
+    try:
+        require_contract(audit, "Dataset audit")
+    except ValueError as exc:
+        problems.append(str(exc))
     if image_spec is not None:
         expected = audit.get("expected", {})
         actual = (
@@ -877,10 +988,14 @@ def validate_audit(
                 f"splits={warning.get('splits', [])}"
             )
     leakage = audit.get("leakage", {})
-    if require_unique_video_keys and leakage.get("video_keys_across_splits"):
-        problems.append(
-            f"train/test share video keys: {leakage['video_keys_across_splits'][:20]}"
-        )
+    video_overlap = leakage.get("split_pair_video_key_overlap") or {}
+    if require_unique_video_keys and isinstance(video_overlap, dict):
+        for pair_key, keys in sorted(video_overlap.items()):
+            if keys:
+                problems.append(
+                    f"video keys span the {pair_key.replace('__', '/')} splits: "
+                    f"{list(keys)[:20]}"
+                )
     # The audit must have been built under the same source identity mode as
     # the current configuration, otherwise its leakage verdicts do not mean
     # what the caller thinks they mean.
@@ -897,8 +1012,8 @@ def validate_audit(
             "rebuild indexes"
         )
     # Source videos must never span train/val/test. Label-independent
-    # source_video_uid overlap is leakage regardless of the policy flags.
-    source_overlap = leakage.get("source_video_uid_overlap")
+    # Stable-source overlap is leakage regardless of the policy flags.
+    source_overlap = leakage.get("stable_source_id_overlap")
     if isinstance(source_overlap, dict):
         for pair_key, uids in sorted(source_overlap.items()):
             if uids:
@@ -906,11 +1021,6 @@ def validate_audit(
                     f"source videos span the {pair_key.replace('__', '/')} "
                     f"splits: {list(uids)[:20]}"
                 )
-    elif leakage.get("video_keys_across_splits"):
-        problems.append(
-            "train/test share source video keys: "
-            f"{leakage['video_keys_across_splits'][:20]}"
-        )
     if problems:
         raise RuntimeError("Strict dataset audit failed: " + "; ".join(problems[:100]))
 
@@ -1017,6 +1127,105 @@ def write_index_bundle(
     return audit
 
 
+def write_external_bundle(
+    root: str | Path,
+    output_dir: str | Path,
+    image_spec: ImageSpec,
+    scan_policy: ScanPolicy,
+    duplicate_policy: DuplicatePolicy,
+    *,
+    pool: str,
+    identity_mode: str = "game_video",
+) -> dict:
+    """Build and transactionally publish one challenge or mining bundle."""
+    if pool not in {"challenge", "mining"}:
+        raise ValueError("pool must be 'challenge' or 'mining'")
+    if identity_mode not in {"game_video", "game_label_video"}:
+        raise ValueError(f"Unsupported source identity mode: {identity_mode}")
+    result = scan_split(
+        root,
+        pool,
+        image_spec,
+        scan_policy=scan_policy,
+        compute_content_hash=True,
+    )
+    if result.findings.errors:
+        preview = "; ".join(
+            f"{item.get('kind')}: {item.get('path')}"
+            for item in result.findings.errors[:10]
+        )
+        raise ValueError(f"External pool scan found errors: {preview}")
+    if not result.frames:
+        raise ValueError(f"External {pool} pool contains no valid frames")
+
+    import os
+    import shutil
+    from uuid import uuid4
+
+    from .video_index import build_video_entries, write_video_entries_parquet
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bundle_id = uuid4().hex
+    staging = output_dir / f".external-staging-{bundle_id}"
+    staging.mkdir(parents=True, exist_ok=False)
+    try:
+        write_parquet(result.frames, staging / "frames.parquet")
+        write_video_entries_parquet(
+            build_video_entries(
+                result.frames,
+                identity_mode=identity_mode,
+                require_content_hash=True,
+            ),
+            staging / "video_entries.parquet",
+        )
+        audit = make_audit(
+            {pool: result.frames},
+            {pool: result.findings},
+            image_spec,
+            duplicate_policy,
+            identity_mode=identity_mode,
+        )
+        audit.update(
+            {
+                "bundle_id": bundle_id,
+                "bundle_kind": "external",
+                "pool": pool,
+            }
+        )
+        audit["policies"]["scan_policy"] = scan_policy.to_dict()
+        (staging / "audit.json").write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        summary = {
+            "contract_version": CONTRACT_VERSION,
+            "bundle_id": bundle_id,
+            "bundle_kind": "external",
+            "pool": pool,
+            "frame_count": len(result.frames),
+            "video_count": len(
+                {(row.game, row.label, row.video_id) for row in result.frames}
+            ),
+            "content_hash_required": True,
+        }
+        (staging / "external_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        for name in EXTERNAL_BUNDLE_ARTIFACT_NAMES:
+            os.replace(staging / name, output_dir / name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    write_bundle_manifest(
+        output_dir,
+        bundle_id,
+        artifact_names=EXTERNAL_BUNDLE_ARTIFACT_NAMES,
+        bundle_kind="external",
+        pool=pool,
+    )
+    verify_external_bundle(output_dir, pool=pool)
+    return summary
+
+
 def write_split_bundle(
     train_all_root: str | Path,
     test_root: str | Path,
@@ -1039,8 +1248,8 @@ def write_split_bundle(
             "data.split.mode must be 'from_train' when writing a split "
             f"bundle, got {split_config.get('mode')!r}"
         )
-    if split_config.get("group_key", "source_video_uid") != "source_video_uid":
-        raise ValueError("data.split.group_key must be 'source_video_uid'")
+    if split_config.get("group_key", "stable_source_id") != "stable_source_id":
+        raise ValueError("data.split.group_key must be 'stable_source_id'")
     if split_config.get("balance_by", "legal_pair_count") != "legal_pair_count":
         raise ValueError("data.split.balance_by must be 'legal_pair_count'")
     if identity_mode not in ("game_video", "game_label_video"):
@@ -1114,7 +1323,7 @@ def write_split_bundle(
     train_frames: list[FrameRecord] = []
     val_frames: list[FrameRecord] = []
     for frame in train_all.frames:
-        uid = source_video_uid(
+        uid = stable_source_id(
             frame.game, frame.video_id, frame.label, mode=identity_mode
         )
         if assignment[uid] == "val":

@@ -60,7 +60,7 @@ class TrainableRulesResumeTests(unittest.TestCase):
         return config
 
     def test_rules_run_saves_fingerprint_and_resumes(self) -> None:
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory)
@@ -89,7 +89,7 @@ class TrainableRulesResumeTests(unittest.TestCase):
         step-0 optimizer. Resume must rebuild the optimizer for the SAVED step
         before loading, or ``load_state_dict`` raises "loaded state dict has a
         different number of parameter groups"."""
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory)
@@ -131,7 +131,7 @@ class TrainableRulesResumeTests(unittest.TestCase):
         """
         from unittest import mock
 
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         recorded: list[list[float]] = []
 
@@ -161,7 +161,7 @@ class TrainableRulesResumeTests(unittest.TestCase):
             self.assertAlmostEqual(recorded[4][-1], 0.1 * expected, places=8)
 
     def test_changed_rules_block_resume(self) -> None:
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory)

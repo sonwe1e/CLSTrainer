@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -75,7 +57,6 @@ pair:
 sampler:
   game_alpha: 0.25
   class_probability: {{0: 0.5, 1: 0.5}}
-  deduplicate_within_global_batch: true
 
 optimizer:
   learning_rate: 0.001

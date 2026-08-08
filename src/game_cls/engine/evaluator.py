@@ -1113,7 +1113,9 @@ def evaluate(
     negative_tail_percentiles = _histogram_probability_percentiles(
         negative_histogram, auc_histogram_bins, (0.99, 0.999)
     )
-    negative_score_max = _histogram_max_probability(negative_histogram, auc_histogram_bins)
+    negative_score_max = _histogram_max_probability(
+        negative_histogram, auc_histogram_bins
+    )
     ece_tail_95_100 = (
         _ece_tail(
             calibration_counts,
@@ -1151,22 +1153,12 @@ def evaluate(
             "sample_count": int(sample_count),
             "threshold": threshold,
             "threshold_is_business_score": True,
-            # Neutral names: the decision threshold is configurable, so the
-            # metric names must not bake in a fixed 0.99. Legacy _tau099
-            # aliases are kept for backward compatibility with old reports
-            # and configs.
+            # Neutral names: the decision threshold is configurable.
             "global_f1_at_decision_threshold": global_binary.f1,
             "macro_game_f1_at_decision_threshold": (
                 sum(row["f1"] for row in by_game) / len(by_game) if by_game else 0.0
             ),
             "worst_game_f1_at_decision_threshold": (
-                min(row["f1"] for row in by_game) if by_game else 0.0
-            ),
-            "global_f1_tau099": global_binary.f1,
-            "macro_game_f1_tau099": (
-                sum(row["f1"] for row in by_game) / len(by_game) if by_game else 0.0
-            ),
-            "worst_game_f1_tau099": (
                 min(row["f1"] for row in by_game) if by_game else 0.0
             ),
             "positive_margin_pass_rate": (

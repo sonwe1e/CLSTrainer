@@ -58,7 +58,7 @@ _NEW_TRANSFORM_BLOCKS: dict[str, dict] = {
 }
 
 # A full augmentation block with every new transform explicitly disabled; the
-# master switch and the legacy transforms are irrelevant to these tests.
+# master switch and the inactive transforms are irrelevant to these tests.
 _ALL_DISABLED: dict[str, dict] = {
     name: {"enabled": False, **{k: v for k, v in block.items() if k != "enabled"}}
     for name, block in _NEW_TRANSFORM_BLOCKS.items()

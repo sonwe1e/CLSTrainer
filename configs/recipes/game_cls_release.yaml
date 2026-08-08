@@ -71,7 +71,7 @@ data:
   backend: png
   frame_extensions: [".png"]
   # Per-video metadata joined AFTER the split (never part of split identity):
-  # source_video_uid -> negative_subtype / sample_weight. Build it with
+  # stable_source_id -> negative_subtype / sample_weight. Build it with
   #   cls-trainer dataset annotate --config <this file>
   # The file must exist and must carry at least one hard_subtypes row before
   # training starts; hard_negative.enabled refuses to launch otherwise instead
@@ -101,7 +101,6 @@ pair:
 sampler:
   game_alpha: 0.25
   class_probability: {0: 0.5, 1: 0.5}
-  deduplicate_within_global_batch: true
 
 optimizer:
   learning_rate: 0.001

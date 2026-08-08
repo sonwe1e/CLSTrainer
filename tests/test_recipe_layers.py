@@ -18,7 +18,7 @@ class RecipeLayerTests(unittest.TestCase):
         # contract layer
         self.assertEqual(config["decision"]["threshold"], 0.99)
         self.assertEqual(config["pair"]["test_delta"], 2)
-        self.assertEqual(config["model"]["trainable_name_contains"], "cls")
+        self.assertIn("cls_head", config["model"]["trainable_rules"])
         self.assertEqual(config["data"]["width"], 448)
         # profile layer
         self.assertEqual(config["device"]["accelerator"], "cpu")
@@ -126,7 +126,8 @@ class RecipeLayerTests(unittest.TestCase):
 
 class InitCommandTests(unittest.TestCase):
     def test_init_writes_a_valid_recipe(self) -> None:
-        from game_cls.cli import build_parser, cmd_init
+        from game_cls.cli.init_cmd import cmd_init
+        from game_cls.cli.parser import build_parser
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "my_recipe.yaml"
@@ -159,7 +160,8 @@ class InitCommandTests(unittest.TestCase):
             self.assertEqual(config["device"]["accelerator"], "npu")
 
     def test_init_refuses_unknown_profile(self) -> None:
-        from game_cls.cli import build_parser, cmd_init
+        from game_cls.cli.init_cmd import cmd_init
+        from game_cls.cli.parser import build_parser
 
         parser = build_parser()
         args = parser.parse_args(

@@ -8,6 +8,8 @@ import shutil
 from functools import lru_cache
 from pathlib import Path
 
+from game_cls.contract import CONTRACT_VERSION, require_contract, stamp_payload
+
 
 def _rules_fingerprint(config: dict) -> str | None:
     """Stable fingerprint of ``model.trainable_rules`` (None when absent)."""
@@ -39,7 +41,7 @@ def _atomic_json_save(payload: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        json.dumps(stamp_payload(payload), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     os.replace(temporary, path)
@@ -74,6 +76,7 @@ def clone_checkpoint_pair(
     source_metadata = output_dir / f"model_{source_tag}.metadata.json"
     if source_metadata.is_file():
         metadata = json.loads(source_metadata.read_text(encoding="utf-8"))
+        require_contract(metadata, f"Checkpoint metadata {source_metadata}")
         metadata["filename"] = f"model_{target_tag}.pth"
         metadata["alias_source"] = f"model_{source_tag}.pth"
         _atomic_json_save(metadata, output_dir / f"model_{target_tag}.metadata.json")
@@ -123,15 +126,14 @@ def _numpy_state_to_primitives(state) -> tuple:
 def _numpy_state_from_primitives(state) -> tuple:
     """Rebuild a numpy RNG state serialized by ``_numpy_state_to_primitives``.
 
-    Accepts both the primitives form (list keys, current format) and a legacy
-    raw ``np.random.get_state()`` tuple (ndarray keys) so old checkpoints still
-    restore.
+    Only the contract-5 primitive representation is accepted.
     """
     import numpy as np
 
     name, keys, pos, has_gauss, cached = state
-    if not isinstance(keys, np.ndarray):
-        keys = np.asarray(keys, dtype=np.uint32)
+    if not isinstance(keys, list):
+        raise RuntimeError("Checkpoint NumPy RNG state is not contract 5.")
+    keys = np.asarray(keys, dtype=np.uint32)
     return (name, keys, pos, has_gauss, cached)
 
 
@@ -239,8 +241,11 @@ def save_checkpoint_pair(
         and Path(base_checkpoint).is_file()
         else None
     )
+    from game_cls.data.identity import compute_dataset_identity
+
     _atomic_torch_save(
         {
+            "contract_version": CONTRACT_VERSION,
             "cls_training_checkpoint": True,
             "model": checkpoint_state_dict,
             "model_state_mode": state_mode,
@@ -282,6 +287,7 @@ def save_checkpoint_pair(
             "rank_random_states": rank_random_states,
             "evaluation_state": evaluation_state or {},
             "config": config,
+            "dataset_identity": compute_dataset_identity(config, verify_content=False),
         },
         output_dir / f"checkpoint_{tag}.pth",
     )
@@ -306,6 +312,7 @@ def restore_training_checkpoint(
     # then checked as a post-load contract so a foreign checkpoint is refused
     # even when it happens to be pickle-safe.
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    require_contract(checkpoint, f"Training checkpoint {path}")
     if not checkpoint.get("cls_training_checkpoint"):
         raise RuntimeError(
             f"{path} is not a CLSTrainer internal training checkpoint "
@@ -318,17 +325,32 @@ def restore_training_checkpoint(
     # programmatic caller) is covered.  The CLI --resume gate alone was
     # insufficient because train.resume_path= bypasses it entirely.
     if current_config is not None and isinstance(checkpoint.get("config"), dict):
-        from game_cls.cli.common import check_resume_drift
+        from game_cls.cli.common import check_resume_drift, classify_resume
 
-        _critical, _ = check_resume_drift(checkpoint["config"], current_config)
-        if _critical:
+        _critical, _warnings = check_resume_drift(checkpoint["config"], current_config)
+        resume_type = classify_resume(checkpoint["config"], current_config, _warnings)
+        if _critical or resume_type == "fork":
             raise RuntimeError(
-                "Resume refused: critical config drift detected between the "
+                "Resume refused: config drift requires a fork between the "
                 "checkpoint's stored config and the current run config:\n"
-                + "\n".join(f"  - {c}" for c in _critical)
+                + "\n".join(f"  - {c}" for c in [*_critical, *_warnings])
                 + "\nUse --fork to start a new run from this checkpoint."
             )
-    state_mode = checkpoint.get("model_state_mode", "full")
+        from game_cls.data.identity import compute_dataset_identity
+
+        recorded_identity = checkpoint.get("dataset_identity")
+        if not isinstance(recorded_identity, dict):
+            raise RuntimeError(
+                "Resume checkpoint predates exact dataset identity; start a "
+                "new run or rebuild the checkpoint with this version."
+            )
+        current_identity = compute_dataset_identity(current_config, verify_content=True)
+        if current_identity != recorded_identity:
+            raise RuntimeError(
+                "Resume refused: dataset/sidecar identity changed since the "
+                "checkpoint was written. Start a fork with the new data."
+            )
+    state_mode = checkpoint["model_state_mode"]
     if state_mode == "trainable_only":
         stored_hash = checkpoint.get("base_checkpoint_sha256")
         if stored_hash and expected_base_checkpoint:
@@ -351,9 +373,7 @@ def restore_training_checkpoint(
                 key.startswith(name.rsplit(".", 1)[0] + ".") for name in trainable_names
             )
         }
-        stored_expected = set(
-            checkpoint.get("expected_trainable_state_keys", checkpoint["model"].keys())
-        )
+        stored_expected = set(checkpoint["expected_trainable_state_keys"])
         actual_keys = set(checkpoint["model"])
         if stored_expected != current_expected or actual_keys != current_expected:
             raise RuntimeError(

@@ -14,13 +14,17 @@ class TrainingSmokeTests(unittest.TestCase):
         from game_cls.model.builder import build_demo_model
         from game_cls.model.freeze_policy import (
             assert_frozen_parameters_unchanged,
-            configure_trainable_parameters,
             snapshot_frozen_parameters,
         )
+        from game_cls.model.trainable_rules import apply_trainable_state, parse_rules
 
         torch.manual_seed(3)
         model = build_demo_model({})
-        configure_trainable_parameters(model)
+        apply_trainable_state(
+            model,
+            parse_rules({"head": {"pattern": r"^cls\.", "lr_scale": 1.0}}),
+            0,
+        )
         frozen = snapshot_frozen_parameters(model)
         optimizer = torch.optim.AdamW(
             [parameter for parameter in model.parameters() if parameter.requires_grad],

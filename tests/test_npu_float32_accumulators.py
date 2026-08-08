@@ -76,7 +76,7 @@ class IntervalAccumulatorTests(unittest.TestCase):
         self.torch = torch
 
     def test_accumulators_are_float32_and_reduce_to_float(self) -> None:
-        from game_cls.engine.trainer import (
+        from game_cls.engine.training.evaluation import (
             _new_interval_accumulator,
             _reduce_interval_accumulator,
         )
@@ -142,7 +142,7 @@ def _threshold_weight_worker(
     import torch
     import torch.distributed as dist
 
-    from game_cls.engine.trainer import (
+    from game_cls.engine.training.evaluation import (
         _new_interval_accumulator,
         _reduce_interval_accumulator,
     )

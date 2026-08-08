@@ -14,7 +14,12 @@ pair:
 
 model:
   num_classes: 2
-  trainable_name_contains: cls
+  trainable_rules:
+    cls_head:
+      pattern: "cls"
+      lr_scale: 1.0
+      unfreeze_at_step: 0
+      priority: 0
   freeze_backbone_batchnorm_stats: true
   freeze_cls_batchnorm_stats: true
   require_pretrained_backbone: true

@@ -33,7 +33,7 @@ from game_cls.data.splitter import (
     format_source_identity_precheck,
     load_split_manifest,
     source_identity_precheck,
-    source_video_uid,
+    stable_source_id,
 )
 
 
@@ -68,7 +68,7 @@ class StableAndContentVersionIdentityTests(unittest.TestCase):
 
     The source identity namespaces are audit-boundary-only, so coincidentally
     equal train/test local numbering must never collapse at the metadata layer.
-    The canonical ``source_video_uid`` therefore carries a content signature
+    The canonical ``stable_source_id`` therefore carries a content signature
     (frame count + ordered per-frame hashes) that distinguishes distinct pools
     without touching the namespace dimension.
     """
@@ -177,7 +177,7 @@ class StableAndContentVersionIdentityTests(unittest.TestCase):
         )
         entries = classification["pairs"].get("train__test", [])
         self.assertEqual(
-            [entry["source_video_uid"] for entry in entries], ["MC::0::01"]
+            [entry["stable_source_id"] for entry in entries], ["MC::0::01"]
         )
         self.assertEqual(entries[0]["shared_content_frames"], 2)
 
@@ -198,9 +198,7 @@ class StableAndContentVersionIdentityTests(unittest.TestCase):
             write_video_entries_parquet(videos, path)
             restored = read_video_entries_parquet(path)
             self.assertEqual(len(restored), 1)
-            self.assertEqual(
-                restored[0].source_version_id, videos[0].source_version_id
-            )
+            self.assertEqual(restored[0].source_version_id, videos[0].source_version_id)
             self.assertEqual(
                 restored[0].stable_source_id,
                 videos[0].stable_source_id,
@@ -242,19 +240,19 @@ def write_video_frames(
 
 class SourceIdentityModeTests(unittest.TestCase):
     def test_uid_defaults_to_game_video(self) -> None:
-        self.assertEqual(source_video_uid("g", "01"), "g::01")
-        self.assertEqual(source_video_uid("g", "01", 0, mode="game_video"), "g::01")
+        self.assertEqual(stable_source_id("g", "01"), "g::01")
+        self.assertEqual(stable_source_id("g", "01", 0, mode="game_video"), "g::01")
 
     def test_game_label_video_mode_namespaced_by_label(self) -> None:
         self.assertEqual(
-            source_video_uid("g", "01", 0, mode="game_label_video"), "g::0::01"
+            stable_source_id("g", "01", 0, mode="game_label_video"), "g::0::01"
         )
         self.assertEqual(
-            source_video_uid("g", "01", 1, mode="game_label_video"), "g::1::01"
+            stable_source_id("g", "01", 1, mode="game_label_video"), "g::1::01"
         )
         self.assertNotEqual(
-            source_video_uid("g", "01", 0, mode="game_label_video"),
-            source_video_uid("g", "01", 1, mode="game_label_video"),
+            stable_source_id("g", "01", 0, mode="game_label_video"),
+            stable_source_id("g", "01", 1, mode="game_label_video"),
         )
 
     def test_source_identity_modes_are_defined(self) -> None:
@@ -264,17 +262,17 @@ class SourceIdentityModeTests(unittest.TestCase):
     def test_uid_accepts_namespace_kwarg(self) -> None:
         # step8: the audit-boundary source-pool namespace prefixes the uid.
         self.assertEqual(
-            source_video_uid("g", "01", namespace="train_pool"), "train_pool::g::01"
+            stable_source_id("g", "01", namespace="train_pool"), "train_pool::g::01"
         )
         self.assertEqual(
-            source_video_uid(
+            stable_source_id(
                 "g", "01", 0, mode="game_label_video", namespace="train_pool"
             ),
             "train_pool::g::0::01",
         )
-        # Empty / absent namespace keeps the legacy uid byte-for-byte.
-        self.assertEqual(source_video_uid("g", "01", namespace=""), "g::01")
-        self.assertEqual(source_video_uid("g", "01", namespace=None), "g::01")
+        # Empty / absent namespace keeps the stable id byte-for-byte.
+        self.assertEqual(stable_source_id("g", "01", namespace=""), "g::01")
+        self.assertEqual(stable_source_id("g", "01", namespace=None), "g::01")
 
 
 class SourceIdentityPrecheckTests(unittest.TestCase):
@@ -400,9 +398,7 @@ class SourceIdentityNamespaceConfigTests(unittest.TestCase):
                 )
             )
 
-    def test_aliased_test_namespaces_rejected(self) -> None:
-        # When test_index is aliased as validation, declaring distinct test
-        # namespaces would bypass the train/val source-identity check.
+    def test_source_and_test_namespaces_are_accepted(self) -> None:
         config = load_config("configs/recipes/example_debug.yaml")
         data = config["data"]
         data["test_index"] = "indexes/test_frames.parquet"
@@ -410,15 +406,14 @@ class SourceIdentityNamespaceConfigTests(unittest.TestCase):
             "source": "train_pool",
             "test": "heldout_pool",
         }
-        with self.assertRaisesRegex(ConfigSchemaError, "aliases test_index"):
-            finalize_config(config)
+        finalize_config(config)
 
 
 class SourceIdentityParityTests(unittest.TestCase):
-    def test_indexing_reuses_splitter_source_video_uid(self) -> None:
+    def test_indexing_reuses_splitter_stable_source_id(self) -> None:
         from game_cls.data import indexing, splitter
 
-        self.assertIs(indexing.source_video_uid, splitter.source_video_uid)
+        self.assertIs(indexing.stable_source_id, splitter.stable_source_id)
 
 
 @unittest.skipIf(pq is None, "pyarrow is not installed in the current interpreter")
@@ -448,7 +443,7 @@ class SourceIdentityBundleTests(unittest.TestCase):
             "mode": "from_train",
             "val_ratio": 0.2,
             "seed": 20260728,
-            "group_key": "source_video_uid",
+            "group_key": "stable_source_id",
             "stratify_by": ["game", "label"],
             "balance_by": "legal_pair_count",
             "target_delta": 2,
@@ -594,7 +589,7 @@ class SourceIdentityNamespaceBundleTests(unittest.TestCase):
             "mode": "from_train",
             "val_ratio": 0.2,
             "seed": 20260728,
-            "group_key": "source_video_uid",
+            "group_key": "stable_source_id",
             "stratify_by": ["game", "label"],
             "balance_by": "legal_pair_count",
             "target_delta": 2,
@@ -656,10 +651,15 @@ class SourceIdentityNamespaceBundleTests(unittest.TestCase):
                 namespaces_by_split=namespaces_by_split,
             )
             leakage = audit["leakage"]
-            self.assertEqual(leakage["source_video_uid_overlap"]["train__test"], [])
-            self.assertEqual(leakage["source_video_uid_overlap"]["train__val"], [])
-            self.assertEqual(leakage["source_video_uid_overlap"]["val__test"], [])
-            self.assertEqual(leakage["video_keys_across_splits"], [])
+            self.assertEqual(leakage["stable_source_id_overlap"]["train__test"], [])
+            self.assertEqual(leakage["stable_source_id_overlap"]["train__val"], [])
+            self.assertEqual(leakage["stable_source_id_overlap"]["val__test"], [])
+            self.assertTrue(
+                all(
+                    not values
+                    for values in leakage["split_pair_video_key_overlap"].values()
+                )
+            )
             self.assertEqual(
                 leakage["source_identity_namespaces"],
                 dict(sorted(namespaces_by_split.items())),

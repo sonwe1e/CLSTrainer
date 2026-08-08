@@ -1,3 +1,8 @@
+# CLSTrainer 5.0.0 配置参考
+
+``cls-trainer config reference`` 根据当前 Schema 自动生成。
+
+```text
 augmentation.blur.enabled  [bool]
     Enable Gaussian blur.
 augmentation.blur.kernel_size  [int]
@@ -87,7 +92,7 @@ augmentation.random_resized_crop.scale  [list]
 augmentation.random_resized_crop.size  [list]
     Output size [height, width].
 benchmark.gate_metrics  [dict]
-    Release/benchmark gates keyed by the metric name the evaluator emits, each {op: "<="|"<"|">="|">", value: <number>}, e.g. {global_fpr_at_decision_threshold: {op: "<=", value: 0.01}, global_positive_recall_at_decision_threshold: {op: ">=", value: 0.8}}. A bare scalar bound is still accepted and means the metric's natural bound (upper for FPR/ECE/Brier/loss/negative-score, lower for recall/F1/precision/specificity/accuracy); metrics with no documented direction (sample_count, threshold) require the explicit form. Unknown metric names or operators are config errors; unmet gates fail the command.
+    Release/benchmark gates keyed by the metric name the evaluator emits, each {op: "<="|"<"|">="|">", value: <number>}, e.g. {global_fpr_at_decision_threshold: {op: "<=", value: 0.01}, global_positive_recall_at_decision_threshold: {op: ">=", value: 0.8}}. Every gate must use the explicit form; bare scalar bounds, unknown metric names and unknown operators are config errors. Unmet gates fail the command.
 benchmark.output_dir  [str]
     Directory for benchmark reports and data probes.
 checkpoint.full_model_every_steps  [int]
@@ -96,8 +101,6 @@ checkpoint.periodic_state_mode  [str] (choices: full|trainable_only)
     Periodic checkpoint content: full state or trainable-only.
 checkpoint.save_best_selection  [bool]
     Clone the best validation selection-score checkpoint (model_best_selection.pth).
-checkpoint.save_best_test_f1  [bool] (legacy)
-    Legacy alias of save_best_selection.
 checkpoint.save_best_val_loss  [bool]
     Clone the best validation loss checkpoint (model_best_val_loss.pth).
 checkpoint.save_best_worst_game  [bool]
@@ -106,8 +109,8 @@ checkpoint.save_last_every_steps  [int]
     Periodic resume checkpoint cadence; 0 disables.
 checkpoint.save_topk  [int]
     Keep the top-N full-validation checkpoints ranked by checkpoint.topk_monitor (saved as model_topk_<step>.pth); 0 disables. Enabling it forces a last-checkpoint save after every full validation so the topk snapshot always matches the evaluated weights.
-checkpoint.topk_monitor  [str] (choices: selection_score|selection|cross_entropy|worst_game_f1_at_decision_threshold)
-    `selection_score` (alias `selection`) ranks topk checkpoints by the unified selection contract, the same ordering as best-checkpoint selection; ineligible checkpoints are admitted but ranked strictly below every eligible one. Any other value names one numeric metric: lower is better for `cross_entropy`, higher is better otherwise.
+checkpoint.topk_monitor  [str] (choices: selection_score|cross_entropy|worst_game_f1_at_decision_threshold)
+    `selection_score` ranks topk checkpoints by the unified selection contract, the same ordering as best-checkpoint selection; ineligible checkpoints are admitted but ranked strictly below every eligible one. Any other value names one numeric metric: lower is better for `cross_entropy`, higher is better otherwise.
 data.audit_path  [str]
     Path to audit.json produced by audit_dataset.
 data.backend  [str] (choices: png|packed_uint8)
@@ -117,9 +120,9 @@ data.challenge_index  [str|null]
 data.challenge_metadata  [str|null]
     Optional challenge-set metadata sidecar.
 data.challenge_packed_index  [str|null]
-    packed_uint8 shard index of the challenge set; required when data.backend=packed_uint8.
+    packed_uint8 shard index of the challenge set; when set, the challenge uses packed storage independently of data.backend.
 data.challenge_packed_video_index  [str|null]
-    Video-level index of the packed challenge set; falls back to challenge_video_index when unset.
+    Video-level index of the packed challenge set; required with challenge_packed_index.
 data.challenge_video_index  [str|null]
     Challenge-set video-level index.
 data.channels  [int]
@@ -163,7 +166,7 @@ data.ignore_file_globs  [list]
 data.ignored_example_limit  [int]
     Max example paths kept per ignored-file category.
 data.metadata_sidecar  [str|null]
-    Optional per-video metadata parquet keyed by source_video_uid (negative_subtype, sample_weight). Joined AFTER the split; never part of split/dedup identity (step5 P2).
+    Optional contract-5 metadata parquet keyed by stable_source_id (negative_subtype, sample_weight). Joined AFTER the split; never part of split/dedup identity (step5 P2).
 data.minimum_pairs_per_game_label_delta  [dict]
     Minimum legal pairs per (game,label) for each delta, e.g. {2: 1}.
 data.mining.enabled  [bool]
@@ -177,17 +180,15 @@ data.mining.pool_index  [str|null]
 data.mining.pool_metadata  [str|null]
     Optional sidecar of the mining pool (subtype_before).
 data.mining.pool_packed_index  [str|null]
-    packed_uint8 shard index of the mining pool; required when data.backend=packed_uint8.
+    packed_uint8 shard index of the mining pool; when set, this external pool uses packed storage independently of data.backend.
 data.mining.pool_packed_video_index  [str|null]
-    Video-level index of the packed mining pool; falls back to pool_video_index when unset.
+    Video-level index of the packed mining pool; required with pool_packed_index.
 data.mining.pool_video_index  [str|null]
     Video-level index of the mining pool.
 data.mining.score_threshold  [float|null]
     Optional p_positive floor; only negatives at or above it are kept.
 data.mining.top_k_per_video  [int]
     Max negatives kept per source video (avoids continuous frames drowning the manifest).
-data.mining.version  [int]
-    Mining manifest format version.
 data.packed_max_open_shards  [int]
     LRU limit of simultaneously memmapped packed shards.
 data.prepare_if_missing  [bool]
@@ -195,7 +196,7 @@ data.prepare_if_missing  [bool]
 data.require_content_hash_audit  [bool]
     Audit must include SHA-256 content hashes.
 data.require_independent_test  [bool]
-    Production acceptance gate: refuse to train when the test split is aliased as the validation split.
+    Production acceptance gate: require a dedicated test split distinct from validation.
 data.require_unique_video_keys_across_splits  [bool]
     Treat cross-split duplicate two-digit video ids as fatal.
 data.source_root  [str|null]
@@ -213,15 +214,15 @@ data.source_video_identity.namespaces.train  [str]
 data.source_video_identity.namespaces.val  [str]
     Source-pool namespace for the validation split; must equal train.
 data.split  [dict]
-    Source-video-level train/validation split configuration (step4 ���).
+    Source-video-level train/validation split configuration (step4 ���).
 data.split.balance_by  [str]
     Balancing statistic; must be 'legal_pair_count'.
 data.split.group_key  [str]
-    Split unit identity; must be 'source_video_uid'.
+    Split unit identity; must be 'stable_source_id'.
 data.split.manifest  [str]
     Split manifest parquet path, relative to the index output dir (default: split_manifest.parquet).
 data.split.mode  [str] (choices: off|from_train)
-    Split derivation mode: 'off' keeps the legacy three-root index layout; 'from_train' scans source_root once and derives train/val by source video.
+    Split derivation mode: 'off' consumes prepared indexes; 'from_train' scans source_root once and derives train/val by source video.
 data.split.on_new_groups  [str] (choices: error|extend)
     Behavior when the dataset fingerprint changes: 'error' refuses to silently re-shuffle, 'extend' keeps every existing assignment and places only the new source videos. A change to seed, val_ratio or target_delta is always an error regardless of this setting.
 data.split.seed  [int]
@@ -234,22 +235,20 @@ data.split.target_delta  [int]
     Frame delta whose pair count drives balancing (1, 2 or 3).
 data.split.val_ratio  [float]
     Fraction of source-video legal pairs moved to validation; strictly between 0 and 1 when mode is from_train.
-data.split_migration  [dict]
-    Auto-generated notes describing legacy split aliasing (set by finalize_config; do not configure manually).
 data.strict_audit  [bool]
     Require a passing dataset audit before creating DataLoaders.
 data.synthetic  [bool]
     Use the built-in synthetic dataset (smoke tests only).
-data.test_index  [str]
-    Test frame index parquet.
+data.test_index  [str|null]
+    Optional independent test frame index parquet.
 data.test_packed_index  [str|null]
     Packed test shard index (packed_uint8 backend).
 data.test_packed_video_index  [str|null]
     Packed test integer video index.
 data.test_root  [str|null]
     Independent test root used with split.mode=from_train.
-data.test_video_index  [str]
-    Test video-level entries parquet (row-per-video).
+data.test_video_index  [str|null]
+    Optional independent test video-level entries parquet.
 data.train_index  [str]
     Train frame index parquet.
 data.train_packed_index  [str|null]
@@ -261,13 +260,13 @@ data.train_video_index  [str]
 data.unexpected_nested_directory_severity  [str] (choices: info|warning|error)
     Severity for unexpected nested directories.
 data.val_index  [str|null]
-    Validation frame index parquet. When omitted, test_index is aliased as validation and the run has no independent test set.
+    Validation frame index parquet; required for real-data training.
 data.val_packed_index  [str|null]
     Packed validation shard index (packed_uint8 backend).
 data.val_packed_video_index  [str|null]
     Packed validation integer video index.
 data.val_video_index  [str|null]
-    Validation video-level entries parquet (row-per-video).
+    Validation video-level entries parquet; required for real-data training.
 data.width  [int]
     Frame width in pixels (task profile default: 448).
 dataloader.eval.num_workers  [int]
@@ -280,14 +279,6 @@ dataloader.eval.prefetch_factor  [int]
     Batches prefetched per worker.
 dataloader.multiprocessing_context  [str|null] (choices: spawn|fork|forkserver)
     Worker start method; NPU forces spawn.
-dataloader.num_workers  [int] (legacy)
-    Fallback worker count; role-specific dataloader.train/eval values win when present.
-dataloader.persistent_workers  [bool] (legacy)
-    Fallback persistent_workers.
-dataloader.pin_memory  [bool] (legacy)
-    Fallback pin_memory.
-dataloader.prefetch_factor  [int] (legacy)
-    Fallback prefetch_factor.
 dataloader.timeout_seconds  [float]
     Max wait per batch before a DataLoader timeout.
 dataloader.train.num_workers  [int]
@@ -321,9 +312,9 @@ early_stopping.full_validation_only  [bool]
 early_stopping.min_delta  [float]
     Minimum improvement that counts as an improvement; smaller deltas increment the patience counter.
 early_stopping.mode  [str] (choices: max|min)
-    max: higher monitor values are better; min: lower values. Applies only to non-selection monitors (any `monitor` other than `selection_score`/`selection`); `mode: min` combined with a selection monitor is a config error because the selection rank key is always bigger-is-better.
-early_stopping.monitor  [str] (choices: selection_score|selection|cross_entropy|objective_loss|worst_game_f1_at_decision_threshold|worst_game_f1_tau099)
-    Metric or selection contract watched for improvement. `selection_score` (alias `selection`) follows the unified selection contract: improvement is judged by the same ordering as best-checkpoint selection; in constrained mode that is (global_positive_recall, worst_game_positive_recall, -negative_score_p999), with ineligible evaluations counting toward patience rather than resetting it. Any other value names one numeric metric and uses the plain `mode` comparison.
+    max: higher monitor values are better; min: lower values. Applies only to non-selection monitors (any `monitor` other than `selection_score`); `mode: min` combined with a selection monitor is a config error because the selection rank key is always bigger-is-better.
+early_stopping.monitor  [str] (choices: selection_score|cross_entropy|objective_loss|worst_game_f1_at_decision_threshold)
+    Metric or selection contract watched for improvement. `selection_score` follows the unified selection contract: improvement is judged by the same ordering as best-checkpoint selection; in constrained mode that is (global_positive_recall, worst_game_positive_recall, -negative_score_p999), with ineligible evaluations counting toward patience rather than resetting it. Any other value names one numeric metric and uses the plain `mode` comparison.
 early_stopping.patience_evaluations  [int]
     Consecutive non-improving full validations tolerated before stopping.
 early_stopping.restore_best  [bool]
@@ -336,10 +327,6 @@ evaluation.auc_histogram_bins  [int]
     Histogram bins for AUC estimation.
 evaluation.full_auc_mode  [str] (choices: histogram|exact)
     Distributed AUC strategy: fixed histogram or exact gather.
-evaluation.full_test_at_end  [bool] (legacy)
-    Legacy alias of val_full_at_end; migrated automatically.
-evaluation.full_test_every_steps  [int] (legacy)
-    Legacy alias of val_full_every_steps; migrated automatically.
 evaluation.group_by_negative_subtype  [bool]
     Add a game_label_subtype group catalog to evaluation and compute worst-subtype FPR/recall metrics (requires sidecar metadata with non-null negative_subtype).
 evaluation.html_max_errors_per_group  [int]
@@ -360,12 +347,8 @@ evaluation.parquet_row_group_size  [int]
     Records accumulated before writing a parquet row group.
 evaluation.quick_save_error_limit  [int]
     Global cap on quick-test error exports.
-evaluation.quick_test_every_steps  [int] (legacy)
-    Legacy alias of val_quick_every_steps; migrated automatically.
-evaluation.quick_test_pairs_per_video  [int] (legacy)
-    Legacy alias of val_quick_pairs_per_video; migrated automatically.
-evaluation.selection_metric  [str] (choices: global_f1_at_decision_threshold|macro_game_f1_at_decision_threshold|worst_game_f1_at_decision_threshold|global_f1_tau099|macro_game_f1_tau099|worst_game_f1_tau099|composite)
-    Metric used to pick the best checkpoint. Neutral names do not bake in a fixed decision threshold; the legacy _tau099 names are still accepted.
+evaluation.selection_metric  [str] (choices: global_f1_at_decision_threshold|macro_game_f1_at_decision_threshold|worst_game_f1_at_decision_threshold|composite)
+    Metric used to pick the best checkpoint.
 evaluation.selection_mode  [str] (choices: metric|composite|constrained)
     Model-selection strategy: metric (single metric), composite (weighted F1), or constrained (FPR/recall gates then recall/worst-recall/p99.9 ranking).
 evaluation.selection_weights  [dict]
@@ -374,8 +357,6 @@ evaluation.tail_calibration_enabled  [bool]
     Compute ece_tail_95_100 in evaluation.
 evaluation.tensorboard_live  [bool]
     Write TensorBoard scalars during training when the tensorboard package is importable; 0-cost when absent.
-evaluation.threshold  [float] (legacy)
-    Legacy copy of decision.threshold. Prefer decision.threshold; conflicting values are rejected.
 evaluation.train_probe_every_steps  [int]
     Train-probe cadence (augmentation-free train subset evaluated like validation); 0 disables.
 evaluation.train_probe_pairs_per_video  [int]
@@ -391,11 +372,11 @@ evaluation.val_quick_pairs_per_video  [int]
 experiment.name  [str]
     Human readable run name; used in the unique run directory name.
 experiment.output_dir  [str]
-    Run output location. With run_mode=unique it is the runs ROOT: every start creates a fresh dated subdirectory underneath it.
-experiment.run_mode  [str] (choices: fixed|unique)
-    fixed: write directly into output_dir (legacy). unique: allocate an immutable timestamped run directory under output_dir.
+    Runs root; every fresh start creates a dated immutable subdirectory underneath it.
 experiment.seed  [int]
     Base RNG seed; each rank adds its rank id.
+experiment.smoke_mode  [bool]
+    Mark a run as a smoke test so the production safety policy is relaxed (e.g. the require-a-full-validation-source gate). Real training must never set this; the NPU smoke stages disable full validation to probe forward/spawn/augmentation/eval separately (audit PR-E: test-env policy and production safety policy must not fight each other).
 export.format  [str] (choices: weights|onnx)
     Default export format (weights|onnx).
 export.include_threshold  [bool]
@@ -409,7 +390,7 @@ export.verify_samples  [int]
 loss.cross_entropy_weight  [float]
     Weight of the CE component.
 loss.label_smoothing  [float]
-    Cross-entropy label smoothing. 0.0 keeps legacy behavior; keep small while the deployment threshold is fixed at 0.99.
+    Cross-entropy label smoothing; keep small while the deployment threshold is fixed at 0.99.
 loss.negative_tail_hard_negative_k  [int|null]
     Top-k hardest negatives for the tail OHEM; null uses all negatives.
 loss.negative_tail_loss_weight  [float]
@@ -418,8 +399,6 @@ loss.rank_loss_weight  [float]
     Weight of the positive-vs-hard-negative pairwise ranking component; 0 disables.
 loss.rank_margin  [float]
     Required logit margin between a positive and a hard negative in the ranking loss.
-loss.threshold  [float] (legacy)
-    Legacy copy of decision.threshold. Prefer decision.threshold; conflicting values are rejected.
 loss.threshold_loss_weight  [float]
     Maximum weight of the threshold margin loss.
 loss.threshold_ramp_ratio  [float]
@@ -440,8 +419,6 @@ model.factory  [str]
     Model factory 'package.module:function' returning a module that maps (image0, image1) to [B,2].
 model.freeze_backbone_batchnorm_stats  [bool]
     Keep backbone BatchNorm statistics frozen.
-model.freeze_batchnorm_stats  [bool] (legacy)
-    Legacy global BatchNorm freeze switch; prefer the two role-specific keys above.
 model.freeze_cls_batchnorm_stats  [bool]
     Keep cls-head BatchNorm statistics frozen (required for distributed training without SyncBatchNorm).
 model.kwargs  [dict]
@@ -450,10 +427,8 @@ model.num_classes  [int]
     Output classes (task profile default: 2).
 model.require_pretrained_backbone  [bool]
     Fail unless every non-cls weight is fully loaded from the base checkpoint.
-model.trainable_name_contains  [str]
-    Substring selecting trainable parameters (task profile default: cls).
 model.trainable_rules  [dict]
-    Staged partial unfreeze: dict keyed by rule name, each rule {pattern, lr_scale, unfreeze_at_step, priority}. When absent, trainable_name_contains is used (legacy behavior).
+    Staged partial unfreeze: dict keyed by rule name, each rule {pattern, lr_scale, unfreeze_at_step, priority}.
 optimizer.learning_rate  [float]
     Peak AdamW learning rate.
 optimizer.weight_decay  [float]
@@ -464,8 +439,6 @@ pair.train_delta_probability  [dict]
     Training frame-delta sampling distribution, e.g. {2: 0.7}.
 sampler.class_probability  [dict]
     Label sampling probability, e.g. {0: 0.5, 1: 0.5}.
-sampler.deduplicate_within_global_batch  [bool] (legacy)
-    Legacy alias of data.deduplication.level: true=pair, false=none.
 sampler.game_alpha  [float]
     Dirichlet smoothing for per-game balancing.
 scheduler.min_learning_rate  [float]
@@ -490,3 +463,4 @@ train.stop_after_steps  [int|null]
     Optional early stop for staged acceptance runs.
 train.verify_frozen_parameters  [bool]
     Assert frozen weights stay bitwise unchanged.
+```

@@ -1,6 +1,6 @@
-"""Staged partial unfreeze via per-rule training rules (step5 P4).
+"""Staged partial unfreeze via per-rule training rules.
 
-Replaces the single ``trainable_name_contains`` token with a set of rules,
+Uses a set of rules,
 each matching parameters by regex and optionally deferring their unfreeze
 until a global step, with a per-group learning-rate scale::
 
@@ -16,9 +16,7 @@ until a global step, with a per-group learning-rate scale::
           unfreeze_at_step: 1000
 
 A parameter is trainable iff ``global_step >= unfreeze_at_step`` for the
-highest-priority rule that matches it. When ``model.trainable_rules`` is
-absent, the legacy ``trainable_name_contains`` path is used unchanged, so
-existing configs are byte-identical.
+highest-priority rule that matches it.
 """
 
 from __future__ import annotations

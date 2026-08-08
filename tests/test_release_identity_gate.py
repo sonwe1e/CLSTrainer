@@ -23,15 +23,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 from game_cls.cli.config_tools import _release_identity_mismatches
+from game_cls.contract import CONTRACT_VERSION
 from game_cls.reports.benchmark import (
     canonical_config_sha256,
     challenge_bundle_fingerprint,
     gate_spec_fingerprint,
 )
 
-GATES_STRICT = {"global_fpr_at_decision_threshold": {"max": 0.01}}
-GATES_LAX = {"global_fpr_at_decision_threshold": {"max": 0.05}}
+GATES_STRICT = {"global_fpr_at_decision_threshold": {"op": "<=", "value": 0.01}}
+GATES_LAX = {"global_fpr_at_decision_threshold": {"op": "<=", "value": 0.05}}
 
 
 def _config(threshold: float, challenge: str | None) -> dict:
@@ -42,7 +46,7 @@ def _config(threshold: float, challenge: str | None) -> dict:
     return {"decision": {"threshold": threshold}, "data": data}
 
 
-def _bundle(directory: Path, *, metadata: bytes = b"meta-v1") -> dict:
+def _bundle(directory: Path, *, metadata: bytes = b"meta-a") -> dict:
     """A config pointing at a real on-disk challenge bundle.
 
     ``benchmark evaluate`` refuses to run without a challenge index at all, so
@@ -50,11 +54,33 @@ def _bundle(directory: Path, *, metadata: bytes = b"meta-v1") -> dict:
     exists. Writing the files makes the fingerprint recomputable on both sides,
     which is the state the identity comparison is designed for.
     """
-    frame_index = directory / "challenge_frames.parquet"
-    video_index = directory / "challenge_video_entries.parquet"
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+    from game_cls.data.indexing import write_external_bundle
+
+    source = directory / "source" / "game_a" / "0"
+    source.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.zeros((208, 448, 3), dtype=np.uint8)).save(
+        source / "0100001.png"
+    )
+    data_cfg = {
+        "frame_extensions": [".png"],
+        "ignore_directory_prefixes": ["_", "."],
+        "ignore_directory_names": ["__pycache__"],
+        "ignore_file_globs": [],
+    }
+    write_external_bundle(
+        directory / "source",
+        directory,
+        ImageSpec(width=448, height=208, channels=3),
+        ScanPolicy.from_config(data_cfg),
+        DuplicatePolicy(),
+        pool="challenge",
+        identity_mode="game_label_video",
+    )
+    frame_index = directory / "frames.parquet"
+    video_index = directory / "video_entries.parquet"
     sidecar = directory / "video_metadata.parquet"
-    frame_index.write_bytes(b"frames-v1")
-    video_index.write_bytes(b"videos-v1")
     sidecar.write_bytes(metadata)
     config = _config(0.99, str(video_index))
     config["data"]["challenge_index"] = str(frame_index)
@@ -66,13 +92,17 @@ def _bundle(directory: Path, *, metadata: bytes = b"meta-v1") -> dict:
 
 class ReleaseIdentityGateTests(unittest.TestCase):
     def _report(self, directory: Path, payload: dict) -> Path:
+        from game_cls.contract import stamp_payload
+
         path = directory / "report.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(json.dumps(stamp_payload(payload)), encoding="utf-8")
         return path
 
     def _payload(self, *, run_id: str, config: dict, gates: dict) -> dict:
         """The identity fields exactly as ``benchmark evaluate`` writes them."""
         fingerprint, components = challenge_bundle_fingerprint(config)
+        from game_cls.reports.benchmark import benchmark_source_fingerprint
+
         return {
             "run_id": run_id,
             "checkpoint_sha256": "SHARED_WEIGHTS",
@@ -80,6 +110,8 @@ class ReleaseIdentityGateTests(unittest.TestCase):
             "challenge_dataset_fingerprint": fingerprint,
             "challenge_bundle_components": components,
             "gate_spec_fingerprint": gate_spec_fingerprint(gates),
+            "contract_version": CONTRACT_VERSION,
+            "benchmark_source_sha256": benchmark_source_fingerprint(),
         }
 
     def test_matching_identity_is_accepted(self) -> None:
@@ -118,9 +150,7 @@ class ReleaseIdentityGateTests(unittest.TestCase):
     def test_changed_challenge_set_is_rejected(self) -> None:
         config = _config(0.99, None)
         with tempfile.TemporaryDirectory() as directory:
-            payload = self._payload(
-                run_id="runA", config=config, gates=GATES_STRICT
-            )
+            payload = self._payload(run_id="runA", config=config, gates=GATES_STRICT)
             payload["challenge_dataset_fingerprint"] = "CHALLENGE_A"
             report = self._report(Path(directory), payload)
             problems = _release_identity_mismatches(
@@ -133,7 +163,7 @@ class ReleaseIdentityGateTests(unittest.TestCase):
             f"expected a challenge fingerprint problem, got {problems}",
         )
 
-    def test_legacy_report_without_identity_fields_is_refused(self) -> None:
+    def test_report_without_identity_fields_is_refused(self) -> None:
         """A report that cannot prove identity is not a release gate."""
         config = _config(0.99, None)
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +191,24 @@ class ReleaseIdentityGateTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("unreadable", problems[0])
 
+    def test_corrupt_challenge_bundle_is_reported_as_identity_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _bundle(root)
+            report = self._report(
+                root,
+                self._payload(run_id="runA", config=config, gates=GATES_STRICT),
+            )
+            (root / "bundle_manifest.json").write_text("{}", encoding="utf-8")
+            problems = _release_identity_mismatches(
+                report,
+                run_id="runA",
+                config=config,
+                gate_metrics=GATES_STRICT,
+            )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("challenge identity cannot be verified", problems[0])
+
 
 class ChallengeBundleFingerprintTests(unittest.TestCase):
     """The challenge fingerprint must cover the whole bundle (audit P0-4).
@@ -176,7 +224,7 @@ class ChallengeBundleFingerprintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = _bundle(Path(directory))
             before, _ = challenge_bundle_fingerprint(config)
-            Path(config["data"]["challenge_metadata"]).write_bytes(b"meta-v2")
+            Path(config["data"]["challenge_metadata"]).write_bytes(b"meta-b")
             after, _ = challenge_bundle_fingerprint(config)
         self.assertNotEqual(before, after)
 
@@ -187,11 +235,12 @@ class ChallengeBundleFingerprintTests(unittest.TestCase):
             video_index = Path(config["data"]["challenge_video_index"])
             before_video = video_index.read_bytes()
             before, _ = challenge_bundle_fingerprint(config)
-            Path(config["data"]["challenge_index"]).write_bytes(b"frames-v2")
-            after, _ = challenge_bundle_fingerprint(config)
+            Path(config["data"]["challenge_index"]).write_bytes(b"frames-b")
+            with self.assertRaises((RuntimeError, ValueError)):
+                challenge_bundle_fingerprint(config)
             # The one file the old fingerprint hashed did not move at all.
             self.assertEqual(video_index.read_bytes(), before_video)
-        self.assertNotEqual(before, after)
+        self.assertTrue(before)
 
     def test_preprocessing_and_geometry_are_part_of_the_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -215,17 +264,29 @@ class ChallengeBundleFingerprintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = _bundle(root)
-            packed = root / "packed_frames.parquet"
-            packed.write_bytes(b"packed-index")
-            manifest = root / "packed_manifest.json"
-            manifest.write_text(json.dumps({"shard_sha256": {"s0.bin": "aaa"}}))
+            from game_cls.data.image_spec import ImageSpec
+            from game_cls.data.packed_backend import pack_frame_index
+
+            packed = pack_frame_index(
+                config["data"]["challenge_index"],
+                root / "packed",
+                image_spec=ImageSpec(width=448, height=208, channels=3),
+                source_video_index=config["data"]["challenge_video_index"],
+                audit_path=root / "audit.json",
+            )
+            manifest = Path(packed).with_name("packed_manifest.json")
             config["data"]["challenge_packed_index"] = str(packed)
+            config["data"]["challenge_packed_video_index"] = str(
+                Path(packed).with_name("packed_video_entries.parquet")
+            )
             before, components = challenge_bundle_fingerprint(config)
             self.assertTrue(components["packed_manifest_sha256"])
-            # A repacked shard changes its recorded hash inside the manifest.
-            manifest.write_text(json.dumps({"shard_sha256": {"s0.bin": "bbb"}}))
-            after, _ = challenge_bundle_fingerprint(config)
-        self.assertNotEqual(before, after)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            shard = manifest.parent / payload["shards"][0]
+            shard.write_bytes(shard.read_bytes() + b"corrupt")
+            with self.assertRaises(RuntimeError):
+                challenge_bundle_fingerprint(config)
+        self.assertTrue(before)
 
     def test_no_resolvable_leg_fails_closed(self) -> None:
         """An unrecomputable identity must not become a valid-looking digest."""
@@ -257,7 +318,7 @@ class ChallengeBundleFingerprintTests(unittest.TestCase):
                     run_id="runA", config=config, gates=GATES_STRICT
                 ),
             )
-            Path(config["data"]["challenge_metadata"]).write_bytes(b"meta-v2")
+            Path(config["data"]["challenge_metadata"]).write_bytes(b"meta-b")
             problems = _release_identity_mismatches(
                 report, run_id="runA", config=config, gate_metrics=GATES_STRICT
             )
@@ -266,13 +327,13 @@ class ChallengeBundleFingerprintTests(unittest.TestCase):
         self.assertIn("challenge_metadata_sha256", joined)
 
     def test_report_predating_the_widened_fingerprint_is_refused(self) -> None:
-        """A v1 narrow digest must not be accepted as a v2 identity."""
+        """A narrow digest must not be accepted as a component identity."""
         with tempfile.TemporaryDirectory() as directory:
             config = _bundle(Path(directory))
             payload = ReleaseIdentityGateTests()._payload(
                 run_id="runA", config=config, gates=GATES_STRICT
             )
-            # A v1-era report: the old single-file digest, no components block.
+            # A malformed report: a single-file digest with no components block.
             from game_cls.reports.benchmark import file_sha256
 
             payload["challenge_dataset_fingerprint"] = file_sha256(
@@ -313,23 +374,17 @@ class ChallengeBundleFingerprintTests(unittest.TestCase):
             config = _bundle(root)
             index = Path(config["data"]["challenge_index"])
 
-            write_parquet([_frame("deadbeef")], index)
-            self.assertIs(challenge_bundle_fingerprint(config)[1]["covers_content"], True)
-
             write_parquet([_frame("")], index)
-            self.assertIs(
-                challenge_bundle_fingerprint(config)[1]["covers_content"], False
-            )
+            with self.assertRaises((RuntimeError, ValueError)):
+                challenge_bundle_fingerprint(config)
 
-    def test_covers_content_is_not_hashed_into_the_digest(self) -> None:
-        """It is derived from the recorded legs, not an independent input."""
+    def test_current_png_bytes_are_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = _bundle(Path(directory))
-            digest, components = challenge_bundle_fingerprint(config)
-        # A plain-bytes index is unreadable as parquet, so coverage is unknown
-        # -- which must not prevent a digest from being produced.
-        self.assertIsNone(components["covers_content"])
-        self.assertTrue(digest)
+            frame_path = next((Path(directory) / "source").rglob("*.png"))
+            Image.fromarray(np.ones((208, 448, 3), dtype=np.uint8)).save(frame_path)
+            with self.assertRaisesRegex(ValueError, "changed after indexing"):
+                challenge_bundle_fingerprint(config)
 
 
 class CanonicalConfigHashTests(unittest.TestCase):
@@ -343,9 +398,7 @@ class CanonicalConfigHashTests(unittest.TestCase):
     def test_key_order_does_not_change_the_hash(self) -> None:
         left = {"a": 1, "b": {"c": 2, "d": 3}}
         right = {"b": {"d": 3, "c": 2}, "a": 1}
-        self.assertEqual(
-            canonical_config_sha256(left), canonical_config_sha256(right)
-        )
+        self.assertEqual(canonical_config_sha256(left), canonical_config_sha256(right))
 
     def test_value_change_changes_the_hash(self) -> None:
         self.assertNotEqual(
@@ -357,7 +410,7 @@ class CanonicalConfigHashTests(unittest.TestCase):
         """Pin the shared helper against evaluate's own call path."""
         import inspect
 
-        from game_cls.cli import benchmark as benchmark_cli
+        import game_cls.cli.benchmark as benchmark_cli
 
         source = inspect.getsource(benchmark_cli.cmd_benchmark_evaluate)
         # evaluate must delegate to the shared helper rather than re-implement

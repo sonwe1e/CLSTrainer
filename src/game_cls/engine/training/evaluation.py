@@ -6,10 +6,6 @@ from typing import Any
 from game_cls.engine.checkpoint import (
     unwrap_model,
 )
-from game_cls.engine.distributed import (
-    distributed_barrier,
-    is_distributed,
-)
 from game_cls.engine.evaluator import EvaluationOutput, evaluate
 from game_cls.engine.training.run_io import (
     _EVALUATION_ROLES,
@@ -25,6 +21,12 @@ from game_cls.losses.threshold_loss import (
 from game_cls.reports.error_writer import (
     prepare_evaluation_directory,
     write_evaluation_report,
+)
+from game_cls.runtime.distributed_runtime import (
+    barrier as distributed_barrier,
+)
+from game_cls.runtime.distributed_runtime import (
+    is_initialized as is_distributed,
 )
 
 
@@ -113,10 +115,10 @@ def _reduce_interval_accumulator(accum: dict, device) -> dict:
         "interval_accuracy": (tp + tn) / max(sample_count, 1.0)
         if sample_count
         else 0.0,
-        "interval_positive_recall_tau099": (
+        "interval_positive_recall_at_decision_threshold": (
             tp / positive_total if positive_total else None
         ),
-        "interval_negative_specificity_tau099": (
+        "interval_negative_specificity_at_decision_threshold": (
             tn / negative_total if negative_total else None
         ),
         "interval_samples": int(sample_count),
@@ -154,7 +156,7 @@ def _run_evaluation(
         unwrap_model(model),
         dataloader,
         device,
-        config["evaluation"].get("threshold", 0.99),
+        config["decision"]["threshold"],
         checkpoint_step=global_step,
         distributed=is_distributed(),
         rank=rank,

@@ -23,7 +23,7 @@ def _distributed_eval_worker(
     from game_cls.data.collate import pair_collate
     from game_cls.data.image_spec import ImageSpec
     from game_cls.engine.evaluator import evaluate
-    from game_cls.engine.trainer import SyntheticPairDataset
+    from game_cls.engine.training.synthetic import SyntheticPairDataset
     from game_cls.reports.error_writer import prepare_evaluation_directory
 
     dist.init_process_group(

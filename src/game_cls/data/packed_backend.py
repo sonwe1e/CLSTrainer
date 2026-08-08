@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from game_cls.contract import (
+    CONTRACT_VERSION,
+    PARQUET_CONTRACT_KEY,
+    require_contract,
+    require_parquet_contract,
+)
+
 from .image_spec import ImageSpec
 
 
@@ -26,27 +33,48 @@ def _file_sha256(path: str | Path | None) -> str:
     return digest.hexdigest()
 
 
-def _source_bundle_id(frame_index: str | Path | None) -> str:
-    """``bundle_id`` of the split bundle a frame index belongs to (audit P0-9).
-
-    Read from the ``bundle_manifest.json`` sitting beside the frame index.
-    Empty when the index is not part of a sealed bundle, which keeps packing an
-    unsealed legacy directory possible -- the binding then simply cannot be
-    asserted later, and ``verify_packed_provenance`` says so rather than
-    inventing agreement.
-    """
-    if frame_index is None:
-        return ""
-    manifest = Path(frame_index).parent / "bundle_manifest.json"
+def verify_source_bundle_artifacts(
+    frame_index: str | Path, video_index: str | Path
+) -> dict[str, Any]:
+    """Prove that both source indexes are artifacts of the same bundle."""
+    frame_path = Path(frame_index).resolve()
+    video_path = Path(video_index).resolve()
+    if frame_path.parent != video_path.parent:
+        raise RuntimeError(
+            "Source frame/video indexes must be siblings in one published bundle: "
+            f"{frame_path} vs {video_path}."
+        )
+    manifest = frame_path.parent / "bundle_manifest.json"
     if not manifest.is_file():
-        return ""
+        raise RuntimeError(f"Source bundle manifest is missing: {manifest}")
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Source bundle manifest is unreadable: {manifest}") from exc
     if not isinstance(payload, dict):
-        return ""
-    return str(payload.get("bundle_id") or "")
+        raise RuntimeError(f"Source bundle manifest is invalid: {manifest}")
+    try:
+        require_contract(payload, f"Source bundle manifest {manifest}")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    artifacts = payload.get("artifacts")
+    bundle_id = str(payload.get("bundle_id") or "") if isinstance(payload, dict) else ""
+    if not bundle_id or not isinstance(artifacts, dict):
+        raise RuntimeError(f"Source bundle manifest is incomplete: {manifest}")
+    for path in (frame_path, video_path):
+        recorded = artifacts.get(path.name)
+        actual = _file_sha256(path)
+        if not recorded or recorded != actual:
+            raise RuntimeError(
+                f"{path.name} is not the artifact committed by {manifest}; "
+                "rebuild the source bundle."
+            )
+    return {
+        "bundle_id": bundle_id,
+        "bundle_kind": str(payload.get("bundle_kind") or "split"),
+        "bundle_manifest": str(manifest),
+        "bundle_manifest_sha256": _file_sha256(manifest),
+    }
 
 
 def verify_packed_provenance(
@@ -70,12 +98,13 @@ def verify_packed_provenance(
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise RuntimeError(f"Packed manifest is unreadable: {manifest_path}: {exc}") from exc
-    if int(manifest.get("format_version", 0)) != 4:
         raise RuntimeError(
-            f"Packed manifest {manifest_path} is not format v4; re-run "
-            "'cls-trainer dataset pack'."
-        )
+            f"Packed manifest is unreadable: {manifest_path}: {exc}"
+        ) from exc
+    try:
+        require_contract(manifest, f"Packed manifest {manifest_path}")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     def _check(field: str, current_path: str | Path | None) -> None:
         recorded = manifest.get(field)
@@ -116,26 +145,34 @@ def verify_packed_provenance(
     # have had no audit/split-manifest to bind to).
     _check("source_frame_index_sha256", current_frame_index)
     _check("source_video_index_sha256", current_video_index)
-    _check("audit_fingerprint", audit_path)
-    _check("split_manifest_fingerprint", split_manifest_path)
+    if manifest.get("audit_fingerprint"):
+        _check("audit_fingerprint", audit_path)
+    if manifest.get("split_manifest_fingerprint"):
+        _check("split_manifest_fingerprint", split_manifest_path)
 
     # Audit P0-9: the file hashes above can all agree while the shards still
     # belong to a superseded generation of the split bundle -- re-preparing
     # rewrites the bundle and mints a new bundle_id, and only comparing that id
     # catches shards packed from the previous one.
+    if current_frame_index is None or current_video_index is None:
+        raise RuntimeError("Packed provenance requires both source indexes.")
+    source = verify_source_bundle_artifacts(current_frame_index, current_video_index)
     recorded_bundle = str(manifest.get("source_bundle_id") or "")
-    current_bundle = _source_bundle_id(current_frame_index)
-    if not recorded_bundle or not current_bundle:
+    if source["bundle_id"] != recorded_bundle:
         raise RuntimeError(
-            "Packed provenance has no verifiable source_bundle_id; re-run "
-            "'cls-trainer dataset pack' from a sealed split bundle."
-        )
-    if current_bundle != recorded_bundle:
-        raise RuntimeError(
-            f"Packed data is stale: it was packed from split bundle "
+            f"Packed data is stale: it was packed from bundle "
             f"{recorded_bundle}, but the index directory now holds bundle "
-            f"{current_bundle}. Re-run 'cls-trainer dataset pack'."
+            f"{source['bundle_id']}. Re-run 'cls-trainer dataset pack'."
         )
+    if source["bundle_manifest_sha256"] != manifest.get(
+        "source_bundle_manifest_sha256"
+    ):
+        raise RuntimeError(
+            "Packed data is stale: source bundle manifest changed since packing. "
+            "Re-run 'cls-trainer dataset pack'."
+        )
+    if source["bundle_kind"] != str(manifest.get("source_bundle_kind") or ""):
+        raise RuntimeError("Packed source bundle kind does not match its manifest.")
 
 
 def verify_packed_shards(manifest_path: str | Path) -> None:
@@ -213,6 +250,7 @@ class PackedUint8Backend:
                 f"got {image_spec.channels}"
             )
         self.index_path = Path(index_path).resolve()
+        require_parquet_contract(self.index_path)
         self.image_spec = image_spec
         self.channels = image_spec.channels
         self.height = image_spec.height
@@ -223,8 +261,8 @@ class PackedUint8Backend:
         required = {"frame_index", "shard_id", "offset", "length"}
         if not required.issubset(schema_names):
             raise RuntimeError(
-                "Legacy path-keyed packed index is unsupported; repack the "
-                "dataset to create the integer-index format."
+                "Packed index is missing required integer-location columns; "
+                "repack it with CLSTrainer 5.0.0."
             )
         table = pq.read_table(
             self.index_path,
@@ -385,13 +423,20 @@ def _pack_frame_index_into(
         raise ValueError(
             f"Packing requires RGB images with 3 channels, got {image_spec.channels}"
         )
-    parquet_file = pq.ParquetFile(frame_index)
     if source_video_index is None or not Path(source_video_index).is_file():
         raise FileNotFoundError(
             f"A readable source video index is required: {source_video_index}"
         )
-    if not source_bundle_id:
-        raise ValueError("source_bundle_id is required for packed format v4")
+    from game_cls.data.indexing import verify_frame_content_integrity
+
+    source_bundle = verify_source_bundle_artifacts(frame_index, source_video_index)
+    if source_bundle_id and source_bundle_id != source_bundle["bundle_id"]:
+        raise ValueError(
+            "Requested source_bundle_id does not match the bundle that commits "
+            "the frame/video indexes."
+        )
+    verify_frame_content_integrity(frame_index)
+    parquet_file = pq.ParquetFile(frame_index)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     index_path = output_dir / "packed_frames.parquet"
@@ -402,13 +447,14 @@ def _pack_frame_index_into(
             pa.field("offset", pa.int64()),
             pa.field("length", pa.int64()),
         ]
-    )
+    ).with_metadata({PARQUET_CONTRACT_KEY: str(CONTRACT_VERSION).encode("ascii")})
     index_writer = pq.ParquetWriter(index_path, index_schema, compression="zstd")
     row_buffer = []
     shard_stream = None
     shard_path = None
     shard_names: list[str] = []
     packed_groups: dict[tuple[str, int, str], list[tuple[int, int]]] = {}
+    packed_content: dict[tuple[str, int, str], list[tuple[int, str]]] = {}
     try:
         index = 0
         for batch in parquet_file.iter_batches(batch_size=1024):
@@ -457,6 +503,16 @@ def _pack_frame_index_into(
                         ),
                         [],
                     ).append((int(row["frame_id"]), index))
+                    packed_content.setdefault(
+                        (
+                            str(row["game"]),
+                            int(row["label"]),
+                            str(row["video_id"]),
+                        ),
+                        [],
+                    ).append(
+                        (int(row["frame_id"]), str(row.get("content_sha256") or ""))
+                    )
                 if len(row_buffer) >= 4096:
                     index_writer.write_table(
                         pa.Table.from_pylist(row_buffer, schema=index_schema)
@@ -484,7 +540,7 @@ def _pack_frame_index_into(
     # are both derived from the audit file: the dataset's audit is its
     # fingerprint, and the audit file hash pins the exact audit revision.
     manifest = {
-        "format_version": 4,
+        "contract_version": CONTRACT_VERSION,
         "channels": image_spec.channels,
         "height": image_spec.height,
         "width": image_spec.width,
@@ -492,13 +548,15 @@ def _pack_frame_index_into(
         "frame_count": index,
         "source_frame_index_sha256": _file_sha256(frame_index),
         "source_video_index_sha256": _file_sha256(source_video_index),
-        "source_bundle_id": str(source_bundle_id),
+        "source_bundle_id": source_bundle["bundle_id"],
+        "source_bundle_kind": source_bundle["bundle_kind"],
+        "source_bundle_manifest_sha256": source_bundle["bundle_manifest_sha256"],
+        "source_frame_index_name": Path(frame_index).name,
+        "source_video_index_name": Path(source_video_index).name,
         "dataset_fingerprint": _file_sha256(audit_path),
         "audit_fingerprint": _file_sha256(audit_path),
         "split_manifest_fingerprint": _file_sha256(split_manifest_path),
-        "shard_sha256": {
-            name: _file_sha256(output_dir / name) for name in shard_names
-        },
+        "shard_sha256": {name: _file_sha256(output_dir / name) for name in shard_names},
         "shards": shard_names,
     }
     (output_dir / "packed_manifest.json").write_text(
@@ -533,6 +591,28 @@ def _pack_frame_index_into(
                 f"extra_in_video_index={extra[:10]}"
             )
 
+        from game_cls.data.video_index import video_content_id
+
+        tokens_by_stable: dict[str, list[str]] = defaultdict(list)
+        seen_source_groups: set[tuple[str, int, str]] = set()
+        for source_entry in source_entries:
+            key = (
+                source_entry.game,
+                int(source_entry.label),
+                source_entry.video_id,
+            )
+            if key in seen_source_groups:
+                continue
+            seen_source_groups.add(key)
+            for frame_id, content_sha256 in sorted(packed_content.get(key, [])):
+                tokens_by_stable[source_entry.stable_source_id].append(
+                    f"{source_entry.label}:{frame_id}:{content_sha256}"
+                )
+        expected_content_by_stable = {
+            stable: video_content_id(len(tokens), tokens) or ""
+            for stable, tokens in tokens_by_stable.items()
+        }
+
         entries = []
         for (game, label, video_id), values in sorted(packed_groups.items()):
             ordered = sorted(values)
@@ -566,6 +646,15 @@ def _pack_frame_index_into(
                 raise ValueError(
                     f"Source video {game}/{label}/{video_id} has no complete "
                     "stable/content identity."
+                )
+            expected_content = expected_content_by_stable.get(
+                inherited.stable_source_id, ""
+            )
+            if expected_content != inherited.content_version_id:
+                raise ValueError(
+                    f"Source video identity is stale for {game}/{label}/{video_id}: "
+                    "content_version_id does not match the frame index's "
+                    "verified content hashes. Rebuild the source video index."
                 )
             entries.append(
                 VideoEntry(

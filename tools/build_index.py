@@ -26,7 +26,7 @@ def _split_config(data_config: dict) -> dict:
         "mode": split["mode"],
         "val_ratio": split["val_ratio"],
         "seed": split["seed"],
-        "group_key": split.get("group_key", "source_video_uid"),
+        "group_key": split.get("group_key", "stable_source_id"),
         "stratify_by": split.get("stratify_by", ["game", "label"]),
         "balance_by": split.get("balance_by", "legal_pair_count"),
         "target_delta": split.get("target_delta", 2),
@@ -67,11 +67,6 @@ def main() -> None:
             "write_split_bundle."
         ),
     )
-    parser.add_argument(
-        "--skip-content-hash",
-        action="store_true",
-        help="Skip SHA-256 leakage detection to reduce indexing I/O",
-    )
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
@@ -96,7 +91,7 @@ def main() -> None:
             duplicate_policy=DuplicatePolicy.from_config(data_config),
             split_config=split_config,
             identity_mode=split_config.get("source_identity_mode", "game_video"),
-            compute_content_hash=not args.skip_content_hash,
+            compute_content_hash=True,
             namespaces_by_split=namespaces_by_split,
         )
     else:
@@ -111,7 +106,7 @@ def main() -> None:
             identity_mode=(data_config.get("source_video_identity") or {}).get(
                 "mode", "game_video"
             ),
-            compute_content_hash=not args.skip_content_hash,
+            compute_content_hash=True,
             namespaces_by_split=namespaces_by_split,
         )
     print(json.dumps(audit, ensure_ascii=False, indent=2))

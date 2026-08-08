@@ -8,9 +8,7 @@ from game_cls.engine.checkpoint import (
     capture_random_state,
     save_checkpoint_pair,
 )
-from game_cls.engine.distributed import (
-    is_distributed,
-)
+from game_cls.runtime.distributed_runtime import is_initialized as is_distributed
 
 
 def _distributed_sum_int(value: int) -> int:
@@ -23,7 +21,9 @@ def _distributed_sum_int(value: int) -> int:
     return sum(int(item) for item in values)
 
 
-def _schedule_factor(config: dict, total_steps: int, base_lr: float, step: int) -> float:
+def _schedule_factor(
+    config: dict, total_steps: int, base_lr: float, step: int
+) -> float:
     """The LambdaLR multiplier at ``step``.
 
     Shared by ``_build_scheduler`` and the staged-unfreeze boundary so the

@@ -57,7 +57,7 @@ class CheckpointTrustTests(unittest.TestCase):
                 },
                 path,
             )
-            with self.assertRaisesRegex(RuntimeError, "cls_training_checkpoint"):
+            with self.assertRaisesRegex(ValueError, "contract_version=5"):
                 restore_training_checkpoint(path, model)
 
     def test_marker_cannot_smuggle_pickled_code(self) -> None:

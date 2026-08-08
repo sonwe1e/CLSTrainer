@@ -42,9 +42,7 @@ class MetadataSidecarTests(unittest.TestCase):
             path = Path(directory) / "video_metadata.parquet"
             fingerprint = write_metadata_sidecar(rows, path)
             sidecar = read_metadata_sidecar(path)
-            self.assertEqual(
-                sidecar["A::0::01"]["negative_subtype"], "wooden_bridge"
-            )
+            self.assertEqual(sidecar["A::0::01"]["negative_subtype"], "wooden_bridge")
             self.assertEqual(sidecar["A::0::01"]["sample_weight"], 1.0)
             validate_sidecar_against_index(sidecar, videos)
             applied = apply_sidecar(videos, sidecar)
@@ -81,6 +79,8 @@ class MetadataSidecarTests(unittest.TestCase):
         import pyarrow as pa
         import pyarrow.parquet as pq
 
+        from game_cls.contract import stamp_parquet_table
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(
@@ -89,7 +89,7 @@ class MetadataSidecarTests(unittest.TestCase):
             )
             rows = pq.read_table(path).to_pylist()
             rows[0]["negative_subtype"] = "tampered"
-            pq.write_table(pa.Table.from_pylist(rows), path)
+            pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), path)
             with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
                 read_metadata_sidecar(path)
 

@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from game_cls.contract import require_contract, stamp_payload
+
 STATE_RUNNING = "RUNNING"
 STATE_SUCCEEDED = "SUCCEEDED"
 STATE_FAILED = "FAILED"
@@ -71,6 +73,8 @@ def atomic_write_text(path: str | Path, text: str) -> None:
 
 
 def atomic_write_json(path: str | Path, payload: Any) -> None:
+    if isinstance(payload, dict):
+        payload = stamp_payload(payload)
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -90,7 +94,9 @@ def read_manifest(run_dir: str | Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        require_contract(payload, f"Run manifest {path}")
+        return payload
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -118,6 +124,7 @@ def append_resume_event(
         "command": command,
         "config_diffs": config_diffs,
     }
+    event = stamp_payload(event)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(
             json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -131,6 +138,7 @@ def update_status(run_dir: str | Path, **fields: Any) -> dict[str, Any]:
     if status_path.exists():
         try:
             payload = json.loads(status_path.read_text(encoding="utf-8"))
+            require_contract(payload, f"Run status {status_path}")
         except (json.JSONDecodeError, OSError):
             payload = {}
     payload.update(fields)
@@ -198,7 +206,7 @@ def append_run_index(runs_root: str | Path, record: dict[str, Any]) -> None:
     runs_root = Path(runs_root)
     runs_root.mkdir(parents=True, exist_ok=True)
     index_path = runs_root / "index.jsonl"
-    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    line = json.dumps(stamp_payload(record), ensure_ascii=False, separators=(",", ":"))
     with index_path.open("a", encoding="utf-8") as stream:
         stream.write(line + "\n")
 
@@ -213,7 +221,9 @@ def read_run_index(runs_root: str | Path) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            record = json.loads(line)
+            require_contract(record, f"Run index {index_path}")
+            records.append(record)
         except json.JSONDecodeError:
             continue
     return records
@@ -299,11 +309,7 @@ def render_summary_md(
         )
     if summary_payload:
         last = summary_payload.get("last_checkpoint_metrics") or {}
-        best = (
-            summary_payload.get("best_validation_metrics")
-            or summary_payload.get("best_observed_dev_test_metrics")
-            or {}
-        )
+        best = summary_payload.get("best_validation_metrics") or {}
 
         def fmt(metrics: dict[str, Any]) -> str:
             if not metrics:
@@ -312,17 +318,11 @@ def render_summary_md(
             selection_text = (
                 f"{selection:.4f}" if isinstance(selection, (int, float)) else "n/a"
             )
-            global_f1 = metrics.get(
-                "global_f1_at_decision_threshold",
-                metrics.get("global_f1_tau099"),
-            )
+            global_f1 = metrics.get("global_f1_at_decision_threshold")
             global_text = (
                 f"{global_f1:.4f}" if isinstance(global_f1, (int, float)) else "n/a"
             )
-            worst = metrics.get(
-                "worst_game_f1_at_decision_threshold",
-                metrics.get("worst_game_f1_tau099"),
-            )
+            worst = metrics.get("worst_game_f1_at_decision_threshold")
             worst_text = f"{worst:.4f}" if isinstance(worst, (int, float)) else "n/a"
             return (
                 f"step={metrics.get('checkpoint_step', '?')} "
@@ -351,7 +351,7 @@ def render_summary_md(
                     f"| {rank_index} | {entry.get('step', '?')} | "
                     f"{value_text} | `model_{entry.get('tag', '')}.pth` |"
                 )
-        counts = summary_payload.get("test_evaluation_counts") or {}
+        counts = summary_payload.get("validation_evaluation_counts") or {}
         lines.append(
             f"- Evaluations: quick={counts.get('quick', 0)}, "
             f"full={counts.get('full', 0)}, "
@@ -385,7 +385,7 @@ def render_summary_md(
 # overview.html: self-contained human report with inline SVG curves
 # ---------------------------------------------------------------------------
 
-# Legacy single-series training charts (kept for export tooling).
+# Core single-series training charts.
 _CHART_FIELDS = (
     ("loss", "Loss", "#dc2626"),
     ("interval_samples_per_second", "Throughput (samples/s)", "#2563eb"),
@@ -436,17 +436,12 @@ def _history_series(
     scope: str | None = None,
 ) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
-    # Neutral field names first; fall back to legacy _tau099 names so old
-    # run histories still render.
-    fallback = field.replace("_at_decision_threshold", "_tau099")
     for row in history:
         if row.get("split") != split:
             continue
         if scope is not None and row.get("scope") != scope:
             continue
         value = row.get(field)
-        if value is None and fallback != field:
-            value = row.get(fallback)
         step = row.get("step")
         if isinstance(value, (int, float)) and isinstance(step, (int, float)):
             points.append((float(step), float(value)))
@@ -792,13 +787,7 @@ def render_overview_html(
             f'<div class="card"><h3>{title}</h3>{_svg_chart(rows, field, color)}</div>'
         )
     charts = "\n".join(chart_cards)
-    split_migration = data_cfg.get("split_migration") or {}
-    split_roles = (
-        "train / validation / test"
-        if not split_migration.get("test_used_as_validation")
-        else "train / validation (test aliased as validation \u2014 NO "
-        "independent test set)"
-    )
+    split_roles = "train / validation / test"
     hyperparameters = (
         ("Decision threshold", config.get("decision", {}).get("threshold")),
         ("Split roles", split_roles),
@@ -841,7 +830,6 @@ def render_overview_html(
         for label, key in (
             ("Last full validation", "last_checkpoint_metrics"),
             ("Best validation", "best_validation_metrics"),
-            ("Best validation (legacy key)", "best_observed_dev_test_metrics"),
         ):
             metrics = summary_payload.get(key) or {}
             if not metrics:

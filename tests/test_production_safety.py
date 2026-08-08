@@ -10,7 +10,7 @@ except ImportError:
     torch = None
 
 from game_cls.config import load_config
-from game_cls.engine.trainer import validate_training_config
+from game_cls.engine.training.config_validation import validate_training_config
 
 
 class ProductionConfigTests(unittest.TestCase):
@@ -63,7 +63,11 @@ class ProductionCheckpointTests(unittest.TestCase):
             shape_mismatch=(),
         )
         with self.assertRaisesRegex(RuntimeError, "frozen backbone"):
-            validate_production_load(model, report)
+            validate_production_load(
+                model,
+                report,
+                frozen_parameter_names={"backbone.0.weight"},
+            )
 
     def test_trainable_only_checkpoint_restores_on_top_of_base(self) -> None:
         from game_cls.engine.checkpoint import (
@@ -71,10 +75,11 @@ class ProductionCheckpointTests(unittest.TestCase):
             save_checkpoint_pair,
         )
         from game_cls.model.builder import build_demo_model
-        from game_cls.model.freeze_policy import configure_trainable_parameters
+        from game_cls.model.trainable_rules import apply_trainable_state, parse_rules
 
         model = build_demo_model({})
-        configure_trainable_parameters(model)
+        rules = parse_rules({"head": {"pattern": r"^cls\.", "lr_scale": 1.0}})
+        apply_trainable_state(model, rules, 0)
         optimizer = torch.optim.AdamW(
             [parameter for parameter in model.parameters() if parameter.requires_grad]
         )
@@ -101,7 +106,7 @@ class ProductionCheckpointTests(unittest.TestCase):
             self.assertEqual(payload["model_state_mode"], "trainable_only")
             self.assertEqual(set(payload["model"]), {"cls.weight", "cls.bias"})
             fresh = build_demo_model({})
-            configure_trainable_parameters(fresh)
+            apply_trainable_state(fresh, rules, 0)
             restore_training_checkpoint(Path(directory) / "checkpoint_last.pth", fresh)
             payload["model"].pop("cls.bias")
             torch.save(payload, Path(directory) / "checkpoint_corrupt.pth")

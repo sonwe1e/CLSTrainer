@@ -38,7 +38,36 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-MINING_MANIFEST_VERSION = 2
+from game_cls.contract import (
+    CONTRACT_VERSION,
+    require_parquet_contract,
+    stamp_parquet_table,
+)
+
+
+def benchmark_source_fingerprint() -> str:
+    """Hash the source modules that define benchmark/evaluator semantics."""
+    package_root = Path(__file__).resolve().parents[1]
+    relative_paths = (
+        "data/collate.py",
+        "data/lazy_pair_dataset.py",
+        "engine/evaluator.py",
+        "engine/training/selection.py",
+        "metrics/binary_metrics.py",
+        "reports/benchmark.py",
+    )
+    digest = hashlib.sha256()
+    for relative in relative_paths:
+        path = package_root / relative
+        if not path.is_file():
+            raise RuntimeError(
+                f"Cannot fingerprint benchmark contract; source is missing: {path}"
+            )
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def file_sha256(path: str | Path) -> str:
@@ -51,6 +80,12 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def benchmark_output_dir(config: dict[str, Any], run_dir: str | Path) -> Path:
+    """Resolve benchmark reports independently of the caller's current CWD."""
+    configured = Path((config.get("benchmark") or {}).get("output_dir", "benchmarks"))
+    return configured if configured.is_absolute() else Path(run_dir) / configured
 
 
 def gate_spec_fingerprint(gate_metrics: dict[str, Any] | None) -> str:
@@ -83,8 +118,6 @@ def canonical_config_sha256(config: dict[str, Any] | None) -> str:
 # Challenge bundle fingerprint (audit P0-4).
 # ---------------------------------------------------------------------------
 
-CHALLENGE_FINGERPRINT_VERSION = 2
-
 # Component keys that are per-file SHA-256 digests, in the order they are
 # reported. Used to decide "did any leg resolve at all" and to diff two
 # recorded component sets.
@@ -94,6 +127,7 @@ _CHALLENGE_FILE_LEGS: tuple[str, ...] = (
     "challenge_packed_index_sha256",
     "challenge_packed_video_index_sha256",
     "challenge_metadata_sha256",
+    "challenge_bundle_manifest_sha256",
     "packed_manifest_sha256",
 )
 
@@ -141,18 +175,49 @@ def challenge_bundle_fingerprint(config: dict[str, Any] | None) -> tuple[str, di
 
     packed_index = data_cfg.get("challenge_packed_index")
     packed_manifest = ""
-    if packed_index:
-        packed_manifest = file_sha256(
-            Path(packed_index).with_name("packed_manifest.json")
+    challenge_index = data_cfg.get("challenge_index")
+    challenge_video_index = data_cfg.get("challenge_video_index")
+    bundle_manifest = ""
+    if challenge_index:
+        bundle_manifest = file_sha256(
+            Path(challenge_index).with_name("bundle_manifest.json")
+        )
+        from game_cls.data.indexing import (
+            verify_external_bundle,
+            verify_frame_content_integrity,
         )
 
+        verify_external_bundle(Path(challenge_index).parent, pool="challenge")
+        if not packed_index:
+            verify_frame_content_integrity(challenge_index)
+    if packed_index:
+        packed_manifest_path = Path(packed_index).with_name("packed_manifest.json")
+        packed_manifest = file_sha256(packed_manifest_path)
+        from game_cls.data.packed_backend import (
+            verify_packed_provenance,
+            verify_packed_shards,
+        )
+
+        verify_packed_provenance(
+            packed_manifest_path,
+            challenge_index,
+            current_video_index=challenge_video_index,
+            audit_path=(
+                Path(challenge_index).with_name("audit.json")
+                if challenge_index
+                else None
+            ),
+        )
+        verify_packed_shards(packed_manifest_path)
+
     components: dict[str, Any] = {
-        "fingerprint_version": CHALLENGE_FINGERPRINT_VERSION,
+        "contract_version": CONTRACT_VERSION,
         "challenge_index_sha256": _hash("challenge_index"),
         "challenge_video_index_sha256": _hash("challenge_video_index"),
         "challenge_packed_index_sha256": _hash("challenge_packed_index"),
         "challenge_packed_video_index_sha256": _hash("challenge_packed_video_index"),
         "challenge_metadata_sha256": _hash("challenge_metadata"),
+        "challenge_bundle_manifest_sha256": bundle_manifest,
         "packed_manifest_sha256": packed_manifest,
     }
 
@@ -236,7 +301,7 @@ def challenge_component_differences(
         return []
     differences: list[str] = []
     keys = [
-        "fingerprint_version",
+        "contract_version",
         *_CHALLENGE_FILE_LEGS,
         "image_spec",
         "preprocessing",
@@ -254,16 +319,11 @@ def challenge_component_differences(
 # Gate contract (step6): explicit metric name + comparison operator.
 # ---------------------------------------------------------------------------
 #
-# A gate is ``{metric_name: {op, value}}``. Bare scalars stay legal for
-# backward compatibility, but the comparison direction is then looked up in an
-# explicit table instead of guessed from substrings of the metric name -- the
-# old ``"fpr" in name`` heuristic mishandled specificity (upper-bounded a
-# higher-is-better metric), ECE and the negative-score percentiles
-# (lower-bounded lower-is-better metrics).
+# A gate is always ``{metric_name: {op, value}}``.
 
 GATE_OPERATORS: tuple[str, ...] = ("<=", "<", ">=", ">")
 
-# Lower is better: a bare scalar bound is an UPPER bound (op "<=").
+# Metrics whose quality direction is lower-is-better.
 _LOWER_BETTER: frozenset[str] = frozenset(
     {
         # Mistake counts.
@@ -291,7 +351,7 @@ _LOWER_BETTER: frozenset[str] = frozenset(
     }
 )
 
-# Higher is better: a bare scalar bound is a LOWER bound (op ">=").
+# Metrics whose quality direction is higher-is-better.
 _HIGHER_BETTER: frozenset[str] = frozenset(
     {
         # Correct counts.
@@ -306,13 +366,10 @@ _HIGHER_BETTER: frozenset[str] = frozenset(
         "balanced_accuracy",
         "roc_auc",
         "pr_auc",
-        # F1 family, neutral names plus the legacy _tau099 aliases.
+        # F1 family.
         "global_f1_at_decision_threshold",
         "macro_game_f1_at_decision_threshold",
         "worst_game_f1_at_decision_threshold",
-        "global_f1_tau099",
-        "macro_game_f1_tau099",
-        "worst_game_f1_tau099",
         # Specificity / recall at the decision threshold.
         "global_specificity_at_decision_threshold",
         "global_positive_recall_at_decision_threshold",
@@ -354,35 +411,16 @@ def gateable_metric_names() -> frozenset[str]:
     return _LOWER_BETTER | _HIGHER_BETTER | _NON_DIRECTIONAL
 
 
-def _legacy_alias_pairs() -> dict[str, str]:
-    """Bidirectional canonical<->legacy metric-name map.
-
-    Reuses ``selection._LEGACY_METRIC_ALIASES`` instead of copying it so the
-    ``*_at_decision_threshold`` / ``*_tau099`` contract keeps exactly one
-    source of truth.
-    """
-    from game_cls.engine.training.selection import _LEGACY_METRIC_ALIASES
-
-    pairs = dict(_LEGACY_METRIC_ALIASES)
-    pairs.update({legacy: canonical for canonical, legacy in pairs.items()})
-    return pairs
-
-
 def _gate_metric_value(metrics: dict, name: str) -> Any:
-    """Read a metric, falling back to its legacy/canonical alias."""
-    value = metrics.get(name)
-    if value is not None:
-        return value
-    alias = _legacy_alias_pairs().get(name)
-    return metrics.get(alias) if alias is not None else None
+    """Read one canonical evaluator metric."""
+    return metrics.get(name)
 
 
 def _resolve_gate(name: str, spec: Any) -> tuple[str, float]:
     """Normalize one gate entry into ``(op, bound)``.
 
     Raises ``ValueError`` for an unknown metric name, an unknown operator, a
-    malformed spec, or a bare scalar on a metric with no documented
-    direction. ``validate_gate_metrics`` reports the same conditions as
+    malformed spec, or a scalar gate. ``validate_gate_metrics`` reports the same conditions as
     config problems; this function is the runtime backstop for a gate dict
     that never went through config validation.
     """
@@ -406,20 +444,7 @@ def _resolve_gate(name: str, spec: Any) -> tuple[str, float]:
             )
         raw_value = spec["value"]
     else:
-        # Backward compatibility: a bare scalar means "the natural bound for
-        # this metric", which only exists when the direction is documented.
-        if name in _LOWER_BETTER:
-            op = "<="
-        elif name in _HIGHER_BETTER:
-            op = ">="
-        else:
-            raise ValueError(
-                f"benchmark.gate_metrics.{name} is a bare scalar bound, but "
-                f"{name} has no documented better-direction, so the "
-                "comparison would have to be guessed. Use the explicit form: "
-                f'{name}: {{op: "<=", value: {spec!r}}}.'
-            )
-        raw_value = spec
+        raise ValueError(f"benchmark.gate_metrics.{name} must use {{op, value}}.")
     if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
         raise ValueError(
             f"benchmark.gate_metrics.{name} bound must be a number (got {raw_value!r})."
@@ -485,16 +510,10 @@ def _pyarrow():
 
 
 def write_mining_manifest(rows: list[dict[str, Any]], path: str | Path) -> None:
-    """Write the versioned hard-negative mining manifest."""
+    """Write the contract-5 hard-negative mining manifest."""
     pa, pq = _pyarrow()
     normalized = []
     for row in rows:
-        requested_version = int(row.get("mining_version", MINING_MANIFEST_VERSION))
-        if requested_version != MINING_MANIFEST_VERSION:
-            raise ValueError(
-                f"Mining manifest version {requested_version} is obsolete; "
-                f"expected {MINING_MANIFEST_VERSION}."
-            )
         normalized.append(
             {
                 "stable_source_id": str(row["stable_source_id"]),
@@ -507,7 +526,6 @@ def write_mining_manifest(rows: list[dict[str, Any]], path: str | Path) -> None:
                 "p_positive": float(row.get("p_positive", 0.0)),
                 "subtype_before": row.get("subtype_before"),
                 "rank_in_video": int(row.get("rank_in_video", 0)),
-                "mining_version": int(MINING_MANIFEST_VERSION),
             }
         )
     path = Path(path)
@@ -515,13 +533,18 @@ def write_mining_manifest(rows: list[dict[str, Any]], path: str | Path) -> None:
     # Write to a temp sibling then atomically replace, which also releases
     # the file handle on Windows (avoids PermissionError on temp-dir cleanup).
     temp = path.with_suffix(f".tmp{path.suffix}")
-    pq.write_table(pa.Table.from_pylist(normalized), temp, compression="zstd")
+    pq.write_table(
+        stamp_parquet_table(pa.Table.from_pylist(normalized)),
+        temp,
+        compression="zstd",
+    )
     temp.replace(path)
 
 
 def read_mining_manifest(path: str | Path) -> list[dict[str, Any]]:
-    """Read a mining manifest, rejecting unknown format versions."""
+    """Read a contract-5 mining manifest."""
     _, pq = _pyarrow()
+    require_parquet_contract(path)
     # Pass an already-opened file object so Python's own reference
     # counting releases the OS handle when the with-block exits.  Passing
     # a Path to pq.read_table keeps a C++ NativeFile alive until GC
@@ -529,13 +552,6 @@ def read_mining_manifest(path: str | Path) -> list[dict[str, Any]]:
     # subsequent rename of the same file (re-annotation, atomic replace).
     with open(path, "rb") as fh:
         rows = pq.read_table(fh).to_pylist()
-    for row in rows:
-        version = int(row.get("mining_version", 0))
-        if version != MINING_MANIFEST_VERSION:
-            raise ValueError(
-                f"Unsupported mining manifest version {version} "
-                f"(expected {MINING_MANIFEST_VERSION})."
-            )
     return rows
 
 
@@ -573,10 +589,7 @@ def scan_negative_pool(
                 if int(labels[index]) != 0:
                     continue
                 meta = batch["meta"][index]
-                # Audit P0-5: consume the persisted canonical uid from the batch
-                # meta instead of re-deriving ``game::video_id``; the legacy
-                # fallback only covers frame-based PairSample metas that never
-                # carried one.
+                # Consume the persisted canonical identity from batch metadata.
                 stable_id = str(meta["stable_source_id"])
                 version_id = str(meta["source_version_id"])
                 p_positive = float(probability[index].item())
@@ -705,6 +718,7 @@ def write_benchmark_report(
     challenge_dataset_fingerprint: str = "",
     gate_spec_fingerprint: str = "",
     challenge_bundle_components: dict[str, Any] | None = None,
+    benchmark_source_sha256: str = "",
 ) -> Path:
     """Append one immutable release-identity report and return its path.
 
@@ -729,6 +743,10 @@ def write_benchmark_report(
         "resolved_config_sha256": str(resolved_config_sha256),
         "challenge_dataset_fingerprint": str(challenge_dataset_fingerprint),
         "gate_spec_fingerprint": str(gate_spec_fingerprint),
+        "contract_version": CONTRACT_VERSION,
+        "benchmark_source_sha256": str(
+            benchmark_source_sha256 or benchmark_source_fingerprint()
+        ),
     }
     identity_sha = release_identity_sha256(identity)
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -748,6 +766,10 @@ def write_benchmark_report(
         "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
         "challenge_bundle_components": challenge_bundle_components or {},
         "gate_spec_fingerprint": gate_spec_fingerprint,
+        "contract_version": CONTRACT_VERSION,
+        "benchmark_source_sha256": (
+            benchmark_source_sha256 or benchmark_source_fingerprint()
+        ),
         "release_identity_sha256": identity_sha,
         "scores": _scores_from_metrics(metrics, gate_metrics),
         "gate_metrics": gate_metrics or {},
@@ -759,8 +781,6 @@ def write_benchmark_report(
     }
     path = report_dir / "report.json"
     temp = report_dir / ".report.json.tmp"
-    temp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(path)
     return path

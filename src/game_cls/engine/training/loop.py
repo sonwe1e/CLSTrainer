@@ -10,8 +10,8 @@ from typing import Any
 from game_cls.config_schema import (
     finalize_config,
     schedule_budget_warnings,
-    split_role_warnings,
 )
+from game_cls.contract import stamp_payload
 from game_cls.data.image_spec import ImageSpec
 from game_cls.engine.checkpoint import (
     clone_checkpoint_pair,
@@ -20,12 +20,6 @@ from game_cls.engine.checkpoint import (
     unwrap_model,
 )
 from game_cls.engine.device import autocast_context
-from game_cls.engine.distributed import (
-    cleanup_distributed,
-    distributed_barrier,
-    initialize_runtime,
-    is_distributed,
-)
 from game_cls.engine.training.config_validation import (
     _dataloader_option,
     validate_training_config,
@@ -46,10 +40,7 @@ from game_cls.engine.training.loop_util import (
     _synchronize_device_for_metrics,
     _tb_write_scalars,
 )
-from game_cls.engine.training.optimizer import (
-    _set_train_mode,
-    build_optimizer_parameter_groups,
-)
+from game_cls.engine.training.optimizer import _set_train_mode
 from game_cls.engine.training.run_io import (
     _append_training_metrics,
     _finalize_run_success,
@@ -83,7 +74,6 @@ from game_cls.model.checkpoint_loader import (
 )
 from game_cls.model.freeze_policy import (
     assert_frozen_parameters_unchanged,
-    configure_trainable_parameters,
     snapshot_frozen_parameters,
 )
 from game_cls.runs import (
@@ -95,6 +85,18 @@ from game_cls.runs import (
     atomic_write_text,
     render_overview_html,
     update_status,
+)
+from game_cls.runtime.distributed_runtime import (
+    barrier as distributed_barrier,
+)
+from game_cls.runtime.distributed_runtime import (
+    cleanup as cleanup_distributed,
+)
+from game_cls.runtime.distributed_runtime import (
+    init_runtime as initialize_runtime,
+)
+from game_cls.runtime.distributed_runtime import (
+    is_initialized as is_distributed,
 )
 
 
@@ -207,14 +209,8 @@ def run_training(
 ) -> dict:
     """Train the dual-frame classifier.
 
-    ``experiment.run_mode`` controls output placement:
-
-    * ``fixed`` (default): write directly into ``experiment.output_dir``
-      (legacy behavior, exact resume and tests rely on it).
-    * ``unique``: treat ``experiment.output_dir`` as a runs ROOT and
-      allocate a fresh, never-overwritten timestamped run directory under
-      it. Rank 0 allocates the directory and broadcasts it, so distributed
-      launches agree on a single run.
+    Fresh training always allocates an immutable timestamped run directory.
+    Exact resume writes only into the explicitly selected existing run.
 
     ``run_meta`` carries launch facts (command, environment, checkpoint
     hash) for the manifest; ``on_run_dir`` is a rank-0 callback fired as
@@ -226,7 +222,6 @@ def run_training(
     validate_training_config(config)
     image_spec = ImageSpec.from_config(config["data"])
     rank, world_size, local_rank, device = initialize_runtime(config)
-    run_mode = str(config["experiment"].get("run_mode", "fixed"))
     meta = run_meta or {}
     resuming = bool(config["train"].get("resume_path") or meta.get("resumed_from"))
     if resuming and meta.get("runs_root"):
@@ -244,7 +239,7 @@ def run_training(
         seed = int(config["experiment"]["seed"])
         _seed_everything(seed + rank)
         config_output = Path(config["experiment"]["output_dir"])
-        if run_mode == "unique":
+        if not resuming:
             allocation: tuple[str, str] | None = None
             if rank == 0:
                 allocated, allocated_id = allocate_run_dir(
@@ -255,8 +250,6 @@ def run_training(
             output_dir = Path(allocation[0])
             run_id = allocation[1]
         else:
-            # fixed/resume: write into the configured directory itself; the
-            # runs root (possibly different on resume) only hosts the index.
             output_dir = config_output
             if rank == 0:
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -273,7 +266,6 @@ def run_training(
                 config=config,
                 run_meta=run_meta,
                 run_id=run_id,
-                run_mode=run_mode,
                 world_size=world_size,
             )
             if effective_run_id is not None:
@@ -316,17 +308,13 @@ def run_training(
 
         model = build_model(config["model"])
         checkpoint_path = config["model"].get("checkpoint_path")
-        # Step5 P4: optional staged partial unfreeze. When
-        # ``model.trainable_rules`` is set it replaces the legacy
-        # ``trainable_name_contains`` token (byte-identical when absent).
         from game_cls.model.freeze_policy import FreezeSummary
         from game_cls.model.trainable_rules import (
             apply_trainable_state,
             parse_rules,
         )
 
-        trainable_rules_cfg = config["model"].get("trainable_rules")
-        rules = parse_rules(trainable_rules_cfg) if trainable_rules_cfg else None
+        rules = parse_rules(config["model"]["trainable_rules"])
         if checkpoint_path:
             # Step5 P5: under DDP only rank 0 touches the base checkpoint
             # file; the state dict is broadcast so the other ranks skip the
@@ -349,28 +337,16 @@ def run_training(
                 and rank == 0
             ):
                 assert report is not None
-                if rules is not None:
-                    frozen_names = {
-                        name
-                        for name, _ in model.named_parameters()
-                        if _rule_frozen_at_zero(rules, name)
-                    }
-                    coverage = validate_production_load(
-                        model,
-                        report,
-                        trainable_name_contains=config["model"].get(
-                            "trainable_name_contains", "cls"
-                        ),
-                        frozen_parameter_names=frozen_names,
-                    )
-                else:
-                    coverage = validate_production_load(
-                        model,
-                        report,
-                        trainable_name_contains=config["model"].get(
-                            "trainable_name_contains", "cls"
-                        ),
-                    )
+                frozen_names = {
+                    name
+                    for name, _ in model.named_parameters()
+                    if _rule_frozen_at_zero(rules, name)
+                }
+                coverage = validate_production_load(
+                    model,
+                    report,
+                    frozen_parameter_names=frozen_names,
+                )
             else:
                 coverage = None
             if rank == 0:
@@ -381,30 +357,23 @@ def run_training(
                 print(f"Missing: {report.missing}")
                 print(f"Unexpected: {report.unexpected}")
                 print(f"Shape mismatch: {report.shape_mismatch}")
-        if rules is not None:
-            apply_trainable_state(model, rules, 0)
-            trainable_names = [
-                name
-                for name, parameter in model.named_parameters()
-                if parameter.requires_grad
-            ]
-            trainable_count = sum(
-                parameter.numel()
-                for _, parameter in model.named_parameters()
-                if parameter.requires_grad
-            )
-            frozen_count = sum(
-                parameter.numel()
-                for _, parameter in model.named_parameters()
-                if not parameter.requires_grad
-            )
-            summary = FreezeSummary(
-                tuple(trainable_names), trainable_count, frozen_count
-            )
-        else:
-            summary = configure_trainable_parameters(
-                model, config["model"].get("trainable_name_contains", "cls")
-            )
+        apply_trainable_state(model, rules, 0)
+        trainable_names = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        ]
+        trainable_count = sum(
+            parameter.numel()
+            for _, parameter in model.named_parameters()
+            if parameter.requires_grad
+        )
+        frozen_count = sum(
+            parameter.numel()
+            for _, parameter in model.named_parameters()
+            if not parameter.requires_grad
+        )
+        summary = FreezeSummary(tuple(trainable_names), trainable_count, frozen_count)
         _set_train_mode(model, config["model"])
         model.to(device)
         # ``bare_model`` always refers to the undecorated module. Every
@@ -427,8 +396,6 @@ def run_training(
 
         loaders = _make_dataloaders(config, rank, world_size)
         if rank == 0:
-            for warning in split_role_warnings(config):
-                print(f"[WARNING] {warning}", flush=True)
             for warning in schedule_budget_warnings(config):
                 print(f"[WARNING] {warning}", flush=True)
             print(
@@ -471,27 +438,19 @@ def run_training(
             for name, parameter in bare_model.named_parameters()
             if parameter.requires_grad
         }
-        if rules is not None:
-            from game_cls.model.trainable_rules import (
-                build_optimizer_parameter_groups as build_rule_groups,
-            )
+        from game_cls.model.trainable_rules import (
+            build_optimizer_parameter_groups as build_rule_groups,
+        )
 
-            optimizer = torch.optim.AdamW(
-                build_rule_groups(
-                    bare_model,
-                    rules,
-                    step=0,
-                    weight_decay=float(config["optimizer"]["weight_decay"]),
-                    base_lr=float(config["optimizer"]["learning_rate"]),
-                )
+        optimizer = torch.optim.AdamW(
+            build_rule_groups(
+                bare_model,
+                rules,
+                step=0,
+                weight_decay=float(config["optimizer"]["weight_decay"]),
+                base_lr=float(config["optimizer"]["learning_rate"]),
             )
-        else:
-            optimizer = torch.optim.AdamW(
-                build_optimizer_parameter_groups(
-                    model, float(config["optimizer"]["weight_decay"])
-                ),
-                lr=config["optimizer"]["learning_rate"],
-            )
+        )
         scheduler = _build_scheduler(optimizer, config["scheduler"], total_steps)
         use_amp = bool(config["device"].get("amp", False))
         scaler = torch.amp.GradScaler(
@@ -504,14 +463,11 @@ def run_training(
         best_val_loss_metrics: dict = {}
         best_worst_game_metrics: dict = {}
         evaluation_state: dict[str, Any] = {
-            "quick_test_count": 0,
-            "full_test_count": 0,
             "val_quick_count": 0,
             "val_full_count": 0,
             "train_probe_count": 0,
             "last_full_metrics": {},
             "last_train_probe_metrics": {},
-            "best_observed_dev_test_metrics": {},
             "best_validation_metrics": {},
             "best_val_loss_metrics": {},
             "best_worst_game_metrics": {},
@@ -529,7 +485,7 @@ def run_training(
             # boundary has more groups than the step-0 optimizer built above;
             # loading into that optimizer raises "loaded state dict has a
             # different number of parameter groups".
-            if rules is not None:
+            if rules:
                 import torch
 
                 from game_cls.model.trainable_rules import (
@@ -706,7 +662,7 @@ def run_training(
             for batch in loaders.train:
                 yielded = True
                 batch_ready = time.perf_counter()
-                if rules is not None and _unfreeze_boundary(rules, global_step):
+                if _unfreeze_boundary(rules, global_step):
                     # Step5 P4: a rule crossed its unfreeze_at_step — make the
                     # newly unfrozen parameters trainable, rebuild the
                     # optimizer (preserving state for already-trainable
@@ -837,8 +793,12 @@ def run_training(
                         raise ValueError(
                             f"Model must return [B,2], got {tuple(logits.shape)}"
                         )
+                    loss_cfg = {
+                        **config["loss"],
+                        "threshold": config["decision"]["threshold"],
+                    }
                     loss, components = combined_loss(
-                        logits, labels, config["loss"], global_step, total_steps
+                        logits, labels, loss_cfg, global_step, total_steps
                     )
                 timing["host_forward_enqueue"] += time.perf_counter() - forward_started
                 backward_started = time.perf_counter()
@@ -969,7 +929,6 @@ def run_training(
                         world_size=world_size,
                         total_steps=total_steps,
                     )
-                    evaluation_state["quick_test_count"] += 1
                     evaluation_state["val_quick_count"] += 1
                     if rank == 0:
                         _tb_write_scalars(
@@ -1029,7 +988,6 @@ def run_training(
                         total_steps=total_steps,
                         evaluation_state=evaluation_state,
                     )
-                    evaluation_state["full_test_count"] += 1
                     evaluation_state["val_full_count"] += 1
                     metrics = _broadcast_object(result.metrics, rank)
                     evaluation_state["last_full_metrics"] = metrics
@@ -1045,7 +1003,6 @@ def run_training(
                     )
                     if is_best:
                         best_metrics = metrics
-                        evaluation_state["best_observed_dev_test_metrics"] = metrics
                         evaluation_state["best_validation_metrics"] = metrics
                     val_ce = (
                         metrics.get("cross_entropy")
@@ -1161,11 +1118,6 @@ def run_training(
                                 "last",
                                 "best_selection",
                             )
-                            clone_checkpoint_pair(
-                                output_dir / "checkpoints",
-                                "last",
-                                "best_observed_dev_test_selection",
-                            )
                         if loss_improved and checkpoint_cfg.get(
                             "save_best_val_loss", True
                         ):
@@ -1250,8 +1202,8 @@ def run_training(
                         metrics_payload = {
                             "step": global_step,
                             "total_steps": total_steps,
-                            # Raw last-batch values (kept for backward
-                            # compatibility; noisy by nature).
+                            # Raw last-batch values retained for per-batch
+                            # diagnostics; noisy by nature.
                             "loss": loss_value,
                             "ce": ce_value,
                             "threshold_loss": threshold_loss_value,
@@ -1273,11 +1225,15 @@ def run_training(
                                 "interval_rank_loss"
                             ],
                             "interval_accuracy": interval_metrics["interval_accuracy"],
-                            "interval_positive_recall_tau099": (
-                                interval_metrics["interval_positive_recall_tau099"]
+                            "interval_positive_recall_at_decision_threshold": (
+                                interval_metrics[
+                                    "interval_positive_recall_at_decision_threshold"
+                                ]
                             ),
-                            "interval_negative_specificity_tau099": (
-                                interval_metrics["interval_negative_specificity_tau099"]
+                            "interval_negative_specificity_at_decision_threshold": (
+                                interval_metrics[
+                                    "interval_negative_specificity_at_decision_threshold"
+                                ]
                             ),
                             "interval_samples": interval_metrics["interval_samples"],
                             "interval_samples_per_second": (
@@ -1429,13 +1385,11 @@ def run_training(
                     total_steps=total_steps,
                     evaluation_state=evaluation_state,
                 )
-                evaluation_state["full_test_count"] += 1
                 evaluation_state["val_full_count"] += 1
                 final_metrics = _broadcast_object(result.metrics, rank)
                 evaluation_state["last_full_metrics"] = final_metrics
                 if _is_better_model(final_metrics, best_metrics, config["evaluation"]):
                     best_metrics = final_metrics
-                    evaluation_state["best_observed_dev_test_metrics"] = final_metrics
                     evaluation_state["best_validation_metrics"] = final_metrics
                     final_is_best = True
                 else:
@@ -1464,11 +1418,6 @@ def run_training(
                 "last",
                 "best_selection",
             )
-            clone_checkpoint_pair(
-                output_dir / "checkpoints",
-                "last",
-                "best_observed_dev_test_selection",
-            )
         if (
             rank == 0
             and int(config["checkpoint"].get("save_topk", 0)) > 0
@@ -1487,7 +1436,7 @@ def run_training(
         # scheduler / sampler / RNG / global_step are mutually consistent and
         # ``--resume checkpoint_last`` is an exact resume. ``restore_best`` is
         # a deployment/display concern only: the selected weights are loaded
-        # AFTER the lineage is sealed so they can never leak into ``last``.
+        # AFTER the lineage is finalized so they can never leak into ``last``.
         restored_best = False
         best_selection_path = output_dir / "checkpoints" / "model_best_selection.pth"
         if (
@@ -1517,16 +1466,15 @@ def run_training(
             summary_payload = {
                 "global_step": global_step,
                 "last_checkpoint_metrics": evaluation_state["last_full_metrics"],
-                "best_observed_dev_test_metrics": best_metrics,
                 "best_validation_metrics": best_metrics,
                 "best_val_loss_metrics": best_val_loss_metrics,
                 "best_worst_game_metrics": best_worst_game_metrics,
                 "restored_best": restored_best,
                 "early_stopping": evaluation_state["early_stopping"],
                 "topk_checkpoints": evaluation_state.get("topk_registry", []),
-                "test_evaluation_counts": {
-                    "quick": evaluation_state["quick_test_count"],
-                    "full": evaluation_state["full_test_count"],
+                "validation_evaluation_counts": {
+                    "quick": evaluation_state["val_quick_count"],
+                    "full": evaluation_state["val_full_count"],
                     "train_probe": evaluation_state["train_probe_count"],
                 },
                 "data_pipeline": loaders.data_summary,
@@ -1547,14 +1495,15 @@ def run_training(
                 ],
             }
             (output_dir / "training_summary.json").write_text(
-                json.dumps(summary_payload, ensure_ascii=False, indent=2),
+                json.dumps(
+                    stamp_payload(summary_payload), ensure_ascii=False, indent=2
+                ),
                 encoding="utf-8",
             )
             _finalize_run_success(
                 output_dir=output_dir,
                 config=config,
                 run_id=run_id,
-                run_mode=run_mode,
                 runs_root=runs_root,
                 summary_payload=summary_payload,
                 global_step=global_step,
@@ -1580,7 +1529,6 @@ def run_training(
                 exc,
                 global_step=global_step,
                 run_id=run_id,
-                run_mode=run_mode,
                 runs_root=runs_root,
                 config=config,
                 started_wall=started_wall,

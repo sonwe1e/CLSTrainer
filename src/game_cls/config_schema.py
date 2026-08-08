@@ -5,9 +5,7 @@ exist, what type they accept and what they mean. It enforces three rules:
 
 1. Unknown configuration keys raise an error (with a "did you mean"
    suggestion) instead of being silently ignored.
-2. Removed/deprecated keys raise a migration hint instead of being
-   silently accepted.
-3. Task-profile facts (the deployment decision threshold, frame size,
+2. Task-profile facts (the deployment decision threshold, frame size,
    pair delta, output width, trainable scope) are resolved from exactly
    one place: ``decision.threshold`` for the threshold; the rest are
    defaults that recipes may override — the framework must stay
@@ -22,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,7 +46,6 @@ class Key:
     description: str
     nullable: bool = False
     choices: tuple[Any, ...] | None = None
-    legacy: bool = False
 
 
 def _k(kind: str, description: str, **kwargs: Any) -> Key:
@@ -78,14 +76,8 @@ SCHEMA: dict[str, Any] = {
         "seed": _k("int", "Base RNG seed; each rank adds its rank id."),
         "output_dir": _k(
             "str",
-            "Run output location. With run_mode=unique it is the runs ROOT: "
-            "every start creates a fresh dated subdirectory underneath it.",
-        ),
-        "run_mode": _k(
-            "str",
-            "fixed: write directly into output_dir (legacy). unique: "
-            "allocate an immutable timestamped run directory under output_dir.",
-            choices=("fixed", "unique"),
+            "Runs root; every fresh start creates a dated immutable "
+            "subdirectory underneath it.",
         ),
         "smoke_mode": _k(
             "bool",
@@ -120,21 +112,24 @@ SCHEMA: dict[str, Any] = {
         "train_index": _k("str", "Train frame index parquet."),
         "val_index": _k(
             "str",
-            "Validation frame index parquet. When omitted, test_index is "
-            "aliased as validation and the run has no independent test set.",
+            "Validation frame index parquet; required for real-data training.",
             nullable=True,
         ),
-        "test_index": _k("str", "Test frame index parquet."),
+        "test_index": _k(
+            "str", "Optional independent test frame index parquet.", nullable=True
+        ),
         "train_video_index": _k(
             "str", "Train video-level entries parquet (row-per-video)."
         ),
         "val_video_index": _k(
             "str",
-            "Validation video-level entries parquet (row-per-video).",
+            "Validation video-level entries parquet; required for real-data training.",
             nullable=True,
         ),
         "test_video_index": _k(
-            "str", "Test video-level entries parquet (row-per-video)."
+            "str",
+            "Optional independent test video-level entries parquet.",
+            nullable=True,
         ),
         "backend": _k(
             "str",
@@ -198,13 +193,8 @@ SCHEMA: dict[str, Any] = {
         ),
         "require_independent_test": _k(
             "bool",
-            "Production acceptance gate: refuse to train when the test "
-            "split is aliased as the validation split.",
-        ),
-        "split_migration": _k(
-            "dict",
-            "Auto-generated notes describing legacy split aliasing "
-            "(set by finalize_config; do not configure manually).",
+            "Production acceptance gate: require a dedicated test split "
+            "distinct from validation.",
         ),
         "source_root": _k(
             "str",
@@ -277,7 +267,7 @@ SCHEMA: dict[str, Any] = {
         },
         "metadata_sidecar": _k(
             "str",
-            "Optional authenticated v2 metadata parquet keyed by stable_source_id "
+            "Optional contract-5 metadata parquet keyed by stable_source_id "
             "(negative_subtype, sample_weight). Joined AFTER the split; "
             "never part of split/dedup identity (step5 P2).",
             nullable=True,
@@ -337,14 +327,14 @@ SCHEMA: dict[str, Any] = {
             ),
             "pool_packed_index": _k(
                 "str",
-                "packed_uint8 shard index of the mining pool; required when "
-                "data.backend=packed_uint8.",
+                "packed_uint8 shard index of the mining pool; when set, this "
+                "external pool uses packed storage independently of data.backend.",
                 nullable=True,
             ),
             "pool_packed_video_index": _k(
                 "str",
-                "Video-level index of the packed mining pool; falls back to "
-                "pool_video_index when unset.",
+                "Video-level index of the packed mining pool; required with "
+                "pool_packed_index.",
                 nullable=True,
             ),
             "output": _k("str", "Output hard_negatives.parquet mining manifest path."),
@@ -361,7 +351,6 @@ SCHEMA: dict[str, Any] = {
                 "Optional p_positive floor; only negatives at or above it are kept.",
                 nullable=True,
             ),
-            "version": _k("int", "Mining manifest format version."),
         },
         "challenge_index": _k(
             "str",
@@ -377,14 +366,14 @@ SCHEMA: dict[str, Any] = {
         ),
         "challenge_packed_index": _k(
             "str",
-            "packed_uint8 shard index of the challenge set; required when "
-            "data.backend=packed_uint8.",
+            "packed_uint8 shard index of the challenge set; when set, the "
+            "challenge uses packed storage independently of data.backend.",
             nullable=True,
         ),
         "challenge_packed_video_index": _k(
             "str",
-            "Video-level index of the packed challenge set; falls back to "
-            "challenge_video_index when unset.",
+            "Video-level index of the packed challenge set; required with "
+            "challenge_packed_index.",
             nullable=True,
         ),
     },
@@ -398,11 +387,6 @@ SCHEMA: dict[str, Any] = {
         "game_alpha": _k("float", "Dirichlet smoothing for per-game balancing."),
         "class_probability": _k(
             "dict", "Label sampling probability, e.g. {0: 0.5, 1: 0.5}."
-        ),
-        "deduplicate_within_global_batch": _k(
-            "bool",
-            "Legacy alias of data.deduplication.level: true=pair, false=none.",
-            legacy=True,
         ),
     },
     "augmentation": {
@@ -484,15 +468,10 @@ SCHEMA: dict[str, Any] = {
             "Base checkpoint; all non-cls weights must load from it.",
             nullable=True,
         ),
-        "trainable_name_contains": _k(
-            "str",
-            "Substring selecting trainable parameters (task profile default: cls).",
-        ),
         "trainable_rules": _k(
             "dict",
             "Staged partial unfreeze: dict keyed by rule name, each rule "
-            "{pattern, lr_scale, unfreeze_at_step, priority}. When absent, "
-            "trainable_name_contains is used (legacy behavior).",
+            "{pattern, lr_scale, unfreeze_at_step, priority}.",
         ),
         "num_classes": _k("int", "Output classes (task profile default: 2)."),
         "freeze_backbone_batchnorm_stats": _k(
@@ -502,12 +481,6 @@ SCHEMA: dict[str, Any] = {
             "bool",
             "Keep cls-head BatchNorm statistics frozen (required for "
             "distributed training without SyncBatchNorm).",
-        ),
-        "freeze_batchnorm_stats": _k(
-            "bool",
-            "Legacy global BatchNorm freeze switch; prefer the two "
-            "role-specific keys above.",
-            legacy=True,
         ),
         "require_pretrained_backbone": _k(
             "bool",
@@ -532,12 +505,6 @@ SCHEMA: dict[str, Any] = {
     },
     "loss": {
         "cross_entropy_weight": _k("float", "Weight of the CE component."),
-        "threshold": _k(
-            "float",
-            "Legacy copy of decision.threshold. Prefer decision.threshold; "
-            "conflicting values are rejected.",
-            legacy=True,
-        ),
         "threshold_loss_weight": _k(
             "float", "Maximum weight of the threshold margin loss."
         ),
@@ -568,7 +535,7 @@ SCHEMA: dict[str, Any] = {
         ),
         "label_smoothing": _k(
             "float",
-            "Cross-entropy label smoothing. 0.0 keeps legacy behavior; "
+            "Cross-entropy label smoothing; "
             "keep small while the deployment threshold is fixed at 0.99.",
         ),
         "negative_tail_loss_weight": _k(
@@ -621,15 +588,6 @@ SCHEMA: dict[str, Any] = {
         "log_every_steps": _k("int", "Metric/log cadence in steps."),
     },
     "dataloader": {
-        "num_workers": _k(
-            "int",
-            "Fallback worker count; role-specific dataloader.train/eval "
-            "values win when present.",
-            legacy=True,
-        ),
-        "persistent_workers": _k("bool", "Fallback persistent_workers.", legacy=True),
-        "prefetch_factor": _k("int", "Fallback prefetch_factor.", legacy=True),
-        "pin_memory": _k("bool", "Fallback pin_memory.", legacy=True),
         "multiprocessing_context": _k(
             "str",
             "Worker start method; NPU forces spawn.",
@@ -646,37 +604,11 @@ SCHEMA: dict[str, Any] = {
         "eval": dict(_DATALOADER_ROLE_KEYS),
     },
     "evaluation": {
-        "threshold": _k(
-            "float",
-            "Legacy copy of decision.threshold. Prefer decision.threshold; "
-            "conflicting values are rejected.",
-            legacy=True,
-        ),
         "amp": _k("bool", "Mixed precision for evaluation forward passes."),
         "amp_dtype": _k(
             "str",
             "Evaluation AMP dtype (deployment parity).",
             choices=("float16", "bfloat16"),
-        ),
-        "quick_test_every_steps": _k(
-            "int",
-            "Legacy alias of val_quick_every_steps; migrated automatically.",
-            legacy=True,
-        ),
-        "quick_test_pairs_per_video": _k(
-            "int",
-            "Legacy alias of val_quick_pairs_per_video; migrated automatically.",
-            legacy=True,
-        ),
-        "full_test_every_steps": _k(
-            "int",
-            "Legacy alias of val_full_every_steps; migrated automatically.",
-            legacy=True,
-        ),
-        "full_test_at_end": _k(
-            "bool",
-            "Legacy alias of val_full_at_end; migrated automatically.",
-            legacy=True,
         ),
         "train_probe_every_steps": _k(
             "int",
@@ -720,16 +652,11 @@ SCHEMA: dict[str, Any] = {
         ),
         "selection_metric": _k(
             "str",
-            "Metric used to pick the best checkpoint. Neutral names do not "
-            "bake in a fixed decision threshold; the legacy _tau099 names "
-            "are still accepted.",
+            "Metric used to pick the best checkpoint.",
             choices=(
                 "global_f1_at_decision_threshold",
                 "macro_game_f1_at_decision_threshold",
                 "worst_game_f1_at_decision_threshold",
-                "global_f1_tau099",
-                "macro_game_f1_tau099",
-                "worst_game_f1_tau099",
                 "composite",
             ),
         ),
@@ -797,8 +724,8 @@ SCHEMA: dict[str, Any] = {
         "monitor": _k(
             "str",
             "Metric or selection contract watched for improvement. "
-            "`selection_score` (alias `selection`) follows the unified "
-            "selection contract: improvement is judged by the same ordering "
+            "`selection_score` follows the unified selection contract: "
+            "improvement is judged by the same ordering "
             "as best-checkpoint selection; in constrained mode that is "
             "(global_positive_recall, worst_game_positive_recall, "
             "-negative_score_p999), with ineligible evaluations counting "
@@ -806,18 +733,16 @@ SCHEMA: dict[str, Any] = {
             "one numeric metric and uses the plain `mode` comparison.",
             choices=(
                 "selection_score",
-                "selection",
                 "cross_entropy",
                 "objective_loss",
                 "worst_game_f1_at_decision_threshold",
-                "worst_game_f1_tau099",
             ),
         ),
         "mode": _k(
             "str",
             "max: higher monitor values are better; min: lower values. "
             "Applies only to non-selection monitors (any `monitor` other "
-            "than `selection_score`/`selection`); `mode: min` combined with "
+            "than `selection_score`); `mode: min` combined with "
             "a selection monitor is a config error because the selection "
             "rank key is always bigger-is-better.",
             choices=("max", "min"),
@@ -859,9 +784,6 @@ SCHEMA: dict[str, Any] = {
             "bool",
             "Clone the best worst-game-F1 checkpoint (model_best_worst_game.pth).",
         ),
-        "save_best_test_f1": _k(
-            "bool", "Legacy alias of save_best_selection.", legacy=True
-        ),
         "save_topk": _k(
             "int",
             "Keep the top-N full-validation checkpoints ranked by "
@@ -872,15 +794,14 @@ SCHEMA: dict[str, Any] = {
         ),
         "topk_monitor": _k(
             "str",
-            "`selection_score` (alias `selection`) ranks topk checkpoints "
-            "by the unified selection contract, the same ordering as "
+            "`selection_score` ranks topk checkpoints by the unified "
+            "selection contract, the same ordering as "
             "best-checkpoint selection; ineligible checkpoints are admitted "
             "but ranked strictly below every eligible one. Any other value "
             "names one numeric metric: lower is better for `cross_entropy`, "
             "higher is better otherwise.",
             choices=(
                 "selection_score",
-                "selection",
                 "cross_entropy",
                 "worst_game_f1_at_decision_threshold",
             ),
@@ -906,12 +827,9 @@ SCHEMA: dict[str, Any] = {
             'emits, each {op: "<="|"<"|">="|">", value: <number>}, e.g. '
             '{global_fpr_at_decision_threshold: {op: "<=", value: 0.01}, '
             'global_positive_recall_at_decision_threshold: {op: ">=", '
-            "value: 0.8}}. A bare scalar bound is still accepted and means "
-            "the metric's natural bound (upper for FPR/ECE/Brier/loss/"
-            "negative-score, lower for recall/F1/precision/specificity/"
-            "accuracy); metrics with no documented direction (sample_count, "
-            "threshold) require the explicit form. Unknown metric names or "
-            "operators are config errors; unmet gates fail the command.",
+            "value: 0.8}}. Every gate must use the explicit form; bare "
+            "scalar bounds, unknown metric names and unknown operators are "
+            "config errors. Unmet gates fail the command.",
         ),
     },
     "export": {
@@ -937,8 +855,8 @@ SCHEMA: dict[str, Any] = {
 _SPLIT_KEYS: dict[str, Any] = {
     "mode": _k(
         "str",
-        "Split derivation mode: 'off' keeps the legacy three-root index "
-        "layout; 'from_train' scans source_root once and derives train/val "
+        "Split derivation mode: 'off' consumes prepared indexes; "
+        "'from_train' scans source_root once and derives train/val "
         "by source video.",
         choices=("off", "from_train"),
     ),
@@ -952,7 +870,7 @@ _SPLIT_KEYS: dict[str, Any] = {
         "Deterministic split seed; the same seed and data produce a "
         "byte-identical manifest.",
     ),
-    "group_key": _k("str", "Split unit identity; must be 'source_video_uid'."),
+    "group_key": _k("str", "Split unit identity; must be 'stable_source_id'."),
     "stratify_by": _k("list", "Stratum fields for balancing, e.g. ['game', 'label']."),
     "balance_by": _k("str", "Balancing statistic; must be 'legal_pair_count'."),
     "target_delta": _k(
@@ -1020,26 +938,6 @@ _NESTED_KEY_SCHEMAS: dict[str, dict[str, Any]] = {
 def _nested_key_schema(dotted: str) -> dict[str, Any] | None:
     """Sub-key schema of a dict-typed leaf, if one is registered."""
     return _NESTED_KEY_SCHEMAS.get(dotted)
-
-
-# Keys that used to exist but have no consumer anymore. They raise a
-# migration hint instead of being silently accepted ("looks effective but
-# is not" is worse than an error).
-REMOVED_KEYS: dict[str, str] = {
-    "optimizer.name": (
-        "The optimizer is fixed to AdamW and was never selected by this "
-        "field. Remove it."
-    ),
-    "scheduler.name": (
-        "The scheduler is a fixed cosine-with-warmup implementation and was "
-        "never selected by this field. Remove it."
-    ),
-    "evaluation.save_all_errors": (
-        "Removed: quick-test error exports are bounded by "
-        "evaluation.quick_save_error_limit, full tests always stream all "
-        "errors to parquet shards."
-    ),
-}
 
 
 def _type_matches(value: Any, key: Key) -> bool:
@@ -1123,23 +1021,6 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ConfigSchemaError(problems)
 
 
-def check_removed_keys(config: dict[str, Any]) -> None:
-    problems: list[str] = []
-    for dotted, hint in REMOVED_KEYS.items():
-        cursor: Any = config
-        found = True
-        for part in dotted.split("."):
-            if isinstance(cursor, dict) and part in cursor:
-                cursor = cursor[part]
-            else:
-                found = False
-                break
-        if found:
-            problems.append(f"Removed config key: {dotted}. {hint}")
-    if problems:
-        raise ConfigSchemaError(problems)
-
-
 def known_dotted_paths() -> list[str]:
     """Every schema-known leaf path, for override validation and docs."""
     paths: list[str] = []
@@ -1161,10 +1042,6 @@ def known_dotted_paths() -> list[str]:
 
 def check_override_path(dotted: str) -> None:
     """CLI overrides may only address schema-known keys."""
-    if dotted in REMOVED_KEYS:
-        raise ConfigSchemaError(
-            [f"Removed config key: {dotted}. {REMOVED_KEYS[dotted]}"]
-        )
     if dotted in known_dotted_paths():
         return
     suggestion = difflib.get_close_matches(
@@ -1181,40 +1058,10 @@ def check_override_path(dotted: str) -> None:
 
 
 def resolve_decision_threshold(config: dict[str, Any]) -> float:
-    """Merge the single business threshold into loss and evaluation.
-
-    ``decision.threshold`` is the source of truth. Legacy ``loss.threshold``
-    and ``evaluation.threshold`` are tolerated only while they agree with
-    it; diverging values are a configuration error.
-    """
+    """Resolve the one business threshold from ``decision.threshold``."""
     decision_cfg = config.get("decision") or {}
-    candidates = {
-        "decision.threshold": decision_cfg.get("threshold"),
-        "loss.threshold": (config.get("loss") or {}).get("threshold"),
-        "evaluation.threshold": (config.get("evaluation") or {}).get("threshold"),
-    }
-    provided = {
-        name: float(value) for name, value in candidates.items() if value is not None
-    }
-    if not provided:
-        threshold = 0.99
-    else:
-        distinct = set(provided.values())
-        if len(distinct) > 1:
-            detail = ", ".join(
-                f"{name}={value}" for name, value in sorted(provided.items())
-            )
-            raise ConfigSchemaError(
-                [
-                    "Conflicting decision thresholds: "
-                    f"{detail}. Keep a single source of truth in "
-                    "decision.threshold."
-                ]
-            )
-        threshold = next(iter(distinct))
+    threshold = float(decision_cfg.get("threshold", 0.99))
     config.setdefault("decision", {})["threshold"] = threshold
-    config.setdefault("loss", {})["threshold"] = threshold
-    config.setdefault("evaluation", {})["threshold"] = threshold
     return threshold
 
 
@@ -1300,7 +1147,7 @@ _DEFAULT_LOSS_NEW_KEYS: dict[str, Any] = {
     "rank_margin": 0.2,
 }
 
-# Hard-negative subtype mixing (step5 P2). All defaults keep the legacy
+# Hard-negative subtype mixing. Defaults keep subtype mixing disabled.
 # sampler byte-identical when data.hard_negative.enabled is false.
 _DEFAULT_HARD_NEGATIVE: dict[str, Any] = {
     "enabled": False,
@@ -1323,7 +1170,6 @@ _DEFAULT_MINING: dict[str, Any] = {
     "top_k_per_video": 8,
     "max_samples": None,
     "score_threshold": None,
-    "version": 2,
 }
 
 
@@ -1336,14 +1182,26 @@ def _apply_defaults(config: dict[str, Any]) -> None:
         experiment["name"] = "run"
     experiment.setdefault("smoke_mode", False)
 
+    model = config.setdefault("model", {})
+    model.setdefault(
+        "trainable_rules",
+        {
+            "classification_head": {
+                "pattern": r"^cls\.",
+                "lr_scale": 1.0,
+                "unfreeze_at_step": 0,
+                "priority": 0,
+            }
+        },
+    )
+
     # An absent data.split block still yields the full dict so consumers can
-    # rely on the documented defaults (split.mode=off keeps the legacy
-    # three-root index layout).
+    # rely on the documented defaults.
     default_split = {
         "mode": "off",
         "val_ratio": 0.10,
         "seed": 20260728,
-        "group_key": "source_video_uid",
+        "group_key": "stable_source_id",
         "stratify_by": ["game", "label"],
         "balance_by": "legal_pair_count",
         "target_delta": 2,
@@ -1429,62 +1287,6 @@ def _apply_defaults(config: dict[str, Any]) -> None:
         loss.setdefault(key, value)
 
 
-# Legacy evaluation cadence keys are silently migrated so old configs keep
-# working; the new train/validation/test protocol names are canonical.
-_LEGACY_EVALUATION_ALIASES: dict[str, str] = {
-    "quick_test_every_steps": "val_quick_every_steps",
-    "quick_test_pairs_per_video": "val_quick_pairs_per_video",
-    "full_test_every_steps": "val_full_every_steps",
-    "full_test_at_end": "val_full_at_end",
-}
-
-
-def migrate_split_roles(config: dict[str, Any]) -> None:
-    """Normalize legacy two-split configs onto train/val/test roles.
-
-    * When ``data.val_index`` is missing, ``data.test_index`` becomes the
-      validation split and ``data.split_migration.test_used_as_validation``
-      records that this run has no independent test set.
-    * Legacy ``quick_test_*``/``full_test_*`` evaluation cadence keys are
-      renamed to their ``val_*`` equivalents.
-
-    Idempotent: finalizing an already-finalized config changes nothing.
-    """
-    data_cfg = config.get("data")
-    if isinstance(data_cfg, dict):
-        migration = dict(data_cfg.get("split_migration") or {})
-        if not data_cfg.get("val_index") and data_cfg.get("test_index"):
-            data_cfg["val_index"] = data_cfg["test_index"]
-            if data_cfg.get("test_video_index"):
-                data_cfg["val_video_index"] = data_cfg["test_video_index"]
-            if data_cfg.get("test_packed_index"):
-                data_cfg["val_packed_index"] = data_cfg["test_packed_index"]
-            if data_cfg.get("test_packed_video_index"):
-                data_cfg["val_packed_video_index"] = data_cfg["test_packed_video_index"]
-            migration["test_used_as_validation"] = True
-        data_cfg["split_migration"] = migration
-    evaluation_cfg = config.get("evaluation")
-    if isinstance(evaluation_cfg, dict):
-        for legacy_key, canonical_key in _LEGACY_EVALUATION_ALIASES.items():
-            if legacy_key in evaluation_cfg and canonical_key not in evaluation_cfg:
-                evaluation_cfg[canonical_key] = evaluation_cfg.pop(legacy_key)
-            elif legacy_key in evaluation_cfg:
-                evaluation_cfg.pop(legacy_key)
-
-
-def split_role_warnings(config: dict[str, Any]) -> list[str]:
-    """Human-readable warnings about legacy split aliasing."""
-    warnings: list[str] = []
-    migration = (config.get("data") or {}).get("split_migration") or {}
-    if migration.get("test_used_as_validation"):
-        warnings.append(
-            "data.val_index is missing: test_index is used as the "
-            "validation split. This run has NO independent test set; final "
-            "test evaluation is unavailable until a val split is added."
-        )
-    return warnings
-
-
 def schedule_budget_warnings(config: dict[str, Any]) -> list[str]:
     """Warn when scheduler.warmup_steps exceeds the effective training budget.
 
@@ -1559,6 +1361,33 @@ def semantic_validate(config: dict[str, Any]) -> None:
     def require(condition: bool, message: str) -> None:
         if not condition:
             problems.append(message)
+
+    model_cfg = config.get("model") or {}
+    rules_cfg = model_cfg.get("trainable_rules")
+    require(
+        isinstance(rules_cfg, dict) and bool(rules_cfg),
+        "model.trainable_rules must contain at least one rule.",
+    )
+    if isinstance(rules_cfg, dict):
+        for name, rule in rules_cfg.items():
+            require(
+                isinstance(rule, dict) and bool(str(rule.get("pattern", ""))),
+                f"model.trainable_rules.{name}.pattern must be non-empty.",
+            )
+            if isinstance(rule, dict):
+                scale = rule.get("lr_scale", 1.0)
+                require(
+                    isinstance(scale, (int, float))
+                    and not isinstance(scale, bool)
+                    and math.isfinite(float(scale))
+                    and float(scale) > 0,
+                    f"model.trainable_rules.{name}.lr_scale must be finite and positive.",
+                )
+                step = rule.get("unfreeze_at_step", 0)
+                require(
+                    isinstance(step, int) and not isinstance(step, bool) and step >= 0,
+                    f"model.trainable_rules.{name}.unfreeze_at_step must be >= 0.",
+                )
 
     train_cfg = config.get("train") or {}
     if isinstance(train_cfg.get("local_batch_size"), (int, float)):
@@ -1774,6 +1603,83 @@ def semantic_validate(config: dict[str, Any]) -> None:
     ):
         require(False, problem)
 
+    export_cfg = config.get("export") or {}
+    verify_samples = export_cfg.get("verify_samples")
+    if isinstance(verify_samples, int) and not isinstance(verify_samples, bool):
+        require(
+            verify_samples >= 1,
+            f"export.verify_samples must be >= 1 (got {verify_samples}).",
+        )
+
+    mining_cfg = (config.get("data") or {}).get("mining") or {}
+    top_k = mining_cfg.get("top_k_per_video")
+    require(
+        isinstance(top_k, int) and not isinstance(top_k, bool) and top_k > 0,
+        "data.mining.top_k_per_video must be positive.",
+    )
+    max_samples = mining_cfg.get("max_samples")
+    if max_samples is not None:
+        require(
+            isinstance(max_samples, int)
+            and not isinstance(max_samples, bool)
+            and max_samples > 0,
+            "data.mining.max_samples must be positive when set.",
+        )
+    score_threshold = mining_cfg.get("score_threshold")
+    if score_threshold is not None:
+        require(
+            isinstance(score_threshold, (int, float))
+            and math.isfinite(float(score_threshold))
+            and 0 <= float(score_threshold) <= 1,
+            "data.mining.score_threshold must be finite and within [0, 1].",
+        )
+
+    data_contract = config.get("data") or {}
+    challenge_configured = any(
+        data_contract.get(key)
+        for key in (
+            "challenge_index",
+            "challenge_video_index",
+            "challenge_packed_index",
+            "challenge_packed_video_index",
+        )
+    )
+    if challenge_configured:
+        require(
+            bool(data_contract.get("challenge_index"))
+            and bool(data_contract.get("challenge_video_index")),
+            "A challenge pool requires challenge_index and "
+            "challenge_video_index from one external bundle.",
+        )
+        require(
+            bool(data_contract.get("challenge_packed_index"))
+            == bool(data_contract.get("challenge_packed_video_index")),
+            "challenge_packed_index and challenge_packed_video_index must be "
+            "configured together.",
+        )
+    mining_configured = any(
+        mining_cfg.get(key)
+        for key in (
+            "pool_index",
+            "pool_video_index",
+            "pool_packed_index",
+            "pool_packed_video_index",
+        )
+    )
+    if mining_configured:
+        require(
+            bool(mining_cfg.get("pool_index"))
+            and bool(mining_cfg.get("pool_video_index")),
+            "A mining pool requires pool_index and pool_video_index from one "
+            "external bundle.",
+        )
+        require(
+            bool(mining_cfg.get("pool_packed_index"))
+            == bool(mining_cfg.get("pool_packed_video_index")),
+            "pool_packed_index and pool_packed_video_index must be configured "
+            "together.",
+        )
+
     # Hard-negative subtype mixing (step5 P2): enabled requires a sidecar,
     # and the per-bucket weights must be positive.
     data_meta = config.get("data") or {}
@@ -1797,14 +1703,33 @@ def semantic_validate(config: dict[str, Any]) -> None:
             "negatives.",
         )
         negative_mix = hard_negative.get("negative_mix") or {}
+        require(
+            set(negative_mix) == {"ordinary", "hard"},
+            "data.hard_negative.negative_mix must contain exactly ordinary and hard.",
+        )
         mix_values = [
             negative_mix.get("ordinary", 0.0),
             negative_mix.get("hard", 0.0),
         ]
         require(
-            any(float(value) > 0 for value in mix_values),
-            "data.hard_negative.negative_mix must have a positive weight "
-            "for at least one of {ordinary, hard}.",
+            all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) >= 0
+                for value in mix_values
+            )
+            and sum(float(value) for value in mix_values) > 0,
+            "data.hard_negative.negative_mix weights must be finite, non-negative, "
+            "and have a positive sum.",
+        )
+        hard_subtypes = {str(value) for value in hard_negative.get("hard_subtypes", [])}
+        ordinary_subtypes = {
+            str(value) for value in hard_negative.get("ordinary_subtypes", [])
+        }
+        require(
+            hard_subtypes.isdisjoint(ordinary_subtypes),
+            "data.hard_negative hard_subtypes and ordinary_subtypes must not overlap.",
         )
         max_pairs = hard_negative.get("max_pairs_per_video")
         if max_pairs is not None:
@@ -1928,14 +1853,6 @@ def semantic_validate(config: dict[str, Any]) -> None:
                 "namespaces would collapse the provenance boundary and hide "
                 "cross-pool leakage.",
             )
-            require(
-                not (data_meta.get("split_migration") or {}).get(
-                    "test_used_as_validation", False
-                ),
-                "data.source_video_identity.namespaces requires an independent "
-                "test split; the current config aliases test_index as "
-                "validation (data.split_migration.test_used_as_validation).",
-            )
 
     # early_stopping.mode: min with a selection monitor is a silent behavior
     # reversal: the selection rank key is always bigger-is-better (in
@@ -1944,7 +1861,7 @@ def semantic_validate(config: dict[str, Any]) -> None:
     # contract maximizes, making it a misconfiguration rather than a deliberate
     # choice. Minimizing a selection score is meaningless and the default is
     # max, so rejecting it cannot break any legitimate config.
-    _SELECTION_MONITOR_VALUES = frozenset({"selection_score", "selection"})
+    _SELECTION_MONITOR_VALUES = frozenset({"selection_score"})
     early_cfg = config.get("early_stopping") or {}
     es_monitor = early_cfg.get("monitor", "selection_score")
     es_mode = early_cfg.get("mode", "max")
@@ -1972,8 +1889,6 @@ def finalize_config(config: dict[str, Any]) -> dict[str, Any]:
     """
     finalized = copy.deepcopy(config)
     _apply_defaults(finalized)
-    migrate_split_roles(finalized)
-    check_removed_keys(finalized)
     validate_config(finalized)
     resolve_decision_threshold(finalized)
     semantic_validate(finalized)
@@ -1995,7 +1910,6 @@ def describe_reference() -> list[dict[str, Any]]:
                     "path": dotted,
                     "type": spec.kind + ("|null" if spec.nullable else ""),
                     "choices": list(spec.choices) if spec.choices else None,
-                    "legacy": spec.legacy,
                     "description": spec.description,
                 }
             )

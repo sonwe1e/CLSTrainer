@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -186,8 +168,8 @@ def _release_gate(config: dict) -> int:
             print(
                 "  note              : the report's gate contract differs "
                 "from this config; re-judging below.",
-                    file=sys.stderr,
-                )
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -245,8 +227,13 @@ def _verify_report_against_gates(
 
 def _read_report_payload(report: Path) -> dict | None:
     try:
+        from game_cls.contract import require_contract
+
         payload = json.loads(report.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        require_contract(payload, f"Benchmark report {report}")
+        return payload
     except (OSError, ValueError):
         return None
 
@@ -273,7 +260,9 @@ def _release_identity_mismatches(
     is a failure rather than an implicit pass; this mirrors the existing
     treatment of reports that predate the current gate set.
     """
+    from game_cls.contract import CONTRACT_VERSION
     from game_cls.reports.benchmark import (
+        benchmark_source_fingerprint,
         canonical_config_sha256,
         challenge_bundle_fingerprint,
         challenge_component_differences,
@@ -289,12 +278,22 @@ def _release_identity_mismatches(
     # video-index file. Routed through the shared helper that
     # cmd_benchmark_evaluate also calls: an inlined copy on either side would
     # drift and turn every identity comparison into an unconditional failure.
-    challenge_fingerprint, challenge_components = challenge_bundle_fingerprint(config)
+    try:
+        challenge_fingerprint, challenge_components = challenge_bundle_fingerprint(
+            config
+        )
+    except Exception as exc:
+        # Release validation is a user-facing gate.  A missing/corrupt source
+        # bundle must fail closed, but it should be reported as a validation
+        # problem rather than escaping as an implementation traceback.
+        return [f"challenge identity cannot be verified: {exc}"]
     expected = {
         "run_id": run_id,
         "resolved_config_sha256": canonical_config_sha256(config),
         "challenge_dataset_fingerprint": challenge_fingerprint,
         "gate_spec_fingerprint": gate_spec_fingerprint(gate_metrics),
+        "contract_version": CONTRACT_VERSION,
+        "benchmark_source_sha256": benchmark_source_fingerprint(),
     }
     problems: list[str] = []
     for field, current in expected.items():
@@ -358,12 +357,7 @@ def _find_report_for_checkpoint(
     run_id: str,
     checkpoint_alias: str,
 ) -> Path | None:
-    """The report whose ``checkpoint_sha256`` matches the target artifact.
-
-    Legacy reports predate the hash column, so fall back to an exact run_id +
-    alias match; a report that carries a DIFFERENT checkpoint hash is never a
-    match, so a later run's PASS cannot be borrowed (audit P0-4).
-    """
+    """Return the contract-5 report bound to the target artifact hash."""
     if not output_dir.is_dir():
         return None
     candidates = list(output_dir.glob("*/report.json"))
@@ -372,19 +366,6 @@ def _find_report_for_checkpoint(
         if not payload:
             continue
         if payload.get("checkpoint_sha256") == checkpoint_sha:
-            return report
-    # Legacy fallback: a report that predates the hash column is matched by
-    # exact run_id + alias. A report that CARRIES a different checkpoint hash
-    # is never a match -- a later artifact cannot borrow its PASS.
-    for report in candidates:
-        payload = _read_report_payload(report)
-        if not payload:
-            continue
-        if (
-            not payload.get("checkpoint_sha256")
-            and payload.get("run_id") == run_id
-            and payload.get("checkpoint") == checkpoint_alias
-        ):
             return report
     return None
 
@@ -434,8 +415,6 @@ def cmd_config_reference(args: argparse.Namespace) -> int:
 
     for row in describe_reference():
         flags = []
-        if row["legacy"]:
-            flags.append("legacy")
         if row["choices"]:
             flags.append("choices: " + "|".join(map(str, row["choices"])))
         suffix = f" ({'; '.join(flags)})" if flags else ""

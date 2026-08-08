@@ -10,8 +10,8 @@ validation set.
 
 Source identity is pluggable through ``identity_mode``:
 
-* ``"game_video"`` (default) — ``source_video_uid`` is label-independent
-  and used exactly as in ``indexing.source_video_uid``; a video carrying
+* ``"game_video"`` (default) — ``stable_source_id`` is label-independent;
+  a video carrying
   frames under both labels stays a single uid, so the strict audit treats
   any overlap across splits as fatal.
 * ``"game_label_video"`` — the label is embedded in the uid, so each label
@@ -31,13 +31,14 @@ import os
 from collections import defaultdict
 from pathlib import Path
 
-# Bump whenever the assignment rule, the fingerprint definition or the
-# manifest schema changes so stale manifests are rejected instead of reused
-# under a contract they were not written for.
-SPLIT_ALGORITHM_VERSION = 3
+from game_cls.contract import (
+    CONTRACT_VERSION,
+    require_parquet_contract,
+    stamp_parquet_table,
+)
 
 # Source identity contract: how a (game, video_id) (plus label) is reduced
-# to a single source_video_uid. Both modes keep pair counts per label.
+# to a single stable source id. Both modes keep pair counts per label.
 SOURCE_IDENTITY_MODES = ("game_video", "game_label_video")
 SOURCE_IDENTITY_MODE_DEFAULT = "game_video"
 
@@ -50,7 +51,7 @@ SPLIT_MANIFEST_FILENAME = "split_manifest.parquet"
 SPLIT_SUMMARY_FILENAME = "split_summary.json"
 
 
-def source_video_uid(
+def stable_source_id(
     game: str,
     video_id: str,
     label=None,
@@ -62,7 +63,7 @@ def source_video_uid(
 
     The default ``"game_video"`` identity is label-independent: a source
     video keeps a single uid regardless of its labels, exactly the leakage
-    unit ``indexing.source_video_uid`` audits against. Under
+    unit the dataset audit uses. Under
     ``"game_label_video"`` the label is embedded in the uid, so a video
     that carries frames under both labels becomes two independent
     identities and ``label`` is required.
@@ -81,7 +82,7 @@ def source_video_uid(
         )
     if mode == "game_label_video":
         if label is None:
-            raise ValueError("source_video_uid mode=game_label_video requires label")
+            raise ValueError("stable_source_id mode=game_label_video requires label")
         uid = f"{game}::{int(label)}::{video_id}"
     else:
         uid = f"{game}::{video_id}"
@@ -150,7 +151,7 @@ def _group_frames(
     *,
     identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> dict[str, dict]:
-    """Group frames by source_video_uid and precompute per-label stats.
+    """Group frames by stable_source_id and precompute per-label stats.
 
     Under ``"game_label_video"`` the uid embeds the label, so every group
     has exactly one label. Under the default ``"game_video"`` a source
@@ -160,7 +161,7 @@ def _group_frames(
     """
     grouped: dict[str, dict] = {}
     for frame in frames:
-        uid = source_video_uid(
+        uid = stable_source_id(
             frame.game,
             frame.video_id,
             label=frame.label,
@@ -462,7 +463,7 @@ def split_source_videos(
     rejects strata with fewer than two source videos (cannot split without
     leakage); ``"warn"`` puts those lone videos in train.
 
-    Returns ``{source_video_uid: "train" | "val"}``.
+    Returns ``{stable_source_id: "train" | "val"}``.
     """
     _validate_split_params(
         val_ratio=val_ratio,
@@ -614,8 +615,8 @@ def extend_split(
     stats = {
         "added_source_videos": len(fresh),
         "dropped_source_videos": len(dropped),
-        "added_source_video_uids": sorted(fresh),
-        "dropped_source_video_uids": dropped,
+        "added_stable_source_ids": sorted(fresh),
+        "dropped_stable_source_ids": dropped,
     }
     return assignment, stats
 
@@ -630,7 +631,7 @@ def _manifest_rows(
     target_delta: int,
     identity_mode: str = SOURCE_IDENTITY_MODE_DEFAULT,
 ) -> list[dict]:
-    """Per-source-video rows for the split manifest parquet (v3 schema).
+    """Per-source-video rows for the contract-5 split manifest parquet.
 
     Per-label stats are recorded per label so a mixed-label video's
     manifest row stays usable under either identity mode.
@@ -642,7 +643,7 @@ def _manifest_rows(
         label1_pairs = group["pair_counts_by_label"].get(1, {})
         rows.append(
             {
-                "source_video_uid": uid,
+                "stable_source_id": uid,
                 "game": group["game"],
                 "labels": list(group["labels"]),
                 "frame_count_label0": group["frame_count_label0"],
@@ -656,7 +657,6 @@ def _manifest_rows(
                 "split": assignment[uid],
                 "dataset_fingerprint": dataset_fingerprint,
                 "split_seed": seed,
-                "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
                 # Recorded so reuse can verify the manifest was written
                 # under the same balancing contract, not just the same data.
                 "split_val_ratio": float(val_ratio),
@@ -700,7 +700,7 @@ def write_split_manifest(
     # pq.read_table opens with FILE_SHARE_DELETE on Windows.
     tmp = path.with_name(path.name + ".tmp")
     try:
-        pq.write_table(pa.Table.from_pylist(rows), tmp)
+        pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), tmp)
         os.replace(tmp, path)
     finally:
         if tmp.exists():
@@ -708,13 +708,7 @@ def write_split_manifest(
 
 
 def load_split_manifest(path: str | Path) -> dict:
-    """Load ``{source_video_uid: "train" | "val"}`` and manifest metadata.
-
-    ``split_val_ratio``/``split_target_delta`` are absent from manifests
-    written by algorithm version 1 and come back as ``None``; the version
-    check rejects those before the values are ever compared. Manifests
-    older than the identity-mode record default to ``"game_video"``.
-    """
+    """Load split assignments and manifest metadata."""
     from .indexing import _pyarrow
 
     _, pq = _pyarrow()
@@ -723,8 +717,24 @@ def load_split_manifest(path: str | Path) -> dict:
     # omits that flag, so any live reference blocks os.replace on the same
     # path with WinError 32 — exactly what resolve_split does when it
     # atomically rewrites a stale manifest.
+    require_parquet_contract(path)
     rows = pq.read_table(path).to_pylist()
-    assignment = {row["source_video_uid"]: row["split"] for row in rows}
+    required = {
+        "stable_source_id",
+        "split",
+        "dataset_fingerprint",
+        "split_seed",
+        "split_val_ratio",
+        "split_target_delta",
+        "split_source_identity_mode",
+    }
+    if rows:
+        missing = required - set(rows[0])
+        if missing:
+            raise ValueError(
+                f"Split manifest is missing contract-5 fields: {sorted(missing)}."
+            )
+    assignment = {row["stable_source_id"]: row["split"] for row in rows}
     if rows:
         first = rows[0]
         ratio = first.get("split_val_ratio")
@@ -733,18 +743,14 @@ def load_split_manifest(path: str | Path) -> dict:
             "assignment": assignment,
             "dataset_fingerprint": first["dataset_fingerprint"],
             "split_seed": int(first["split_seed"]),
-            "split_algorithm_version": int(first["split_algorithm_version"]),
             "split_val_ratio": None if ratio is None else float(ratio),
             "split_target_delta": None if delta is None else int(delta),
-            "split_source_identity_mode": str(
-                first.get("split_source_identity_mode", "game_video")
-            ),
+            "split_source_identity_mode": str(first["split_source_identity_mode"]),
         }
     return {
         "assignment": {},
         "dataset_fingerprint": "",
         "split_seed": 0,
-        "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
         "split_val_ratio": None,
         "split_target_delta": None,
         "split_source_identity_mode": "game_video",
@@ -770,12 +776,6 @@ def _manifest_mismatches(
     def note(field: str, found, wanted) -> None:
         mismatches[field] = f"{field}: manifest={found!r} config={wanted!r}"
 
-    if existing["split_algorithm_version"] != SPLIT_ALGORITHM_VERSION:
-        note(
-            "split_algorithm_version",
-            existing["split_algorithm_version"],
-            SPLIT_ALGORITHM_VERSION,
-        )
     if int(existing["split_seed"]) != int(seed):
         note("split_seed", existing["split_seed"], seed)
     found_ratio = existing.get("split_val_ratio")
@@ -784,7 +784,7 @@ def _manifest_mismatches(
     found_delta = existing.get("split_target_delta")
     if found_delta is None or int(found_delta) != int(target_delta):
         note("split_target_delta", found_delta, target_delta)
-    found_mode = existing.get("split_source_identity_mode", "game_video")
+    found_mode = existing["split_source_identity_mode"]
     if found_mode != identity_mode:
         note("split_source_identity_mode", found_mode, identity_mode)
     if existing["dataset_fingerprint"] != dataset_fingerprint:
@@ -849,7 +849,7 @@ def split_summary(
             splits["val"][key] / total if total else 0.0, 6
         )
     return {
-        "split_algorithm_version": SPLIT_ALGORITHM_VERSION,
+        "contract_version": CONTRACT_VERSION,
         "dataset_fingerprint": dataset_fingerprint,
         "split_seed": seed,
         "target_val_ratio": val_ratio,
@@ -900,7 +900,7 @@ def source_identity_precheck(
         "single_label_videos": len(groups) - len(mixed),
         "mixed_label_videos": len(mixed),
         "mixed_label_examples": [
-            {"source_video_uid": uid, "labels": list(groups[uid]["labels"])}
+            {"stable_source_id": uid, "labels": list(groups[uid]["labels"])}
             for uid in mixed
         ],
         "pair_counts_label0": pair_counts_label0,
@@ -919,7 +919,7 @@ def format_source_identity_precheck(report: dict) -> str:
     if report["mixed_label_examples"]:
         lines.append("Mixed-label examples:")
         for example in report["mixed_label_examples"]:
-            lines.append(f"  {example['source_video_uid']}  labels={example['labels']}")
+            lines.append(f"  {example['stable_source_id']}  labels={example['labels']}")
     label0 = report["pair_counts_label0"]
     label1 = report["pair_counts_label1"]
     lines.append(

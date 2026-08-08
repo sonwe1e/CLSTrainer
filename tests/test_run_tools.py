@@ -41,9 +41,9 @@ def _base_overrides(root: str) -> list[str]:
         "train.max_steps=2",
         "train.steps_per_epoch=2",
         "train.log_every_steps=1",
-        "evaluation.quick_test_every_steps=0",
-        "evaluation.full_test_every_steps=0",
-        "evaluation.full_test_at_end=false",
+        "evaluation.val_quick_every_steps=0",
+        "evaluation.val_full_every_steps=0",
+        "evaluation.val_full_at_end=false",
         "checkpoint.save_last_every_steps=1",
     ]
 
@@ -87,9 +87,9 @@ class RunToolsTests(unittest.TestCase):
                 "train.max_steps=2",
                 "train.steps_per_epoch=2",
                 "train.log_every_steps=1",
-                "evaluation.quick_test_every_steps=0",
-                "evaluation.full_test_every_steps=0",
-                "evaluation.full_test_at_end=false",
+                "evaluation.val_quick_every_steps=0",
+                "evaluation.val_full_every_steps=0",
+                "evaluation.val_full_at_end=false",
                 "checkpoint.save_last_every_steps=0",
             )
             self.assertIn("Training finished", fork_output)
@@ -156,10 +156,17 @@ class RunToolsTests(unittest.TestCase):
         def write_run(run_dir: Path, *, eligible: bool, worst_recall: float) -> None:
             (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
             (run_dir / "status.json").write_text(
-                json.dumps({"state": "SUCCEEDED", "step": 20}), encoding="utf-8"
+                json.dumps({"contract_version": 5, "state": "SUCCEEDED", "step": 20}),
+                encoding="utf-8",
             )
             (run_dir / "manifest.json").write_text(
-                json.dumps({"run_id": run_dir.name, "run_name": run_dir.name}),
+                json.dumps(
+                    {
+                        "contract_version": 5,
+                        "run_id": run_dir.name,
+                        "run_name": run_dir.name,
+                    }
+                ),
                 encoding="utf-8",
             )
             (run_dir / "resolved_config.json").write_text(
@@ -169,7 +176,8 @@ class RunToolsTests(unittest.TestCase):
             (run_dir / "training_summary.json").write_text(
                 json.dumps(
                     {
-                        "best_observed_dev_test_metrics": {
+                        "contract_version": 5,
+                        "best_validation_metrics": {
                             "selection_score": 0.91,
                             "selection_mode": "constrained",
                             "selection_eligible": eligible,
@@ -188,6 +196,12 @@ class RunToolsTests(unittest.TestCase):
                                 "eligible": eligible,
                                 "monitor": "selection_score",
                                 "tag": "topk_00000020",
+                                "sort_value": [
+                                    1.0 if eligible else 0.0,
+                                    0.91,
+                                    worst_recall,
+                                    2.5,
+                                ],
                             }
                         ],
                     }

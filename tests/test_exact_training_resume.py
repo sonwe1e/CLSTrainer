@@ -27,7 +27,7 @@ class ExactTrainingResumeTests(unittest.TestCase):
         from unittest import mock
 
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         def _configure(restore_best: bool, root: Path, name: str) -> dict:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -68,16 +68,16 @@ class ExactTrainingResumeTests(unittest.TestCase):
         fake_metrics = [
             {
                 "selection_score": 0.9,
-                "global_f1_tau099": 0.9,
+                "global_f1_at_decision_threshold": 0.9,
                 "cross_entropy": 1.0,
-                "worst_game_f1_tau099": 0.3,
+                "worst_game_f1_at_decision_threshold": 0.3,
                 "checkpoint_step": 20,
             },
             {
                 "selection_score": 0.8,
-                "global_f1_tau099": 0.8,
+                "global_f1_at_decision_threshold": 0.8,
                 "cross_entropy": 1.2,
-                "worst_game_f1_tau099": 0.2,
+                "worst_game_f1_at_decision_threshold": 0.2,
                 "checkpoint_step": 40,
             },
         ]
@@ -100,15 +100,16 @@ class ExactTrainingResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with_best = _run(True, "with_best")
             without_best = _run(False, "without_best")
-            root = Path(directory)
+            best_root = Path(with_best["output_dir"])
+            plain_root = Path(without_best["output_dir"])
 
             best_cp = torch.load(
-                root / "with_best" / "checkpoints" / "checkpoint_last.pth",
+                best_root / "checkpoints" / "checkpoint_last.pth",
                 map_location="cpu",
                 weights_only=True,
             )
             plain_cp = torch.load(
-                root / "without_best" / "checkpoints" / "checkpoint_last.pth",
+                plain_root / "checkpoints" / "checkpoint_last.pth",
                 map_location="cpu",
                 weights_only=True,
             )
@@ -131,12 +132,12 @@ class ExactTrainingResumeTests(unittest.TestCase):
             # The best checkpoint genuinely differs from the terminal model, so
             # the test would catch the old contamination.
             best_model = torch.load(
-                root / "with_best" / "checkpoints" / "model_best_selection.pth",
+                best_root / "checkpoints" / "model_best_selection.pth",
                 map_location="cpu",
                 weights_only=True,
             )
             terminal_model = torch.load(
-                root / "with_best" / "checkpoints" / "model_last.pth",
+                best_root / "checkpoints" / "model_last.pth",
                 map_location="cpu",
                 weights_only=True,
             )
@@ -149,15 +150,11 @@ class ExactTrainingResumeTests(unittest.TestCase):
             )
             # The summary still reports the restore for deployment/display.
             summary = json.loads(
-                (root / "with_best" / "training_summary.json").read_text(
-                    encoding="utf-8"
-                )
+                (best_root / "training_summary.json").read_text(encoding="utf-8")
             )
             self.assertTrue(summary["restored_best"])
             summary_plain = json.loads(
-                (root / "without_best" / "training_summary.json").read_text(
-                    encoding="utf-8"
-                )
+                (plain_root / "training_summary.json").read_text(encoding="utf-8")
             )
             self.assertFalse(summary_plain["restored_best"])
 
@@ -190,15 +187,15 @@ class ExactTrainingResumeTests(unittest.TestCase):
         writes.
         """
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
-            def _config(resume: bool) -> dict:
+            def _config(resume_dir: Path | None = None) -> dict:
                 config = load_config("configs/recipes/example_debug.yaml")
                 config["device"]["accelerator"] = "cpu"
-                config["experiment"]["output_dir"] = str(root / "run")
+                config["experiment"]["output_dir"] = str(resume_dir or root / "run")
                 config["train"].update(
                     {
                         "max_steps": 4,
@@ -216,28 +213,29 @@ class ExactTrainingResumeTests(unittest.TestCase):
                     }
                 )
                 config["checkpoint"]["save_last_every_steps"] = 1
-                if resume:
+                if resume_dir is not None:
                     config["train"]["resume_path"] = str(
-                        root / "run" / "checkpoints" / "checkpoint_last.pth"
+                        resume_dir / "checkpoints" / "checkpoint_last.pth"
                     )
                 return config
 
-            first = _config(resume=False)
+            first = _config()
             first["train"]["stop_after_steps"] = 2
-            run_training(first)
+            first_result = run_training(first)
+            run_dir = Path(first_result["output_dir"])
             # A second process holds the resume lock; a resume must refuse.
-            lock_path = root / "run" / ".resume.lock"
+            lock_path = run_dir / ".resume.lock"
             lock_path.write_text("held by another process", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "already being resumed"):
-                run_training(_config(resume=True))
+                run_training(_config(run_dir))
             # After the lock is released, the same resume succeeds.
             lock_path.unlink()
-            result = run_training(_config(resume=True))
+            result = run_training(_config(run_dir))
             self.assertGreaterEqual(int(result["global_step"]), 4)
 
     def test_interrupted_resume_matches_uninterrupted_training(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -254,36 +252,38 @@ class ExactTrainingResumeTests(unittest.TestCase):
             )
             base["evaluation"].update(
                 {
-                    "quick_test_every_steps": 0,
-                    "full_test_every_steps": 0,
-                    "full_test_at_end": False,
+                    "val_quick_every_steps": 0,
+                    "val_full_every_steps": 0,
+                    "val_full_at_end": False,
                 }
             )
             base["checkpoint"]["save_last_every_steps"] = 2
 
             uninterrupted = copy.deepcopy(base)
             uninterrupted["experiment"]["output_dir"] = str(root / "full")
-            run_training(uninterrupted)
+            full_result = run_training(uninterrupted)
 
             partial = copy.deepcopy(base)
             partial["train"]["stop_after_steps"] = 2
             partial["experiment"]["output_dir"] = str(root / "resumed")
-            run_training(partial)
+            partial_result = run_training(partial)
+            resumed_run_dir = Path(partial_result["output_dir"])
 
             resumed = copy.deepcopy(base)
-            resumed["experiment"]["output_dir"] = str(root / "resumed")
+            resumed["experiment"]["output_dir"] = str(resumed_run_dir)
             resumed["train"]["resume_path"] = str(
-                root / "resumed" / "checkpoints" / "checkpoint_last.pth"
+                resumed_run_dir / "checkpoints" / "checkpoint_last.pth"
             )
             run_training(resumed)
 
+            full_run_dir = Path(full_result["output_dir"])
             full_state = torch.load(
-                root / "full" / "checkpoints" / "model_last.pth",
+                full_run_dir / "checkpoints" / "model_last.pth",
                 map_location="cpu",
                 weights_only=True,
             )
             resumed_state = torch.load(
-                root / "resumed" / "checkpoints" / "model_last.pth",
+                resumed_run_dir / "checkpoints" / "model_last.pth",
                 map_location="cpu",
                 weights_only=True,
             )
@@ -292,7 +292,7 @@ class ExactTrainingResumeTests(unittest.TestCase):
                 self.assertTrue(torch.equal(full_state[key], resumed_state[key]), key)
             metric_steps = [
                 json.loads(line)["step"]
-                for line in (root / "resumed" / "train_metrics.jsonl")
+                for line in (resumed_run_dir / "train_metrics.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]

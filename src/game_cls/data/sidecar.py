@@ -4,9 +4,8 @@ The sidecar is an *additive* source of truth keyed by ``stable_source_id``
 (``game::video_id``). It is joined to the video index **after** the split is
 derived, so it can never leak frames across splits or drift the split
 manifest, and it is not part of any dedup identity. When ``data.metadata_sidecar``
-is unset, no sidecar is loaded and every video keeps the legacy
-``negative_subtype=None`` / ``sample_weight=1.0`` defaults — training is
-byte-identical to before.
+is unset, no sidecar is loaded and every video uses
+``negative_subtype=None`` / ``sample_weight=1.0`` defaults.
 
 That "missing file reads as no metadata" default is a trap for
 ``data.hard_negative.enabled``, so ``check_hard_negative_readiness`` refuses
@@ -21,7 +20,6 @@ Schema (parquet columns):
     capture_domain     string|null
     difficulty         string|null
     sample_weight      float (default 1.0)
-    metadata_version   int
     metadata_fingerprint  string (SHA-256 over the rows)
 """
 
@@ -29,13 +27,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .video_index import VideoEntry
+from game_cls.contract import require_parquet_contract, stamp_parquet_table
 
-METADATA_SCHEMA_VERSION = 2
+from .video_index import VideoEntry
 
 
 def _pyarrow():
@@ -60,7 +59,7 @@ def _fingerprint(rows: list[dict[str, Any]]) -> str:
 
 
 def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
-    """Load and authenticate a v2 sidecar into ``{stable_source_id: meta}``.
+    """Load and authenticate a contract-5 sidecar by stable source id.
 
     Missing or empty sidecar files return an empty mapping (never an error),
     so a config that points at a not-yet-created sidecar behaves like the
@@ -69,6 +68,7 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
     path = Path(path)
     if not path.is_file():
         return {}
+    require_parquet_contract(path)
     _, pq = _pyarrow()
     # Use open() so Python's own reference counting closes the OS handle
     # when the with-block exits.  Passing a Path to pq.read_schema /
@@ -79,7 +79,6 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
         schema_names = set(pq.read_schema(fh).names)
     required = {
         "stable_source_id",
-        "metadata_version",
         "metadata_fingerprint",
     }
     missing = required - schema_names
@@ -91,20 +90,9 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
         rows = pq.read_table(fh).to_pylist()
     if not rows:
         return {}
-    versions = {int(row.get("metadata_version", 0)) for row in rows}
-    if versions != {METADATA_SCHEMA_VERSION}:
-        raise ValueError(
-            f"Metadata sidecar {path} has schema version(s) {sorted(versions)}; "
-            f"expected only v{METADATA_SCHEMA_VERSION}. Run "
-            "'cls-trainer dataset metadata-migrate'."
-        )
-    recorded_fingerprints = {
-        str(row.get("metadata_fingerprint") or "") for row in rows
-    }
+    recorded_fingerprints = {str(row.get("metadata_fingerprint") or "") for row in rows}
     if len(recorded_fingerprints) != 1 or "" in recorded_fingerprints:
-        raise ValueError(
-            f"Metadata sidecar {path} has missing or mixed fingerprints."
-        )
+        raise ValueError(f"Metadata sidecar {path} has missing or mixed fingerprints.")
     normalized_for_hash = [
         {key: value for key, value in row.items() if key != "metadata_fingerprint"}
         for row in rows
@@ -124,13 +112,19 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
                 f"Metadata sidecar {path} contains duplicate primary key "
                 f"stable_source_id={stable_id!r}."
             )
+        sample_weight = float(row.get("sample_weight", 1.0))
+        if not math.isfinite(sample_weight) or sample_weight <= 0:
+            raise ValueError(
+                f"Metadata sidecar {path} has invalid sample_weight="
+                f"{sample_weight!r} for {stable_id}; weights must be finite "
+                "and positive."
+            )
         result[stable_id] = {
             "negative_subtype": row.get("negative_subtype"),
             "scene_type": row.get("scene_type"),
             "capture_domain": row.get("capture_domain"),
             "difficulty": row.get("difficulty"),
-            "sample_weight": float(row.get("sample_weight", 1.0)),
-            "metadata_version": int(row.get("metadata_version", 1)),
+            "sample_weight": sample_weight,
         }
     return result
 
@@ -262,8 +256,6 @@ def apply_sidecar(
 def write_metadata_sidecar(
     rows: list[dict[str, Any]],
     path: str | Path,
-    *,
-    version: int = METADATA_SCHEMA_VERSION,
 ) -> str:
     """Write the sidecar atomically and return its fingerprint."""
     pa, pq = _pyarrow()
@@ -278,6 +270,12 @@ def write_metadata_sidecar(
                 f"Duplicate metadata primary key stable_source_id={stable_id!r}."
             )
         seen.add(stable_id)
+        sample_weight = float(row.get("sample_weight", 1.0))
+        if not math.isfinite(sample_weight) or sample_weight <= 0:
+            raise ValueError(
+                f"sample_weight for {stable_id} must be finite and positive, "
+                f"got {sample_weight!r}."
+            )
         normalized.append(
             {
                 "stable_source_id": stable_id,
@@ -285,8 +283,7 @@ def write_metadata_sidecar(
                 "scene_type": row.get("scene_type"),
                 "capture_domain": row.get("capture_domain"),
                 "difficulty": row.get("difficulty"),
-                "sample_weight": float(row.get("sample_weight", 1.0)),
-                "metadata_version": int(version),
+                "sample_weight": sample_weight,
                 "metadata_fingerprint": "",
             }
         )
@@ -302,7 +299,7 @@ def write_metadata_sidecar(
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(f".tmp{path.suffix}")
     pq.write_table(
-        pa.Table.from_pylist(normalized),
+        stamp_parquet_table(pa.Table.from_pylist(normalized)),
         temp,
         compression="zstd",
     )

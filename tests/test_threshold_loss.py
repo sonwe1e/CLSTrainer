@@ -212,7 +212,7 @@ class TorchThresholdLossTests(unittest.TestCase):
         self.assertEqual(components["negative_tail_loss"].item(), 0.0)
         self.assertEqual(components["rank_loss"].item(), 0.0)
         self.assertEqual(set(comp_default), set(components))
-        # Hand-replicated legacy baseline: ce + weight * margin loss.
+        # Hand-replicated reference baseline: ce + weight * margin loss.
         weight = threshold_weight_at_step(50, 100, 0.2, 0.10, 0.20)
         expected = F.cross_entropy(
             logits.float(), targets

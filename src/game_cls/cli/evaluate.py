@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -26,6 +8,7 @@ import sys
 from pathlib import Path
 
 from game_cls.cli.common import _resolve_run_dir
+from game_cls.contract import stamp_payload
 
 
 def _resolve_checkpoint_state(run_dir: Path, name: str):
@@ -73,26 +56,32 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     train/validation/test protocol.
     """
     from game_cls.config import load_config
-    from game_cls.config_schema import ConfigSchemaError, split_role_warnings
+    from game_cls.config_schema import ConfigSchemaError
     from game_cls.engine.checkpoint import unwrap_model
-    from game_cls.engine.distributed import (
-        cleanup_distributed,
-        distributed_barrier,
-        initialize_runtime,
-        is_distributed,
-    )
     from game_cls.engine.evaluator import evaluate
-    from game_cls.engine.trainer import (
-        _annotate_selection,
+    from game_cls.engine.training.config_validation import has_independent_test
+    from game_cls.engine.training.loaders import build_eval_loader_for_split
+    from game_cls.engine.training.run_io import (
         _append_evaluation_history,
         _evaluation_history_record,
-        build_eval_loader_for_split,
-        has_independent_test,
     )
+    from game_cls.engine.training.selection import _annotate_selection
     from game_cls.model.builder import build_model
     from game_cls.reports.error_writer import (
         prepare_evaluation_directory,
         write_evaluation_report,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        barrier as distributed_barrier,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        cleanup as cleanup_distributed,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        init_runtime as initialize_runtime,
+    )
+    from game_cls.runtime.distributed_runtime import (
+        is_initialized as is_distributed,
     )
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
@@ -118,15 +107,11 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 2
     if args.split == "test" and not has_independent_test(config):
         print(
-            "This run has no independent test set: data.test_index was "
-            "aliased as validation during training. Use --split "
-            "validation, or retrain with a dedicated data.val_index.",
+            "This run has no independent test set. Configure dedicated "
+            "validation and test indexes.",
             file=sys.stderr,
         )
         return 3
-    for warning in split_role_warnings(config):
-        print(f"[WARNING] {warning}", file=sys.stderr)
-
     try:
         rank, world_size, local_rank, device = initialize_runtime(config)
     except RuntimeError as exc:
@@ -234,7 +219,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 else "validation_evaluation.json"
             )
             summary_path.write_text(
-                json.dumps(metrics, ensure_ascii=False, indent=2),
+                json.dumps(stamp_payload(metrics), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             print("")
@@ -250,10 +235,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 "brier_score",
                 "ece_20_bins",
             ):
-                value = metrics.get(
-                    key,
-                    metrics.get(key.replace("_at_decision_threshold", "_tau099")),
-                )
+                value = metrics.get(key)
                 if isinstance(value, (int, float)):
                     print(f"{key:<22}: {value:.4f}")
             print(f"report          : {report_dir}")

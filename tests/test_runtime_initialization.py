@@ -33,7 +33,9 @@ def test_npu_extension_and_device_are_ready_before_hccl_init():
         ),
         patch.dict(os.environ, environment, clear=False),
     ):
-        from game_cls.engine.distributed import initialize_runtime
+        from game_cls.runtime.distributed_runtime import (
+            init_runtime as initialize_runtime,
+        )
 
         rank, world_size, local_rank, device = initialize_runtime(
             {

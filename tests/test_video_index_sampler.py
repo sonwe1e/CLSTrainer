@@ -35,6 +35,36 @@ def videos():
 
 
 class VideoIndexSamplerTests(unittest.TestCase):
+    def test_sample_weight_changes_video_selection_probability(self) -> None:
+        import numpy as np
+
+        from game_cls.data.video_index import VideoEntry
+
+        entries = [
+            VideoEntry(
+                game="A",
+                label=0,
+                video_id=str(index),
+                frame_ids=np.asarray([0, 1], dtype=np.int32),
+                valid_start_positions={1: np.asarray([0], dtype=np.int32)},
+                sample_weight=weight,
+            )
+            for index, weight in enumerate((1.0, 9.0))
+        ]
+        sampler = VideoBalancedPairBatchSampler(
+            entries,
+            local_batch_size=64,
+            steps_per_epoch=100,
+            seed=21,
+            delta_probability={1: 1.0},
+            class_probability={0: 1.0},
+            dedup_level="none",
+        )
+        selected = Counter(
+            request.video_index for batch in sampler for request in batch
+        )
+        self.assertGreater(selected[1] / sum(selected.values()), 0.85)
+
     def test_delta_first_sampling_tracks_requested_distribution(self) -> None:
         entries = videos()
         sampler = VideoBalancedPairBatchSampler(

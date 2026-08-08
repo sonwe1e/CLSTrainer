@@ -58,7 +58,7 @@ def _sampler(videos, *, seed=7, **cfg):
 
 
 class HardNegativeSamplerTests(unittest.TestCase):
-    def test_disabled_matches_legacy_behavior(self) -> None:
+    def test_disabled_matches_baseline_behavior(self) -> None:
         videos = _videos()
         baseline = _sampler(videos, seed=11)
         disabled = _sampler(videos, seed=11)

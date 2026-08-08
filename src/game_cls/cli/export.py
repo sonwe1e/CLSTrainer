@@ -28,12 +28,25 @@ from uuid import uuid4
 
 from game_cls.cli.common import _resolve_run_dir
 from game_cls.cli.evaluate import _resolve_checkpoint_state
+from game_cls.contract import CONTRACT_VERSION
 
 # The pair dimension is an architectural constant, not a config key: the
 # model contract is ``forward(image0, image1) -> [B,2]`` and the whole
 # pipeline hands it uint8 ``[B,2,C,H,W]`` frame pairs (see
 # ImageSpec.validate_pair_batch_shape). Only C/H/W are configurable.
 FRAME_PAIR_SIZE = 2
+
+
+def _cleanup_empty_export_parents(artifact_dir: Path, export_root: Path) -> None:
+    """Remove empty hash/run directories left by a failed transaction."""
+    parent = artifact_dir.parent
+    while parent != export_root and export_root in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
 
 # Deployment-relevant headline metrics copied into the manifest. The full
 # metric set stays in the run's training_summary.json (referenced by path in
@@ -99,15 +112,18 @@ def _metric_summary(run_dir: Path, config: dict) -> dict[str, Any]:
     # fall back to the config default "global_f1_at_decision_threshold".
     _best_sel = payload.get("best_selection")
     selection_metric = (
-        (_best_sel.get("selection_metric") if isinstance(_best_sel, dict) else None)
-        or (config.get("evaluation") or {}).get(
-            "selection_metric", "global_f1_at_decision_threshold"
-        )
+        _best_sel.get("selection_metric") if isinstance(_best_sel, dict) else None
+    ) or (config.get("evaluation") or {}).get(
+        "selection_metric", "global_f1_at_decision_threshold"
     )
     summary["selection_metric"] = selection_metric
-    best = payload.get("best_validation_metrics") or payload.get(
-        "best_observed_dev_test_metrics"
+    summary["selection_mode"] = (
+        _best_sel.get("selection_mode") if isinstance(_best_sel, dict) else None
+    ) or (config.get("evaluation") or {}).get("selection_mode", "metric")
+    summary["selection_eligible"] = (
+        _best_sel.get("selection_eligible") if isinstance(_best_sel, dict) else None
     )
+    best = payload.get("best_validation_metrics")
     summary["available"] = True
     summary["global_step"] = payload.get("global_step")
     summary["selection_metric_value"] = (
@@ -152,6 +168,7 @@ def _export_manifest(
     """Build the manifest shared by the weights and ONNX paths."""
     _ms = _metric_summary(run_dir, config)
     return {
+        "contract_version": CONTRACT_VERSION,
         "run_id": run_dir.name,
         "checkpoint": alias,
         "checkpoint_path": checkpoint_path,
@@ -212,11 +229,14 @@ def cmd_export(args: argparse.Namespace) -> int:
     from game_cls.reports.benchmark import file_sha256
 
     # Audit PR-F: immutable per-artifact layout
-    #   exports/<run_id>/<checkpoint_sha256>/model.{pt,onnx} + export_manifest.json
+    #   exports/<run_id>/<checkpoint_sha256>/<format>/artifact + manifest
     # A second export of the same artifact writes the same directory and is
     # refused; a different checkpoint writes a different sha directory, so runs
     # can never overwrite each other's deployment artifacts.
-    final_artifact_dir = out_dir / run_dir.name / file_sha256(checkpoint_path)
+    export_format = args.format or export_cfg.get("format") or "weights"
+    final_artifact_dir = (
+        out_dir / run_dir.name / file_sha256(checkpoint_path) / export_format
+    )
     if final_artifact_dir.exists():
         print(
             f"Export refused: artifact already exists at {final_artifact_dir}; the "
@@ -229,7 +249,6 @@ def cmd_export(args: argparse.Namespace) -> int:
         f".{final_artifact_dir.name}.staging-{uuid4().hex}"
     )
     artifact_dir.mkdir(parents=False, exist_ok=False)
-    export_format = args.format or export_cfg.get("format") or "weights"
     include_threshold = bool(export_cfg.get("include_threshold", True))
     manifest_extra = (
         {"decision.threshold": config["decision"]["threshold"]}
@@ -270,6 +289,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             artifact_dir.replace(final_artifact_dir)
         except Exception:
             shutil.rmtree(artifact_dir, ignore_errors=True)
+            _cleanup_empty_export_parents(final_artifact_dir, out_dir)
             raise
         print(
             json.dumps(
@@ -299,14 +319,17 @@ def cmd_export(args: argparse.Namespace) -> int:
         )
         if result != 0:
             shutil.rmtree(artifact_dir, ignore_errors=True)
+            _cleanup_empty_export_parents(final_artifact_dir, out_dir)
             return result
         try:
             artifact_dir.replace(final_artifact_dir)
         except Exception:
             shutil.rmtree(artifact_dir, ignore_errors=True)
+            _cleanup_empty_export_parents(final_artifact_dir, out_dir)
             raise
         return 0
     shutil.rmtree(artifact_dir, ignore_errors=True)
+    _cleanup_empty_export_parents(final_artifact_dir, out_dir)
     print(f"Unsupported export format: {export_format}", file=sys.stderr)
     return 2
 
@@ -357,6 +380,8 @@ def _export_onnx(
     # Verification harness: ORT vs PyTorch on the same N sample tensors.
     session = ort.InferenceSession(str(onnx_path))
     verify_samples = int(export_cfg.get("verify_samples", 8))
+    if verify_samples < 1:
+        raise ValueError("export.verify_samples must be >= 1")
     max_diff = 0.0
     # Verify on a batch > 1 so the dynamic batch axis is exercised too.
     verify_shape = (2, *input_shape[1:])

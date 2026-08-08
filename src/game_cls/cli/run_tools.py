@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -86,7 +68,7 @@ def cmd_run_show(args: argparse.Namespace) -> int:
                 f"error        : {status['error_type']}: {status.get('error_message')}"
             )
     if summary:
-        best = summary.get("best_observed_dev_test_metrics") or {}
+        best = summary.get("best_validation_metrics") or {}
         if isinstance(best.get("selection_score"), (int, float)):
             print(f"best score   : {best['selection_score']:.4f}")
         if best.get("selection_eligible") is not None:
@@ -139,7 +121,7 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
     summary_b = _read_run_json(dir_b, "training_summary.json") or {}
 
     def headline(label: str, run_dir: Path, status: dict, summary: dict) -> None:
-        best = summary.get("best_observed_dev_test_metrics") or {}
+        best = summary.get("best_validation_metrics") or {}
         score = best.get("selection_score")
         score_text = f"{score:.4f}" if isinstance(score, (int, float)) else "n/a"
         eligible = best.get("selection_eligible")
@@ -178,10 +160,7 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
     def _row(name: str, metrics: dict, fields: tuple[str, ...]) -> str:
         values = []
         for metric in fields:
-            value = metrics.get(
-                metric,
-                metrics.get(metric.replace("_at_decision_threshold", "_tau099")),
-            )
+            value = metrics.get(metric)
             values.append(
                 f"{metric}={value:.4f}"
                 if isinstance(value, (int, float))
@@ -190,7 +169,7 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
         return f"  {name:<4s} " + " ".join(values)
 
     def metric_row(name: str, summary: dict) -> str:
-        metrics = summary.get("best_observed_dev_test_metrics") or {}
+        metrics = summary.get("best_validation_metrics") or {}
         return _row(
             name,
             metrics,
@@ -205,7 +184,7 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
     # still differ on eligibility, worst-game recall or the negative tail, so
     # compare has to print the gate inputs and both tie-breakers.
     def selection_row(name: str, summary: dict) -> str:
-        metrics = summary.get("best_observed_dev_test_metrics") or {}
+        metrics = summary.get("best_validation_metrics") or {}
         return _row(
             name,
             metrics,
@@ -219,7 +198,7 @@ def cmd_run_compare(args: argparse.Namespace) -> int:
         )
 
     print("")
-    print("Best observed dev-test metrics:")
+    print("Best validation metrics:")
     print(metric_row("A", summary_a))
     print(metric_row("B", summary_b))
     print("")
@@ -254,8 +233,8 @@ def cmd_run_export_tensorboard(args: argparse.Namespace) -> int:
         "interval_threshold_loss",
         "interval_threshold_weight",
         "interval_accuracy",
-        "interval_positive_recall_tau099",
-        "interval_negative_specificity_tau099",
+        "interval_positive_recall_at_decision_threshold",
+        "interval_negative_specificity_at_decision_threshold",
         "interval_samples_per_second",
         "interval_step_time",
         "data_wait_ratio",

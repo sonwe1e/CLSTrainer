@@ -1,7 +1,7 @@
 """Packed-shard identity and integrity contract (audit P0-5 / P0-6).
 
 P0-5: ``pack_frame_index`` rebuilt ``VideoEntry`` from the packed frame index,
-which carries no per-frame content hash, so ``canonical_source_video_uid``
+which carries no per-frame content hash, so ``canonical_stable_source_id``
 silently fell back to the ``game::label::video_id`` form. The packed backend
 and the PNG backend then disagreed on identity and every sidecar / mining /
 subtype join keyed on the uid drifted.
@@ -15,6 +15,7 @@ truncated or corrupt shard reached the DataLoader as garbage pixels.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -34,6 +35,8 @@ HEIGHT = 208
 
 def _write_frames(root: Path) -> Path:
     """A 4-frame PNG pool over two videos plus its frame index."""
+    from game_cls.contract import stamp_parquet_table
+
     rows = []
     for index in range(4):
         array = np.full((HEIGHT, WIDTH, 3), index * 30, dtype=np.uint8)
@@ -46,16 +49,26 @@ def _write_frames(root: Path) -> Path:
                 "label": index % 2,
                 "video_id": f"{index % 2:02d}",
                 "frame_id": index,
+                "content_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         )
     frame_index = root / "frames.parquet"
-    pq.write_table(pa.Table.from_pylist(rows), frame_index)
+    pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), frame_index)
     return frame_index
 
 
 def _source_video_index(root: Path) -> Path:
     """A source video index carrying content-anchored canonical uids."""
-    from game_cls.data.video_index import VideoEntry, write_video_entries_parquet
+    from game_cls.data.video_index import (
+        VideoEntry,
+        video_content_id,
+        write_video_entries_parquet,
+    )
+
+    frame_index = root / "frames.parquet"
+    if not frame_index.is_file():
+        _write_frames(root)
+    frame_rows = pq.read_table(frame_index).to_pylist()
 
     entries = []
     for label in (0, 1):
@@ -71,7 +84,21 @@ def _source_video_index(root: Path) -> Path:
                     delta: np.asarray([0], dtype=np.int32) for delta in (1, 2, 3)
                 },
                 stable_source_id=f"game_a::{label}::{video_id}",
-                content_version_id=f"content{label}",
+                content_version_id=video_content_id(
+                    len(frame_ids),
+                    [
+                        f"{label}:{int(row['frame_id'])}:{row['content_sha256']}"
+                        for row in sorted(
+                            (
+                                item
+                                for item in frame_rows
+                                if int(item["label"]) == label
+                            ),
+                            key=lambda item: int(item["frame_id"]),
+                        )
+                    ],
+                )
+                or "",
                 negative_subtype="bridge" if label == 0 else None,
                 sample_weight=2.5 if label == 0 else 1.0,
             )
@@ -83,6 +110,7 @@ def _source_video_index(root: Path) -> Path:
 
 def _pack(root: Path, *, source_video_index: Path | None = None) -> Path:
     from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.indexing import write_bundle_manifest
     from game_cls.data.packed_backend import pack_frame_index
 
     frame_index = _write_frames(root)
@@ -91,8 +119,15 @@ def _pack(root: Path, *, source_video_index: Path | None = None) -> Path:
     split_manifest = root / "split_manifest.parquet"
     audit.write_text("{}", encoding="utf-8")
     split_manifest.write_bytes(b"split")
-    (root / "bundle_manifest.json").write_text(
-        json.dumps({"bundle_id": "bundle-v1"}), encoding="utf-8"
+    write_bundle_manifest(
+        root,
+        "bundle-a",
+        artifact_names=(
+            "frames.parquet",
+            "source_videos.parquet",
+            "audit.json",
+            "split_manifest.parquet",
+        ),
     )
     return pack_frame_index(
         frame_index,
@@ -100,7 +135,7 @@ def _pack(root: Path, *, source_video_index: Path | None = None) -> Path:
         image_spec=ImageSpec(width=WIDTH, height=HEIGHT, channels=3),
         images_per_shard=2,
         source_video_index=source_video_index,
-        source_bundle_id="bundle-v1",
+        source_bundle_id="bundle-a",
         audit_path=audit,
         split_manifest_path=split_manifest,
     )
@@ -127,7 +162,10 @@ class PackedIdentityTests(unittest.TestCase):
                 "game_a::0::00",
             )
             # Samples and reports use the versioned identity.
-            self.assertEqual(by_video["00"].source_version_id, "game_a::0::00#content0")
+            source_entry = read_video_entries_parquet(source)[0]
+            self.assertEqual(
+                by_video["00"].source_version_id, source_entry.source_version_id
+            )
 
     def test_packed_and_source_uids_agree(self) -> None:
         from game_cls.data.video_index import read_video_entries_parquet
@@ -138,8 +176,7 @@ class PackedIdentityTests(unittest.TestCase):
             _pack(root, source_video_index=source)
 
             source_uids = {
-                entry.source_version_id
-                for entry in read_video_entries_parquet(source)
+                entry.source_version_id for entry in read_video_entries_parquet(source)
             }
             packed_uids = {
                 entry.source_version_id
@@ -183,7 +220,7 @@ class PackedIdentityTests(unittest.TestCase):
                     root / "packed",
                     image_spec=ImageSpec(width=WIDTH, height=HEIGHT, channels=3),
                     source_video_index=root / "missing.parquet",
-                    source_bundle_id="bundle-v1",
+                    source_bundle_id="bundle-a",
                 )
 
     def test_frame_id_mismatch_is_refused_without_partial_output(self) -> None:
@@ -199,14 +236,25 @@ class PackedIdentityTests(unittest.TestCase):
             frame_index = _write_frames(root)
             source = _source_video_index(root)
             entries = read_video_entries_parquet(source)
-            object.__setattr__(entries[0], "frame_ids", np.asarray([99], dtype=np.int32))
+            object.__setattr__(
+                entries[0], "frame_ids", np.asarray([99], dtype=np.int32)
+            )
             write_video_entries_parquet(entries, source)
             audit = root / "audit.json"
             split_manifest = root / "split_manifest.parquet"
             audit.write_text("{}", encoding="utf-8")
             split_manifest.write_bytes(b"split")
-            (root / "bundle_manifest.json").write_text(
-                json.dumps({"bundle_id": "bundle-v1"}), encoding="utf-8"
+            from game_cls.data.indexing import write_bundle_manifest
+
+            write_bundle_manifest(
+                root,
+                "bundle-a",
+                artifact_names=(
+                    "frames.parquet",
+                    "source_videos.parquet",
+                    "audit.json",
+                    "split_manifest.parquet",
+                ),
             )
             output = root / "packed"
             with self.assertRaisesRegex(ValueError, "Frame ids disagree"):
@@ -215,7 +263,7 @@ class PackedIdentityTests(unittest.TestCase):
                     output,
                     image_spec=ImageSpec(width=WIDTH, height=HEIGHT, channels=3),
                     source_video_index=source,
-                    source_bundle_id="bundle-v1",
+                    source_bundle_id="bundle-a",
                     audit_path=audit,
                     split_manifest_path=split_manifest,
                 )
@@ -240,12 +288,10 @@ class PackedProvenanceTests(unittest.TestCase):
                 split_manifest_path=root / "split_manifest.parquet",
             )
             manifest = json.loads(
-                (root / "packed" / "packed_manifest.json").read_text(
-                    encoding="utf-8"
-                )
+                (root / "packed" / "packed_manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["format_version"], 4)
-            self.assertEqual(manifest["source_bundle_id"], "bundle-v1")
+            self.assertEqual(manifest["contract_version"], 5)
+            self.assertEqual(manifest["source_bundle_id"], "bundle-a")
             self.assertTrue(manifest["source_video_index_sha256"])
 
     def test_changed_bundle_generation_is_refused(self) -> None:
@@ -254,8 +300,12 @@ class PackedProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _pack(root)
+            payload = json.loads(
+                (root / "bundle_manifest.json").read_text(encoding="utf-8")
+            )
+            payload["bundle_id"] = "bundle-b"
             (root / "bundle_manifest.json").write_text(
-                json.dumps({"bundle_id": "bundle-v2"}), encoding="utf-8"
+                json.dumps(payload), encoding="utf-8"
             )
             with self.assertRaisesRegex(RuntimeError, "stale"):
                 verify_packed_provenance(
@@ -290,8 +340,12 @@ class PackedProvenanceTests(unittest.TestCase):
             root = Path(directory)
             _pack(root)
             # Regenerate the index with different content: stale shards.
+            from game_cls.contract import stamp_parquet_table
+
             pq.write_table(
-                pa.Table.from_pylist([{"path": "x", "frame_id": 99}]),
+                stamp_parquet_table(
+                    pa.Table.from_pylist([{"path": "x", "frame_id": 99}])
+                ),
                 root / "frames.parquet",
             )
             with self.assertRaisesRegex(RuntimeError, "stale"):

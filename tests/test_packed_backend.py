@@ -17,9 +17,23 @@ except ImportError:
 @unittest.skipIf(torch is None, "packed backend dependencies are not installed")
 class PackedBackendTests(unittest.TestCase):
     def _contract(self, root: Path, rows: list[dict]) -> dict:
-        import json
+        import hashlib
 
-        from game_cls.data.video_index import VideoEntry, write_video_entries_parquet
+        from game_cls.contract import stamp_parquet_table
+        from game_cls.data.indexing import write_bundle_manifest
+        from game_cls.data.video_index import (
+            VideoEntry,
+            video_content_id,
+            write_video_entries_parquet,
+        )
+
+        for row in rows:
+            row["content_sha256"] = hashlib.sha256(
+                Path(row["path"]).read_bytes()
+            ).hexdigest()
+        pq.write_table(
+            stamp_parquet_table(pa.Table.from_pylist(rows)), root / "frames.parquet"
+        )
 
         grouped = {}
         for row in rows:
@@ -37,13 +51,33 @@ class PackedBackendTests(unittest.TestCase):
                     frame_ids=frame_ids,
                     valid_start_positions={
                         delta: np.asarray(
-                            [i for i, value in enumerate(frame_ids) if int(value) + delta in id_set],
+                            [
+                                i
+                                for i, value in enumerate(frame_ids)
+                                if int(value) + delta in id_set
+                            ],
                             dtype=np.int32,
                         )
                         for delta in (1, 2, 3)
                     },
                     stable_source_id=f"{game}::{label}::{video_id}",
-                    content_version_id=f"content-{game}-{label}-{video_id}",
+                    content_version_id=video_content_id(
+                        len(frame_ids),
+                        [
+                            f"{label}:{int(row['frame_id'])}:{row['content_sha256']}"
+                            for row in sorted(
+                                (
+                                    item
+                                    for item in rows
+                                    if item["game"] == game
+                                    and int(item["label"]) == label
+                                    and item["video_id"] == video_id
+                                ),
+                                key=lambda item: int(item["frame_id"]),
+                            )
+                        ],
+                    )
+                    or "",
                 )
             )
         video_index = root / "source_videos.parquet"
@@ -52,17 +86,25 @@ class PackedBackendTests(unittest.TestCase):
         split_manifest = root / "split_manifest.parquet"
         audit.write_text("{}", encoding="utf-8")
         split_manifest.write_bytes(b"split")
-        (root / "bundle_manifest.json").write_text(
-            json.dumps({"bundle_id": "bundle-v1"}), encoding="utf-8"
+        write_bundle_manifest(
+            root,
+            "bundle-a",
+            artifact_names=(
+                "frames.parquet",
+                "source_videos.parquet",
+                "audit.json",
+                "split_manifest.parquet",
+            ),
         )
         return {
             "source_video_index": video_index,
-            "source_bundle_id": "bundle-v1",
+            "source_bundle_id": "bundle-a",
             "audit_path": audit,
             "split_manifest_path": split_manifest,
         }
 
     def test_packed_decode_matches_png_pixels(self) -> None:
+        from game_cls.contract import stamp_parquet_table
         from game_cls.data.image_spec import ImageSpec
         from game_cls.data.lazy_pair_dataset import (
             LazyTrainingPairDataset,
@@ -95,7 +137,7 @@ class PackedBackendTests(unittest.TestCase):
                 )
                 expected.append(torch.from_numpy(array.transpose(2, 0, 1).copy()))
             frame_index = root / "frames.parquet"
-            pq.write_table(pa.Table.from_pylist(rows), frame_index)
+            pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), frame_index)
             image_spec = ImageSpec(width=448, height=208, channels=3)
             packed_index = pack_frame_index(
                 frame_index,
@@ -168,6 +210,7 @@ class PackedBackendTests(unittest.TestCase):
     def test_stale_source_index_is_refused(self) -> None:
         # Audit P0-6 / acceptance #4: modify the frame index after packing and
         # the old shards must be refused before a DataLoader is built.
+        from game_cls.contract import stamp_parquet_table
         from game_cls.data.image_spec import ImageSpec
         from game_cls.data.packed_backend import (
             pack_frame_index,
@@ -191,7 +234,7 @@ class PackedBackendTests(unittest.TestCase):
                     }
                 )
             frame_index = root / "frames.parquet"
-            pq.write_table(pa.Table.from_pylist(rows), frame_index)
+            pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), frame_index)
             image_spec = ImageSpec(width=448, height=208, channels=3)
             contract = self._contract(root, rows)
             pack_frame_index(
@@ -211,8 +254,13 @@ class PackedBackendTests(unittest.TestCase):
             )
             # A regenerated (different) source index -> stale -> refused.
             pq.write_table(
-                pa.Table.from_pylist(
-                    [dict(row, frame_id=index + 100) for index, row in enumerate(rows)]
+                stamp_parquet_table(
+                    pa.Table.from_pylist(
+                        [
+                            dict(row, frame_id=index + 100)
+                            for index, row in enumerate(rows)
+                        ]
+                    )
                 ),
                 frame_index,
             )
@@ -237,12 +285,13 @@ class PackedBackendTests(unittest.TestCase):
             root = Path(directory)
             manifest = root / "packed_manifest.json"
             manifest.write_text(_json.dumps({"shards": []}), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "not format v4"):
+            with self.assertRaisesRegex(RuntimeError, "contract_version=5"):
                 verify_packed_provenance(manifest, root / "frames.parquet")
 
     def test_packed_dataset_spawn_worker_owns_its_memmap(self) -> None:
         from torch.utils.data import DataLoader
 
+        from game_cls.contract import stamp_parquet_table
         from game_cls.data.collate import pair_collate
         from game_cls.data.image_spec import ImageSpec
         from game_cls.data.lazy_pair_dataset import build_eval_dataset
@@ -269,7 +318,7 @@ class PackedBackendTests(unittest.TestCase):
                     }
                 )
             frame_index = root / "frames.parquet"
-            pq.write_table(pa.Table.from_pylist(rows), frame_index)
+            pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), frame_index)
             image_spec = ImageSpec(width=8, height=8, channels=3)
             packed_index = pack_frame_index(
                 frame_index,

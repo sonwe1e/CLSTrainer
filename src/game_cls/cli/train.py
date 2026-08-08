@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -63,19 +45,10 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
     if checkpoint_path and checkpoint_status == "MISSING":
         warnings.append(f"model.checkpoint_path does not exist: {checkpoint_path}")
     from game_cls.config_schema import schedule_budget_warnings
+
     warnings.extend(schedule_budget_warnings(config))
-    quick_every = int(
-        evaluation_cfg.get(
-            "val_quick_every_steps",
-            evaluation_cfg.get("quick_test_every_steps", 0),
-        )
-    )
-    full_every = int(
-        evaluation_cfg.get(
-            "val_full_every_steps",
-            evaluation_cfg.get("full_test_every_steps", 0),
-        )
-    )
+    quick_every = int(evaluation_cfg.get("val_quick_every_steps", 0))
+    full_every = int(evaluation_cfg.get("val_full_every_steps", 0))
     probe_every = int(evaluation_cfg.get("train_probe_every_steps", 0))
 
     print("=== DRY RUN — nothing will be initialized or written ===")
@@ -106,15 +79,11 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
     print(
         f"full validation    : "
         f"{'every ' + str(full_every) + ' steps' if full_every else 'disabled'}"
-        f" (at end: {bool(evaluation_cfg.get('val_full_at_end', evaluation_cfg.get('full_test_at_end', True)))})"
+        f" (at end: {bool(evaluation_cfg.get('val_full_at_end', True))})"
     )
     data_cfg = config["data"]
     if data_cfg.get("synthetic"):
         print("split roles        : synthetic (train/val/test)")
-    elif (data_cfg.get("split_migration") or {}).get("test_used_as_validation"):
-        print(
-            "split roles        : test aliased as validation — NO independent test set"
-        )
     else:
         print("split roles        : train / validation / test")
     early_cfg = config.get("early_stopping") or {}
@@ -127,19 +96,11 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
         )
     else:
         print("early stopping     : disabled")
-    run_mode = str(config["experiment"].get("run_mode", "fixed"))
-    print(f"run mode           : {run_mode}")
     print(f"runs root          : {config['experiment']['output_dir']}")
-    if run_mode == "unique":
-        print(
-            "planned output     : <runs root>/<date>/<time>_<name>_<id>/ "
-            "(allocated at start)"
-        )
-    else:
-        print(
-            f"planned output     : {config['experiment']['output_dir']} "
-            "(written in place)"
-        )
+    print(
+        "planned output     : <runs root>/<date>/<time>_<name>_<id>/ "
+        "(allocated at start)"
+    )
     print(f"config warnings    : {len(warnings)}")
     for warning in warnings:
         print(f"  [WARNING] {warning}")
@@ -149,7 +110,7 @@ def _dry_run_report(config: dict[str, Any], config_file: str) -> int:
 def cmd_train(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
-    from game_cls.engine.trainer import run_training
+    from game_cls.engine.training.loop import run_training
     from game_cls.runs import collect_environment, sha256_file
 
     try:
@@ -234,7 +195,6 @@ def cmd_train(args: argparse.Namespace) -> int:
             if candidate.is_dir():
                 inferred_runs_root = str(candidate)
         config["experiment"]["output_dir"] = str(resume_dir)
-        config["experiment"]["run_mode"] = "fixed"
         config["train"]["resume_path"] = _resolve_resume_checkpoint(resume_dir, config)
     elif args.fork:
         fork_manifest = _read_run_json(fork_dir, "manifest.json") or {}
@@ -246,9 +206,6 @@ def cmd_train(args: argparse.Namespace) -> int:
         )
         if not explicit_resume:
             config["train"]["resume_path"] = None
-        config["experiment"]["run_mode"] = "unique"
-    else:
-        config["experiment"]["run_mode"] = args.run_mode
 
     if args.dry_run:
         return _dry_run_report(config, config_source)

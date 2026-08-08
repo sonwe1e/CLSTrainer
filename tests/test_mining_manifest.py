@@ -23,7 +23,7 @@ class MiningManifestTests(unittest.TestCase):
         rows = [
             {
                 "stable_source_id": "A::01",
-                "source_version_id": "A::01#v1",
+                "source_version_id": "A::01#content-a",
                 "game": "A",
                 "video_id": "01",
                 "frame0_id": 1,
@@ -41,18 +41,15 @@ class MiningManifestTests(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0]["stable_source_id"], "A::01")
             self.assertEqual(loaded[0]["p_positive"], 0.9)
-            self.assertEqual(loaded[0]["mining_version"], 2)
 
-    def test_version_mismatch_rejected(self) -> None:
+    def test_missing_contract_rejected(self) -> None:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.parquet"
             pq.write_table(
-                pa.Table.from_pylist(
-                    [{"stable_source_id": "A::01", "mining_version": 99}]
-                ),
+                pa.Table.from_pylist([{"stable_source_id": "A::01"}]),
                 path,
             )
             with self.assertRaises(ValueError):
@@ -131,7 +128,7 @@ class ScanNegativePoolTests(unittest.TestCase):
         for meta in metas:
             stable_id = f"{meta['game']}::{meta['video_id']}"
             meta["stable_source_id"] = stable_id
-            meta["source_version_id"] = f"{stable_id}#v1"
+            meta["source_version_id"] = f"{stable_id}#content-a"
         return [{"images": images, "labels": labels, "meta": metas}]
 
     def test_topk_per_video_and_dedup(self) -> None:

@@ -34,7 +34,6 @@ class BalancedDistributedPairBatchSampler:
         game_alpha: float = 0.25,
         class_probability: dict[int, float] | None = None,
         delta_probability: dict[int, float] | None = None,
-        deduplicate_within_global_batch: bool | None = None,
         dedup_level: str = "pair",
         on_exhaustion: str = "warn_and_relax",
     ) -> None:
@@ -51,11 +50,6 @@ class BalancedDistributedPairBatchSampler:
             raise ValueError(
                 f"on_exhaustion must be error|warn_and_relax; got {on_exhaustion!r}"
             )
-        if deduplicate_within_global_batch is not None:
-            if dedup_level == "pair" and not deduplicate_within_global_batch:
-                dedup_level = "none"
-            if dedup_level == "none" and deduplicate_within_global_batch:
-                dedup_level = "pair"
         self.pairs = list(pairs)
         self.groups = group_pair_indices(pairs)
         if not self.groups:

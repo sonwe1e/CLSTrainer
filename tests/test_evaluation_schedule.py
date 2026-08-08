@@ -15,7 +15,7 @@ except ImportError:
 @unittest.skipIf(torch is None, "torch is not installed")
 class EvaluationScheduleTests(unittest.TestCase):
     def test_npu_interval_metrics_synchronize_device(self) -> None:
-        from game_cls.engine.trainer import (
+        from game_cls.engine.training.loop_util import (
             _synchronize_device_for_metrics,
         )
 
@@ -26,7 +26,7 @@ class EvaluationScheduleTests(unittest.TestCase):
 
     def test_full_step_skips_quick_and_final_result_can_be_best(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -50,9 +50,10 @@ class EvaluationScheduleTests(unittest.TestCase):
             )
             config["checkpoint"]["save_last_every_steps"] = 2
             result = run_training(config)
-            self.assertEqual(result["evaluation_state"]["quick_test_count"], 1)
-            self.assertEqual(result["evaluation_state"]["full_test_count"], 1)
-            reports = Path(directory) / "run" / "reports"
+            self.assertEqual(result["evaluation_state"]["val_quick_count"], 1)
+            self.assertEqual(result["evaluation_state"]["val_full_count"], 1)
+            run_dir = Path(result["output_dir"])
+            reports = run_dir / "reports"
             quick_report = reports / "val_quick_step_00000001"
             full_report = reports / "val_full_step_00000002"
             self.assertTrue((quick_report / "metrics.json").is_file())
@@ -61,27 +62,14 @@ class EvaluationScheduleTests(unittest.TestCase):
             self.assertFalse((quick_report / "metrics_by_video.csv").exists())
             self.assertTrue((full_report / "errors.html").is_file())
             self.assertTrue((full_report / "metrics_by_video.csv").is_file())
-            checkpoints = Path(directory) / "run" / "checkpoints"
-            self.assertTrue(
-                (
-                    checkpoints / "checkpoint_best_observed_dev_test_selection.pth"
-                ).is_file()
-            )
-            self.assertTrue(
-                (checkpoints / "model_best_observed_dev_test_selection.pth").is_file()
-            )
-            self.assertTrue(
-                (
-                    checkpoints / "model_best_observed_dev_test_selection.metadata.json"
-                ).is_file()
-            )
+            checkpoints = run_dir / "checkpoints"
             # Multi-objective checkpoints required by the train/val/test
             # protocol (step2 plan P2).
             self.assertTrue((checkpoints / "model_best_selection.pth").is_file())
             self.assertTrue((checkpoints / "model_best_val_loss.pth").is_file())
             self.assertTrue((checkpoints / "model_best_worst_game.pth").is_file())
             # Unified evaluation history (step2 plan P1).
-            history_path = Path(directory) / "run" / "metrics" / "evaluation.jsonl"
+            history_path = run_dir / "metrics" / "evaluation.jsonl"
             self.assertTrue(history_path.is_file())
             history = [
                 json.loads(line)
@@ -94,7 +82,7 @@ class EvaluationScheduleTests(unittest.TestCase):
             self.assertIn("positive_margin_pass_rate", history[0])
             metric_rows = [
                 json.loads(line)
-                for line in (Path(directory) / "run" / "train_metrics.jsonl")
+                for line in (run_dir / "train_metrics.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]

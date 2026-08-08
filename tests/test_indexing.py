@@ -20,9 +20,8 @@ from game_cls.data.indexing import (
     write_split_bundle,
 )
 from game_cls.data.splitter import (
-    SPLIT_ALGORITHM_VERSION,
     load_split_manifest,
-    source_video_uid,
+    stable_source_id,
 )
 
 
@@ -206,7 +205,7 @@ class IndexBundleTests(unittest.TestCase):
                 scan_policy(),
                 DuplicatePolicy(),
             )
-            self.assertEqual(audit["audit_format_version"], 3)
+            self.assertEqual(audit["contract_version"], 5)
             self.assertEqual(
                 audit["expected"],
                 {"width": 448, "height": 208, "channels": 3},
@@ -267,11 +266,11 @@ class IndexBundleTests(unittest.TestCase):
                 val_root=root / "val",
             )
             self.assertEqual(
-                audit["leakage"]["source_video_uid_overlap"]["train__test"],
+                audit["leakage"]["stable_source_id_overlap"]["train__test"],
                 ["game_A::01"],
             )
             self.assertEqual(
-                audit["leakage"]["source_video_uid_overlap"]["train__val"],
+                audit["leakage"]["stable_source_id_overlap"]["train__val"],
                 ["game_A::01"],
             )
             with self.assertRaisesRegex(RuntimeError, "source videos span"):
@@ -308,7 +307,7 @@ class IndexBundleTests(unittest.TestCase):
                 val_root=root / "val",
                 namespaces_by_split=namespaces_by_split,
             )
-            overlap = audit["leakage"]["source_video_uid_overlap"]
+            overlap = audit["leakage"]["stable_source_id_overlap"]
             # train/val share the train_pool namespace: the real overlap of
             # the same source video stays detectable.
             self.assertEqual(overlap["train__val"], ["train_pool::game_A::01"])
@@ -358,7 +357,7 @@ class SplitBundleTests(unittest.TestCase):
             "mode": "from_train",
             "val_ratio": 0.2,
             "seed": 20260728,
-            "group_key": "source_video_uid",
+            "group_key": "stable_source_id",
             "stratify_by": ["game", "label"],
             "balance_by": "legal_pair_count",
             "target_delta": 2,
@@ -368,7 +367,7 @@ class SplitBundleTests(unittest.TestCase):
         }
 
     def _write_roots(self, root: Path) -> None:
-        # video ids must be unique per game (source_video_uid is
+        # video ids must be unique per game (stable_source_id is
         # label-independent), so a per-game counter spans both labels.
         train_all = root / "train_all"
         for game in ("game_a", "game_b", "game_c"):
@@ -418,7 +417,7 @@ class SplitBundleTests(unittest.TestCase):
 
             # Every source video lives in exactly one split: no uid may span
             # any pair of train/val/test.
-            for pair_key, uids in audit["leakage"]["source_video_uid_overlap"].items():
+            for pair_key, uids in audit["leakage"]["stable_source_id_overlap"].items():
                 self.assertEqual(
                     uids,
                     [],
@@ -429,9 +428,6 @@ class SplitBundleTests(unittest.TestCase):
             # every frame carries its split's label.
             manifest = load_split_manifest(output / "split_manifest.parquet")
             self.assertEqual(manifest["split_seed"], 20260728)
-            self.assertEqual(
-                manifest["split_algorithm_version"], SPLIT_ALGORITHM_VERSION
-            )
             for split in ("train", "val"):
                 frames = read_frame_parquet(output / f"{split}_frames.parquet")
                 self.assertTrue(frames, f"{split} has no frames")
@@ -439,7 +435,7 @@ class SplitBundleTests(unittest.TestCase):
                     self.assertEqual(frame.split, split)
                     self.assertEqual(
                         manifest["assignment"][
-                            source_video_uid(frame.game, frame.video_id)
+                            stable_source_id(frame.game, frame.video_id)
                         ],
                         split,
                     )
@@ -450,10 +446,7 @@ class SplitBundleTests(unittest.TestCase):
             self.assertGreater(audit["splits"]["val"]["valid_pairs"]["2"], 0)
             self.assertGreater(audit["splits"]["test"]["valid_pairs"]["2"], 0)
             self.assertIn("split", audit)
-            self.assertEqual(
-                audit["split"]["split_algorithm_version"],
-                SPLIT_ALGORITHM_VERSION,
-            )
+            self.assertEqual(audit["split"]["contract_version"], 5)
             self.assertFalse(audit["split"]["manifest_reused"])
             # The summary names the ratio after the delta that drove the
             # balancing, so a delta!=2 split is not misreported.
@@ -631,7 +624,7 @@ class SplitBundleTransactionTests(SplitBundleTests):
             self.assertIn("incomplete", message)
             self.assertIn("val_video_entries.parquet", message)
 
-    def test_an_unsealed_directory_is_refused_but_can_be_tolerated(self) -> None:
+    def test_unpublished_directory_is_refused(self) -> None:
         from game_cls.data.indexing import (
             BUNDLE_MANIFEST_FILENAME,
             SplitBundleError,
@@ -645,19 +638,18 @@ class SplitBundleTransactionTests(SplitBundleTests):
             with self.assertRaises(SplitBundleError) as caught:
                 verify_split_bundle(output)
             message = str(caught.exception)
-            # Both ways forward must be named, since only the operator knows
-            # whether a legacy directory is really one generation.
             self.assertIn("dataset prepare", message)
-            self.assertIn("dataset seal", message)
-            # Callers that only want "was anything built" opt out explicitly.
-            self.assertIsNone(verify_split_bundle(output, require_manifest=False))
 
     def test_no_staging_directory_survives_a_successful_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = self._prepare(root)
             self.assertEqual(
-                [path.name for path in output.iterdir() if path.name.startswith(".staging")],
+                [
+                    path.name
+                    for path in output.iterdir()
+                    if path.name.startswith(".staging")
+                ],
                 [],
             )
 

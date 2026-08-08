@@ -5,10 +5,16 @@ device:
   amp_dtype: float16
 
 dataloader:
-  num_workers: 0
-  persistent_workers: false
-  prefetch_factor: 2
-  pin_memory: false
+  train:
+    num_workers: 0
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false
+  eval:
+    num_workers: 0
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false
 
 evaluation:
   amp: false

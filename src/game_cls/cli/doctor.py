@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -140,16 +122,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "data.split.mode is not 'from_train'; no split bundle to verify",
             )
 
-        migration = data_cfg.get("split_migration") or {}
-        if migration.get("test_used_as_validation"):
-            check(
-                None,
-                "split roles",
-                "test_index is aliased as validation; no independent "
-                "test set (add data.val_index)",
-            )
-        else:
-            check(True, "split roles", "train / validation / test")
+        check(True, "split roles", "train / validation / test")
         identity_mode = (data_cfg.get("source_video_identity") or {}).get(
             "mode", "game_video"
         )

@@ -8,7 +8,7 @@ from game_cls.engine.training.selection import (
 # ``monitor`` values that mean "follow the selection contract" instead of
 # naming a single numeric metric. Everything else (cross_entropy,
 # objective_loss, worst_game_f1_*) keeps the plain float comparison.
-_SELECTION_MONITORS = frozenset({"selection_score", "selection"})
+_SELECTION_MONITORS = frozenset({"selection_score"})
 
 # _selection_verdict outcomes.
 _ABSTAIN = "abstain"  # monitored value unavailable: patience must not move
@@ -46,9 +46,7 @@ def _early_stopping_monitor_label(early_config: dict) -> str:
 def _persisted_key(best_value: object) -> list[float] | None:
     """Normalize a persisted ``best_value`` into a comparable key list.
 
-    Runs started before early stopping used the rank key stored a bare
-    float, so a resumed run must keep comparing against it instead of
-    silently restarting patience.
+    Return a comparable list for the persisted rank key.
     """
     if isinstance(best_value, (int, float)) and not isinstance(best_value, bool):
         return [float(best_value)]

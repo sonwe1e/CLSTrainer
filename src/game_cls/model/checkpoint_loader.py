@@ -16,16 +16,10 @@ def validate_production_load(
     model,
     report: LoadReport,
     *,
-    trainable_name_contains: str = "cls",
-    frozen_parameter_names: set[str] | None = None,
+    frozen_parameter_names: set[str],
 ) -> float:
     state_keys = set(model.state_dict())
-    if frozen_parameter_names is not None:
-        # Rule-based training: the frozen set is whatever the rules leave
-        # frozen at the current step, not the legacy name token.
-        frozen_keys = {key for key in state_keys if key in frozen_parameter_names}
-    else:
-        frozen_keys = {key for key in state_keys if trainable_name_contains not in key}
+    frozen_keys = {key for key in state_keys if key in frozen_parameter_names}
     loaded_frozen = {key for key in report.loaded if key in frozen_keys}
     missing_frozen = {key for key in report.missing if key in frozen_keys}
     mismatch_frozen = {key for key in report.shape_mismatch if key in frozen_keys}
@@ -72,16 +66,16 @@ def load_model_checkpoint(model, path: str | Path) -> LoadReport:
         ) from exc
     incoming = extract_state_dict(checkpoint)
     current = model.state_dict()
-    compatible = {}
+    loadable = {}
     shape_mismatch = []
     for key, value in incoming.items():
         if key in current and tuple(value.shape) != tuple(current[key].shape):
             shape_mismatch.append(key)
         elif key in current:
-            compatible[key] = value
-    result = model.load_state_dict(compatible, strict=False)
+            loadable[key] = value
+    result = model.load_state_dict(loadable, strict=False)
     return LoadReport(
-        loaded=tuple(sorted(compatible)),
+        loaded=tuple(sorted(loadable)),
         missing=tuple(sorted(result.missing_keys)),
         unexpected=tuple(sorted(key for key in incoming if key not in current)),
         shape_mismatch=tuple(sorted(shape_mismatch)),

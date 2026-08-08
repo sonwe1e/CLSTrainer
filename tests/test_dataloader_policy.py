@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from game_cls.engine.trainer import (
-    _loader_common,
-    _validate_dataloader_config,
-)
+from game_cls.engine.training.config_validation import _validate_dataloader_config
+from game_cls.engine.training.loaders import _loader_common
 
 
 class DataLoaderPolicyTests(unittest.TestCase):
@@ -42,14 +40,12 @@ class DataLoaderPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "must use spawn"):
             _validate_dataloader_config(config)
 
-    def test_role_configuration_overrides_legacy_root_values(self) -> None:
+    def test_role_configuration_uses_scoped_worker_values(self) -> None:
         config = {
             "device": {"accelerator": "cpu"},
             "dataloader": {
-                "num_workers": 4,
-                "persistent_workers": True,
                 "timeout_seconds": 90,
-                "train": {"num_workers": 2},
+                "train": {"num_workers": 2, "persistent_workers": True},
                 "eval": {
                     "num_workers": 1,
                     "persistent_workers": False,
@@ -68,7 +64,7 @@ class DataLoaderPolicyTests(unittest.TestCase):
         self.assertFalse(evaluation["persistent_workers"])
         self.assertEqual(evaluation["timeout"], 30)
 
-    def test_legacy_root_worker_configuration_is_supported(self) -> None:
+    def test_root_worker_configuration_is_ignored(self) -> None:
         config = {
             "device": {"accelerator": "cpu"},
             "dataloader": {
@@ -80,9 +76,9 @@ class DataLoaderPolicyTests(unittest.TestCase):
 
         options = _loader_common(config, "train")
 
-        self.assertEqual(options["num_workers"], 3)
-        self.assertFalse(options["persistent_workers"])
-        self.assertEqual(options["prefetch_factor"], 4)
+        self.assertEqual(options["num_workers"], 0)
+        self.assertNotIn("persistent_workers", options)
+        self.assertNotIn("prefetch_factor", options)
 
     def test_zero_workers_omit_multiprocessing_only_options(self) -> None:
         config = {

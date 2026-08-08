@@ -1,12 +1,4 @@
-"""Benchmark gate checks and report writing (step5 P3/P6, step6 gate contract).
-
-The gate contract is ``{metric_name: {op, value}}`` with bare scalars kept for
-backward compatibility. The direction of a bare scalar comes from an explicit
-table, never from substrings of the metric name: the old ``"fpr" in name``
-heuristic upper-bounded specificity (higher is better) and lower-bounded ECE
-and the negative-score percentiles (lower is better), so those three cases get
-fixtures whose value verdict *flips* between ``<=`` and ``>=``.
-"""
+"""Benchmark gate and release-report contract tests."""
 
 from __future__ import annotations
 
@@ -24,30 +16,71 @@ from game_cls.reports.benchmark import (
 )
 
 
+def _gate(op: str, value: float) -> dict[str, object]:
+    return {"op": op, "value": value}
+
+
+def _configure_challenge_bundle(base: Path, config: dict) -> None:
+    import numpy as np
+    from PIL import Image
+
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+    from game_cls.data.indexing import write_external_bundle
+
+    source = base / "challenge_source" / "game_a" / "0"
+    source.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.zeros((208, 448, 3), dtype=np.uint8)).save(
+        source / "0100001.png"
+    )
+    output = base / "challenge"
+    write_external_bundle(
+        base / "challenge_source",
+        output,
+        ImageSpec.from_config(config["data"]),
+        ScanPolicy.from_config(config["data"]),
+        DuplicatePolicy.from_config(config["data"]),
+        pool="challenge",
+        identity_mode=(config["data"].get("source_video_identity") or {}).get(
+            "mode", "game_video"
+        ),
+    )
+    config["data"]["challenge_index"] = str(output / "frames.parquet")
+    config["data"]["challenge_video_index"] = str(output / "video_entries.parquet")
+
+
 class BenchmarkGateTests(unittest.TestCase):
     def test_fpr_gate_uses_upper_bound(self) -> None:
         metrics = {"global_fpr_at_decision_threshold": 0.008}
-        checks = check_gates(metrics, {"global_fpr_at_decision_threshold": 0.01})
+        checks = check_gates(
+            metrics, {"global_fpr_at_decision_threshold": _gate("<=", 0.01)}
+        )
         self.assertTrue(checks[0][1])
         metrics["global_fpr_at_decision_threshold"] = 0.02
-        checks = check_gates(metrics, {"global_fpr_at_decision_threshold": 0.01})
+        checks = check_gates(
+            metrics, {"global_fpr_at_decision_threshold": _gate("<=", 0.01)}
+        )
         self.assertFalse(checks[0][1])
 
     def test_recall_gate_uses_lower_bound(self) -> None:
         metrics = {"global_positive_recall_at_decision_threshold": 0.85}
         checks = check_gates(
-            metrics, {"global_positive_recall_at_decision_threshold": 0.8}
+            metrics,
+            {"global_positive_recall_at_decision_threshold": _gate(">=", 0.8)},
         )
         self.assertTrue(checks[0][1])
         metrics["global_positive_recall_at_decision_threshold"] = 0.7
         checks = check_gates(
-            metrics, {"global_positive_recall_at_decision_threshold": 0.8}
+            metrics,
+            {"global_positive_recall_at_decision_threshold": _gate(">=", 0.8)},
         )
         self.assertFalse(checks[0][1])
 
     def test_absent_metric_fails_gate(self) -> None:
         # A producible metric this run did not emit (no subtype grouping).
-        checks = check_gates({}, {"worst_subtype_fpr_at_decision_threshold": 0.01})
+        checks = check_gates(
+            {}, {"worst_subtype_fpr_at_decision_threshold": _gate("<=", 0.01)}
+        )
         self.assertFalse(checks[0][1])
         self.assertIn("metric absent", checks[0][2])
 
@@ -55,46 +88,42 @@ class BenchmarkGateTests(unittest.TestCase):
         # An unpassable-by-construction gate must not read as a normal
         # "metric absent" failure that a human would blame on the model.
         with self.assertRaisesRegex(ValueError, "not a metric the evaluator"):
-            check_gates({}, {"missing_metric": 0.01})
+            check_gates({}, {"missing_metric": _gate("<=", 0.01)})
 
-    def test_specificity_scalar_is_a_lower_bound(self) -> None:
-        """The old substring guess had no 'specificity' rule but its own
-        comment claimed one; a higher-is-better metric must never be upper
-        bounded. value=0.97 bound=0.95 passes as ">=" and fails as "<=".
-        """
+    def test_specificity_explicit_lower_bound(self) -> None:
         checks = check_gates(
             {"global_specificity_at_decision_threshold": 0.97},
-            {"global_specificity_at_decision_threshold": 0.95},
+            {"global_specificity_at_decision_threshold": _gate(">=", 0.95)},
         )
         self.assertTrue(checks[0][1], checks[0][2])
         self.assertIn(">=", checks[0][2])
         # And the direction really bites: below the floor it fails.
         checks = check_gates(
             {"global_specificity_at_decision_threshold": 0.90},
-            {"global_specificity_at_decision_threshold": 0.95},
+            {"global_specificity_at_decision_threshold": _gate(">=", 0.95)},
         )
         self.assertFalse(checks[0][1], checks[0][2])
 
-    def test_ece_scalar_is_an_upper_bound(self) -> None:
-        """Calibration error is lower-better; the substring guess had no
-        'ece' rule and would have read 0.02 >= 0.05 as a failure.
-        """
-        checks = check_gates({"ece_tail_95_100": 0.02}, {"ece_tail_95_100": 0.05})
+    def test_ece_explicit_upper_bound(self) -> None:
+        checks = check_gates(
+            {"ece_tail_95_100": 0.02}, {"ece_tail_95_100": _gate("<=", 0.05)}
+        )
         self.assertTrue(checks[0][1], checks[0][2])
         self.assertIn("<=", checks[0][2])
-        checks = check_gates({"ece_tail_95_100": 0.11}, {"ece_tail_95_100": 0.05})
+        checks = check_gates(
+            {"ece_tail_95_100": 0.11}, {"ece_tail_95_100": _gate("<=", 0.05)}
+        )
         self.assertFalse(checks[0][1], checks[0][2])
 
-    def test_negative_score_p999_scalar_is_an_upper_bound(self) -> None:
-        """A hard negative scoring 0.995 at a 0.99 bound must FAIL. The
-        substring guess would have read it as value >= bound -> pass.
-        """
+    def test_negative_score_p999_explicit_upper_bound(self) -> None:
         checks = check_gates(
-            {"negative_score_p999": 0.995}, {"negative_score_p999": 0.99}
+            {"negative_score_p999": 0.995},
+            {"negative_score_p999": _gate("<=", 0.99)},
         )
         self.assertFalse(checks[0][1], checks[0][2])
         checks = check_gates(
-            {"negative_score_p999": 0.80}, {"negative_score_p999": 0.99}
+            {"negative_score_p999": 0.80},
+            {"negative_score_p999": _gate("<=", 0.99)},
         )
         self.assertTrue(checks[0][1], checks[0][2])
 
@@ -155,29 +184,20 @@ class BenchmarkGateTests(unittest.TestCase):
                     {"global_fpr_at_decision_threshold": spec},
                 )
 
-    def test_non_directional_metric_requires_the_explicit_form(self) -> None:
-        # sample_count has no better-direction: 2000 could mean "at least" or
-        # "at most". Guessing either way would be a silent wrong answer.
-        with self.assertRaisesRegex(ValueError, "no documented better-direction"):
+    def test_every_metric_requires_the_explicit_form(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must use"):
             check_gates({"sample_count": 5000}, {"sample_count": 2000})
         checks = check_gates(
             {"sample_count": 5000}, {"sample_count": {"op": ">=", "value": 2000}}
         )
         self.assertTrue(checks[0][1])
 
-    def test_legacy_tau099_alias_satisfies_a_neutral_gate(self) -> None:
-        # An older run's metrics dict only has the _tau099 name.
-        checks = check_gates(
-            {"worst_game_f1_tau099": 0.82},
-            {"worst_game_f1_at_decision_threshold": 0.80},
-        )
-        self.assertTrue(checks[0][1], checks[0][2])
-        # ...and the reverse direction of the alias map works too.
-        checks = check_gates(
-            {"global_f1_at_decision_threshold": 0.60},
-            {"global_f1_tau099": 0.80},
-        )
-        self.assertFalse(checks[0][1], checks[0][2])
+    def test_unknown_metric_name_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not a metric the evaluator"):
+            check_gates(
+                {"worst_game_f1_at_decision_threshold": 0.82},
+                {"worst_game_f1_at_threshold": _gate(">=", 0.80)},
+            )
 
 
 class GateMetricValidationTests(unittest.TestCase):
@@ -186,7 +206,9 @@ class GateMetricValidationTests(unittest.TestCase):
         self.assertEqual(validate_gate_metrics({}), [])
 
     def test_typo_is_reported_with_a_suggestion(self) -> None:
-        problems = validate_gate_metrics({"global_fpr_at_decision_threshhold": 0.01})
+        problems = validate_gate_metrics(
+            {"global_fpr_at_decision_threshhold": _gate("<=", 0.01)}
+        )
         self.assertEqual(len(problems), 1)
         self.assertIn("global_fpr_at_decision_threshhold", problems[0])
         self.assertIn("Did you mean 'global_fpr_at_decision_threshold'", problems[0])
@@ -197,7 +219,10 @@ class GateMetricValidationTests(unittest.TestCase):
         gate naming them could never pass and must fail at config time.
         """
         problems = validate_gate_metrics(
-            {"max_global_fpr": 0.01, "min_positive_recall": 0.8}
+            {
+                "max_global_fpr": _gate("<=", 0.01),
+                "min_positive_recall": _gate(">=", 0.8),
+            }
         )
         self.assertEqual(len(problems), 2)
         self.assertTrue(all("could never pass" in problem for problem in problems))
@@ -211,7 +236,7 @@ class GateMetricValidationTests(unittest.TestCase):
         )
         self.assertEqual(len(problems), 2)
         self.assertTrue(any("not a comparison operator" in p for p in problems))
-        self.assertTrue(any("no documented better-direction" in p for p in problems))
+        self.assertTrue(any("must use" in p for p in problems))
 
     def test_non_mapping_gate_block_is_reported(self) -> None:
         self.assertEqual(len(validate_gate_metrics([1, 2])), 1)
@@ -355,7 +380,7 @@ class BenchmarkReportTests(unittest.TestCase):
         the metric is outside the fixed summary."""
         gate_metrics = {
             "ece_tail_95_100": {"op": "<=", "value": 0.05},
-            "specificity": 0.95,
+            "specificity": {"op": ">=", "value": 0.95},
         }
         metrics = {
             "sample_count": 100,
@@ -428,7 +453,7 @@ class ReleaseGateVerificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             code, _, err = self._validate(
                 Path(directory),
-                gate_metrics={"global_fpr_at_decision_threshold": 0.01},
+                gate_metrics={"global_fpr_at_decision_threshold": _gate("<=", 0.01)},
             )
             self.assertEqual(code, 2)
             self.assertIn("no benchmark report", err)
@@ -440,7 +465,7 @@ class ReleaseGateVerificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             code, _, err = self._validate(
                 Path(directory),
-                gate_metrics={"min_positive_recall": 0.8},
+                gate_metrics={"min_positive_recall": _gate(">=", 0.8)},
             )
             self.assertEqual(code, 2)
             self.assertIn("could never pass", err)
@@ -459,7 +484,7 @@ class ReleaseGateVerificationTests(unittest.TestCase):
     def test_passing_report_verifies_the_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
-            gate_metrics = {"global_fpr_at_decision_threshold": 0.01}
+            gate_metrics = {"global_fpr_at_decision_threshold": _gate("<=", 0.01)}
             self._report(
                 base,
                 metrics={
@@ -476,7 +501,7 @@ class ReleaseGateVerificationTests(unittest.TestCase):
     def test_failing_report_fails_the_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
-            gate_metrics = {"global_fpr_at_decision_threshold": 0.01}
+            gate_metrics = {"global_fpr_at_decision_threshold": _gate("<=", 0.01)}
             self._report(
                 base,
                 metrics={"sample_count": 100, "global_fpr_at_decision_threshold": 0.09},
@@ -497,12 +522,12 @@ class ReleaseGateVerificationTests(unittest.TestCase):
                     "sample_count": 100,
                     "global_fpr_at_decision_threshold": 0.004,
                 },
-                gate_metrics={"global_fpr_at_decision_threshold": 0.01},
+                gate_metrics={"global_fpr_at_decision_threshold": _gate("<=", 0.01)},
             )
             code, _, err = self._validate(
                 base,
                 gate_metrics={
-                    "global_fpr_at_decision_threshold": 0.01,
+                    "global_fpr_at_decision_threshold": _gate("<=", 0.01),
                     "ece_tail_95_100": {"op": "<=", "value": 0.05},
                 },
             )
@@ -510,10 +535,7 @@ class ReleaseGateVerificationTests(unittest.TestCase):
             self.assertIn("predates the current gates", err)
             self.assertIn("ece_tail_95_100", err)
 
-    def test_report_recorded_under_the_old_direction_is_re_judged(self) -> None:
-        """The report's own ``passed`` flags are not trusted: a specificity
-        gate that the old substring guess recorded as passing (0.90 <= 0.95)
-        must be re-checked as ">=" and fail."""
+    def test_report_pass_flags_are_re_judged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             report_dir = base / "benchmarks" / "run-1_best_selection"
@@ -521,11 +543,14 @@ class ReleaseGateVerificationTests(unittest.TestCase):
             (report_dir / "report.json").write_text(
                 json.dumps(
                     {
+                        "contract_version": 5,
                         "run_id": "run-1",
                         "checkpoint": "best_selection",
                         "scores": {"global_specificity_at_decision_threshold": 0.90},
                         "gate_metrics": {
-                            "global_specificity_at_decision_threshold": 0.95
+                            "global_specificity_at_decision_threshold": _gate(
+                                ">=", 0.95
+                            )
                         },
                         "gates": [
                             {
@@ -541,7 +566,9 @@ class ReleaseGateVerificationTests(unittest.TestCase):
             )
             code, _, err = self._validate(
                 base,
-                gate_metrics={"global_specificity_at_decision_threshold": 0.95},
+                gate_metrics={
+                    "global_specificity_at_decision_threshold": _gate(">=", 0.95)
+                },
             )
             self.assertEqual(code, 2)
             self.assertIn("fails gate global_specificity_at_decision_threshold", err)
@@ -573,7 +600,7 @@ class ReleaseCheckTests(unittest.TestCase):
         config["experiment"]["output_dir"] = str(base / "runs")
         config["benchmark"] = {
             "output_dir": str(base / "benchmarks"),
-            "gate_metrics": {"global_fpr_at_decision_threshold": 0.01},
+            "gate_metrics": {"global_fpr_at_decision_threshold": _gate("<=", 0.01)},
         }
         config.setdefault("evaluation", {})["minimum_worst_game_f1"] = 0.75
         # A release-gated config must carry a challenge set: 'benchmark
@@ -581,14 +608,7 @@ class ReleaseCheckTests(unittest.TestCase):
         # fingerprint is empty cannot exist in practice, and release check is
         # right to refuse it. Writing the bundle keeps the fixture on the path
         # the command is actually designed for (audit P0-4).
-        challenge = base / "challenge"
-        challenge.mkdir(parents=True, exist_ok=True)
-        frame_index = challenge / "challenge_frames.parquet"
-        video_index = challenge / "challenge_video_entries.parquet"
-        frame_index.write_bytes(b"challenge-frames")
-        video_index.write_bytes(b"challenge-videos")
-        config["data"]["challenge_index"] = str(frame_index)
-        config["data"]["challenge_video_index"] = str(video_index)
+        _configure_challenge_bundle(base, config)
         return config
 
     def _bound_report(
@@ -702,9 +722,7 @@ class ExportGateBindingTests(unittest.TestCase):
         config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(run_dir)
         config["export"]["output_dir"] = str(base / "exports")
-        challenge = base / "challenge.identity"
-        challenge.write_bytes(b"challenge")
-        config["data"]["challenge_index"] = str(challenge)
+        _configure_challenge_bundle(base, config)
         gates = {"global_fpr_at_decision_threshold": {"op": "<=", "value": 0.01}}
         config["benchmark"]["gate_metrics"] = gates
         config["benchmark"]["output_dir"] = str(base / "benchmarks")
@@ -791,15 +809,16 @@ class ExportGateBindingTests(unittest.TestCase):
         from game_cls.cli.export import cmd_export
 
         for mutation in ("threshold", "challenge", "gate"):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 base = Path(directory)
                 run_dir = self._run_with_gate(base, passed=True)
                 config_path = run_dir / "resolved_config.json"
                 config = json.loads(config_path.read_text(encoding="utf-8"))
                 if mutation == "threshold":
                     config["decision"]["threshold"] = 0.95
-                    config["loss"]["threshold"] = 0.95
-                    config["evaluation"]["threshold"] = 0.95
                     config_path.write_text(json.dumps(config), encoding="utf-8")
                 elif mutation == "challenge":
                     Path(config["data"]["challenge_index"]).write_bytes(b"changed")

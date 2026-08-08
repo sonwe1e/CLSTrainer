@@ -27,9 +27,9 @@ def _fast_training_overrides(output_dir: str) -> dict:
             "log_every_steps": 1,
         },
         "evaluation": {
-            "quick_test_every_steps": 0,
-            "full_test_every_steps": 0,
-            "full_test_at_end": False,
+            "val_quick_every_steps": 0,
+            "val_full_every_steps": 0,
+            "val_full_at_end": False,
         },
         "checkpoint": {"save_last_every_steps": 0},
     }
@@ -48,7 +48,7 @@ def _apply(container: dict, patch: dict) -> dict:
 class UniqueRunDirectoryTests(unittest.TestCase):
     def test_two_starts_create_two_disjoint_runs(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
@@ -56,7 +56,6 @@ class UniqueRunDirectoryTests(unittest.TestCase):
             for _ in range(2):
                 config = load_config("configs/recipes/example_debug.yaml")
                 _apply(config, _fast_training_overrides(str(root)))
-                config["experiment"]["run_mode"] = "unique"
                 result = run_training(config)
                 created.append(Path(result["output_dir"]))
             self.assertNotEqual(created[0], created[1])
@@ -79,38 +78,39 @@ class UniqueRunDirectoryTests(unittest.TestCase):
             )
             self.assertEqual(len(index_lines), 4)
             records = [json.loads(line) for line in index_lines]
+            self.assertTrue(all(record["contract_version"] == 5 for record in records))
             self.assertEqual(
                 {record["state"] for record in records}, {"RUNNING", "SUCCEEDED"}
             )
-            from game_cls.cli import _find_index_records
+            from game_cls.cli.common import _find_index_records
 
             aggregated = _find_index_records(root)
             self.assertEqual(len(aggregated), 2)
             self.assertEqual({record["state"] for record in aggregated}, {"SUCCEEDED"})
 
-    def test_fixed_mode_keeps_legacy_in_place_behavior(self) -> None:
+    def test_fresh_training_always_allocates_a_run(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fixed_run"
             config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(output)))
             result = run_training(config)
-            self.assertEqual(Path(result["output_dir"]), output)
-            self.assertTrue((output / "train_metrics.jsonl").is_file())
+            run_dir = Path(result["output_dir"])
+            self.assertIn(output, run_dir.parents)
+            self.assertTrue((run_dir / "train_metrics.jsonl").is_file())
 
     def test_failed_run_records_status_and_failure_log(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
             config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(root)))
-            config["experiment"]["run_mode"] = "unique"
-            config["train"]["resume_path"] = str(root / "does_not_exist.pth")
-            with self.assertRaises(FileNotFoundError):
+            config["model"]["checkpoint_path"] = str(root / "does_not_exist.pth")
+            with self.assertRaises(RuntimeError):
                 run_training(config)
             (run_dir,) = [
                 path
@@ -120,7 +120,7 @@ class UniqueRunDirectoryTests(unittest.TestCase):
             ]
             status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "FAILED")
-            self.assertEqual(status["error_type"], "FileNotFoundError")
+            self.assertEqual(status["error_type"], "RuntimeError")
             self.assertTrue((run_dir / "failure.log").is_file())
             records = [
                 json.loads(line)
@@ -129,23 +129,22 @@ class UniqueRunDirectoryTests(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual(records[-1]["state"], "FAILED")
+            self.assertEqual(records[-1]["contract_version"], 5)
 
     def test_resume_reuses_the_same_run_directory(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
             config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(root)))
-            config["experiment"]["run_mode"] = "unique"
             config["checkpoint"]["save_last_every_steps"] = 1
             first = run_training(config)
             run_dir = Path(first["output_dir"])
 
             resumed = load_config("configs/recipes/example_debug.yaml")
             _apply(resumed, _fast_training_overrides(str(root)))
-            resumed["experiment"]["run_mode"] = "fixed"
             resumed["experiment"]["output_dir"] = str(run_dir)
             resumed["train"]["max_steps"] = 4
             resumed["train"]["resume_path"] = str(
@@ -178,13 +177,12 @@ class RunIndexSelectionRecordTests(unittest.TestCase):
         from unittest import mock
 
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runs_root"
             config = load_config("configs/recipes/example_debug.yaml")
             _apply(config, _fast_training_overrides(str(root)))
-            config["experiment"]["run_mode"] = "unique"
             config["train"].update({"max_steps": 20, "steps_per_epoch": 20})
             config["evaluation"].update(
                 {
@@ -352,9 +350,9 @@ class CliWorkflowTests(unittest.TestCase):
                 "train.max_steps=2",
                 "train.steps_per_epoch=2",
                 "train.log_every_steps=1",
-                "evaluation.quick_test_every_steps=0",
-                "evaluation.full_test_every_steps=0",
-                "evaluation.full_test_at_end=false",
+                "evaluation.val_quick_every_steps=0",
+                "evaluation.val_full_every_steps=0",
+                "evaluation.val_full_at_end=false",
                 "checkpoint.save_last_every_steps=0",
             )
             self.assertIn("=== Training finished ===", output)

@@ -1,22 +1,4 @@
-"""cls-trainer command line interface.
-
-Workflows:
-
-    cls-trainer train --config configs/recipes/game_cls_production.yaml [key=value ...]
-    cls-trainer train --config ... --dry-run
-    cls-trainer train --resume <run_dir>
-    cls-trainer config show --config ... [--with-source]
-    cls-trainer config validate --config ...
-    cls-trainer config reference
-    cls-trainer run list [--root runs]
-    cls-trainer run show latest|<run_dir>
-    cls-trainer doctor --config ...
-
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
-"""
+"""CLSTrainer command implementation for contract 5."""
 
 from __future__ import annotations
 
@@ -25,6 +7,46 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def cmd_dataset_external_prepare(args: argparse.Namespace) -> int:
+    """Build a published single-pool bundle for challenge/mining workflows."""
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+    from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
+    from game_cls.data.indexing import write_external_bundle
+
+    try:
+        config = load_config(args.config, args.overrides)
+        data_cfg = config["data"]
+        summary = write_external_bundle(
+            args.root,
+            args.output_dir,
+            ImageSpec.from_config(data_cfg),
+            ScanPolicy.from_config(data_cfg),
+            DuplicatePolicy.from_config(data_cfg),
+            pool=args.pool,
+            identity_mode=(data_cfg.get("source_video_identity") or {}).get(
+                "mode", "game_video"
+            ),
+        )
+    except (ConfigSchemaError, FileNotFoundError, RuntimeError, ValueError) as exc:
+        problems = getattr(exc, "problems", None)
+        if problems:
+            for problem in problems:
+                print(f"Config error: {problem}", file=sys.stderr)
+        else:
+            print(f"External bundle preparation failed: {exc}", file=sys.stderr)
+        return 2
+    payload = {
+        **summary,
+        "frame_index": str(Path(args.output_dir) / "frames.parquet"),
+        "video_index": str(Path(args.output_dir) / "video_entries.parquet"),
+        "bundle_manifest": str(Path(args.output_dir) / "bundle_manifest.json"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _resolve_source_video_index(
@@ -47,6 +69,10 @@ def _resolve_source_video_index(
     if not frame_index:
         raise FileNotFoundError("A frame index is required to resolve its video index.")
     stem = Path(frame_index).stem  # e.g. "train_frames"
+    if stem == "frames":
+        candidate = Path(frame_index).with_name("video_entries.parquet")
+        if candidate.is_file():
+            return candidate
     if stem.endswith("_frames"):
         candidate = Path(frame_index).with_name(
             stem[: -len("_frames")] + "_video_entries.parquet"
@@ -61,6 +87,7 @@ def _resolve_source_video_index(
         f"Cannot derive a source video index from {frame_index}; pass "
         "--source-video-index explicitly."
     )
+
 
 # ---------------------------------------------------------------------------
 # dataset prepare / audit / pack
@@ -243,10 +270,8 @@ def _maybe_prepare_split(config: dict[str, Any]) -> None:
             "run 'cls-trainer dataset prepare' separately first. Missing "
             "artifacts: " + ", ".join(missing)
         )
-    # Audit PR-C: write into the CONFIGURED index directory, not the
-    # CWD-relative ./indexes default -- otherwise a config pointing
-    # data.train_index at /data/project/indexes_v2 would "prepare successfully"
-    # while the configured paths stayed missing and training still refused.
+    # Write into the configured index directory so prepared artifacts land at
+    # the exact paths the training process will consume.
     configured_index_dir = Path(
         data_config.get("train_index", "indexes/train_frames.parquet")
     ).parent
@@ -377,115 +402,19 @@ def cmd_dataset_audit(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_dataset_seal(args: argparse.Namespace) -> int:
-    """Adopt an existing index directory as one bundle generation (audit P0-9).
-
-    Bundles built before the transactional writer carry no
-    ``bundle_manifest.json``, so nothing can rule out that they are a mixed
-    generation -- and the read path refuses them rather than guessing. Rebuilding
-    with ``dataset prepare`` is the safe route; this command is the alternative
-    for an operator who knows the directory is one consistent generation.
-
-    That knowledge is genuinely the operator's: the framework cannot infer it
-    from files that all exist. So sealing is explicit, and it refuses when an
-    artifact is missing rather than committing a known-incomplete bundle.
-    """
-    from game_cls.config import load_config
-    from game_cls.config_schema import ConfigSchemaError
-    from game_cls.data.indexing import (
-        BUNDLE_ARTIFACT_NAMES,
-        SplitBundleError,
-        verify_split_bundle,
-        write_bundle_manifest,
-    )
-
-    try:
-        config = load_config(args.config, args.overrides)
-    except ConfigSchemaError as exc:
-        for problem in exc.problems:
-            print(f"Config error: {problem}", file=sys.stderr)
-        return 2
-    data_config = config["data"]
-    index_dir = (
-        Path(args.index_dir) if args.index_dir else _split_index_dir(data_config)
-    )
-    if not index_dir.is_dir():
-        print(f"Index directory not found: {index_dir}", file=sys.stderr)
-        return 2
-
-    absent = [
-        name for name in BUNDLE_ARTIFACT_NAMES if not (index_dir / name).is_file()
-    ]
-    if absent:
-        print(
-            f"Refusing to seal {index_dir}: it is missing {', '.join(absent)}. "
-            "Sealing would commit a bundle that is already known to be "
-            "incomplete. Rebuild it instead:\n"
-            "    cls-trainer dataset prepare --config <config> "
-            "--train-root <train_all> --test-root <test>",
-            file=sys.stderr,
-        )
-        return 2
-
-    # A pre-existing bundle_id inside audit.json/split_summary.json would
-    # disagree with the new manifest and read as a mixed generation, so restamp
-    # both to the generation being committed now.
-    from uuid import uuid4
-
-    bundle_id = uuid4().hex
-    for name in ("audit.json", "split_summary.json"):
-        path = index_dir / name
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            print(
-                f"Cannot seal {index_dir}: {name} is unreadable: {exc}", file=sys.stderr
-            )
-            return 2
-        if not isinstance(payload, dict):
-            print(
-                f"Cannot seal {index_dir}: {name} is not a JSON object.",
-                file=sys.stderr,
-            )
-            return 2
-        payload["bundle_id"] = bundle_id
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
-    # The split manifest is not hash-committed here either -- write_split_bundle
-    # leaves it out because resolve_split mutates it before the parquets are
-    # staged, and seal must produce a manifest the same shape or a sealed bundle
-    # and a prepared one would verify under different rules.
-    manifest = write_bundle_manifest(index_dir, bundle_id)
-    try:
-        verify_split_bundle(index_dir)
-    except SplitBundleError as exc:
-        # Sealing then failing verification means the directory changed under
-        # us; surface it rather than reporting a success that does not hold.
-        print(f"Sealed {manifest} but verification failed: {exc}", file=sys.stderr)
-        return 1
-    print(
-        json.dumps(
-            {
-                "index_dir": str(index_dir),
-                "bundle_id": bundle_id,
-                "bundle_manifest": str(manifest),
-                "artifacts": len(BUNDLE_ARTIFACT_NAMES),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
 def cmd_dataset_pack(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
     from game_cls.data.image_spec import ImageSpec
-    from game_cls.data.indexing import SplitBundleError, verify_split_bundle
-    from game_cls.data.packed_backend import pack_frame_index
+    from game_cls.data.indexing import (
+        SplitBundleError,
+        verify_external_bundle,
+        verify_split_bundle,
+    )
+    from game_cls.data.packed_backend import (
+        pack_frame_index,
+        verify_source_bundle_artifacts,
+    )
 
     try:
         config = load_config(args.config, args.overrides)
@@ -494,22 +423,28 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
     try:
-        bundle = verify_split_bundle(Path(args.frame_index).parent)
-        assert bundle is not None
         source_video_index = _resolve_source_video_index(
             args.frame_index,
             getattr(args, "source_video_index", None),
         )
-        split_manifest_path = Path(
-            (config["data"].get("split") or {}).get(
-                "manifest", "split_manifest.parquet"
+        source = verify_source_bundle_artifacts(args.frame_index, source_video_index)
+        source_dir = Path(args.frame_index).parent
+        split_manifest_path: Path | None = None
+        if source["bundle_kind"] == "split":
+            bundle = verify_split_bundle(source_dir)
+            assert bundle is not None
+            split_manifest_path = Path(
+                (config["data"].get("split") or {}).get(
+                    "manifest", "split_manifest.parquet"
+                )
             )
-        )
-        if not split_manifest_path.is_absolute():
-            split_manifest_path = Path(args.frame_index).parent / split_manifest_path
-        audit_path = Path(config["data"].get("audit_path") or "audit.json")
-        if not audit_path.is_absolute() and not audit_path.is_file():
-            audit_path = Path(args.frame_index).parent / audit_path.name
+            if not split_manifest_path.is_absolute():
+                split_manifest_path = source_dir / split_manifest_path.name
+        elif source["bundle_kind"] == "external":
+            bundle = verify_external_bundle(source_dir)
+        else:
+            raise ValueError(f"Unsupported source bundle kind: {source['bundle_kind']}")
+        audit_path = source_dir / "audit.json"
         index_path = pack_frame_index(
             args.frame_index,
             args.output_dir,
@@ -555,24 +490,25 @@ _SIDECAR_FIELDS = (
     "difficulty",
     "sample_weight",
 )
+_UNSET = object()
 
 
 def _annotate_field(row: dict[str, Any], field: str) -> Any:
-    """Value of ``field`` when the input really supplies one, else ``None``.
-
-    A missing key, ``None`` and a blank string (an empty CSV cell) all mean
-    "not specified", so merging keeps whatever the sidecar already held
-    instead of blanking a hand-made annotation.
-    """
-    value = row.get(field)
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return None
+    """Return a supplied value, explicit subtype clear, or ``_UNSET``."""
+    if field not in row:
+        return _UNSET
+    value = row[field]
+    blank = value is None or (isinstance(value, str) and not value.strip())
+    if blank:
+        return None if field == "negative_subtype" else _UNSET
     if field == "sample_weight":
         return float(value)
     return str(value)
 
 
-def _mining_rows(mined: list[dict[str, Any]], subtype: str) -> list[dict[str, Any]]:
+def _mining_rows(
+    mined: list[dict[str, Any]], subtype: str | None
+) -> list[dict[str, Any]]:
     """Collapse mining top-K *pairs* into one row per source video.
 
     A mining manifest holds up to ``top_k_per_video`` rows per video, but
@@ -589,13 +525,27 @@ def _mining_rows(mined: list[dict[str, Any]], subtype: str) -> list[dict[str, An
     stays auditable and unit-testable.
     """
     best: dict[str, dict[str, Any]] = {}
+    versions: dict[str, set[str]] = {}
     for row in mined:
         stable_id = str(row["stable_source_id"])
+        source_version_id = str(row.get("source_version_id") or "")
+        if not source_version_id:
+            raise ValueError(
+                f"Mining row for {stable_id} has no source_version_id; rebuild "
+                "the mining manifest with CLSTrainer 5.0.0."
+            )
+        versions.setdefault(stable_id, set()).add(source_version_id)
+        if len(versions[stable_id]) > 1:
+            raise ValueError(
+                f"Mining manifest mixes content versions for {stable_id}: "
+                f"{sorted(versions[stable_id])}"
+            )
         score = float(row.get("p_positive", 0.0))
         current = best.get(stable_id)
         if current is None or score > current["p_positive"]:
             best[stable_id] = {
                 "stable_source_id": stable_id,
+                "source_version_id": source_version_id,
                 "negative_subtype": subtype,
                 "p_positive": score,
             }
@@ -636,7 +586,12 @@ def _merge_sidecar_rows(
         stable_id = str(row["stable_source_id"])
         before = merged.get(stable_id)
         if before is None:
-            new_row = {field: _annotate_field(row, field) for field in _SIDECAR_FIELDS}
+            new_row = {
+                field: (
+                    None if (value := _annotate_field(row, field)) is _UNSET else value
+                )
+                for field in _SIDECAR_FIELDS
+            }
             # A null sample_weight would break both readers, so the column is
             # always a real float.
             if new_row["sample_weight"] is None:
@@ -647,12 +602,14 @@ def _merge_sidecar_rows(
         after = dict(before)
         for field in _SIDECAR_FIELDS:
             value = _annotate_field(row, field)
-            if value is None:
+            if value is _UNSET:
                 continue  # absent in the import: keep the current value
             if field == "negative_subtype":
                 current = before.get("negative_subtype")
-                if current and current != value:
-                    conflicts.append((stable_id, str(current), str(value)))
+                if current is not None and current != value:
+                    conflicts.append(
+                        (stable_id, str(current), str(value or "<cleared>"))
+                    )
                     # refuse aborts before anything is written; keep leaves the
                     # human annotation in place. Only overwrite falls through.
                     if on_subtype_conflict in ("refuse", "keep"):
@@ -694,12 +651,15 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
     if args.from_mining:
         from game_cls.reports.benchmark import read_mining_manifest
 
-        if not args.subtype:
-            print("--from-mining requires --subtype.", file=sys.stderr)
+        clear_subtype = bool(getattr(args, "clear_subtype", False))
+        if not args.subtype and not clear_subtype:
+            print(
+                "--from-mining requires --subtype or --clear-subtype.", file=sys.stderr
+            )
             return 2
         mined = read_mining_manifest(args.from_mining)
         mining_pairs = len(mined)
-        rows = _mining_rows(mined, args.subtype)
+        rows = _mining_rows(mined, None if clear_subtype else args.subtype)
         if not rows:
             print(f"No mined negatives in {args.from_mining}", file=sys.stderr)
             return 2
@@ -737,9 +697,37 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
         + components["val_videos"]
         + (components["test_videos"] or [])
     )
+    if args.from_mining:
+        current_versions = {
+            entry.stable_source_id: entry.source_version_id for entry in entries
+        }
+        stale = [
+            (
+                str(row["stable_source_id"]),
+                str(row["source_version_id"]),
+                current_versions.get(str(row["stable_source_id"])),
+            )
+            for row in rows
+            if current_versions.get(str(row["stable_source_id"]))
+            != str(row["source_version_id"])
+        ]
+        if stale:
+            uid, mined_version, current_version = stale[0]
+            print(
+                "Mining annotation refused: source content changed after "
+                f"mining for {uid} (mined={mined_version}, "
+                f"current={current_version}). Re-run scan-negatives.",
+                file=sys.stderr,
+            )
+            return 2
+        if bool(getattr(args, "clear_subtype", False)):
+            for row in rows:
+                row["negative_subtype"] = None
     incoming = {
         str(row["stable_source_id"]): {
-            field: _annotate_field(row, field) for field in _SIDECAR_FIELDS
+            field: value
+            for field in _SIDECAR_FIELDS
+            if (value := _annotate_field(row, field)) is not _UNSET
         }
         for row in rows
     }
@@ -786,120 +774,4 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
         # Makes the top-K -> one-row-per-video aggregation visible.
         payload["mining_pairs"] = mining_pairs
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
-
-
-def cmd_dataset_metadata_migrate(args: argparse.Namespace) -> int:
-    """Convert a legacy source_video_uid sidecar into stable-id schema v2."""
-    import pyarrow.parquet as pq
-
-    from game_cls.config import load_config
-    from game_cls.config_schema import resolve_source_identity_namespaces
-    from game_cls.data.sidecar import write_metadata_sidecar
-    from game_cls.data.splitter import source_video_uid
-
-    config = load_config(args.config)
-    identity_cfg = config["data"].get("source_video_identity") or {}
-    mode = identity_cfg.get("mode", "game_video")
-    namespaces = resolve_source_identity_namespaces(identity_cfg)
-    assignments: dict[str, Path] = {}
-    for value in args.legacy_video_index:
-        if "=" not in value:
-            print(
-                "--legacy-video-index must be split=path (train, val or test).",
-                file=sys.stderr,
-            )
-            return 2
-        split, raw_path = value.split("=", 1)
-        if split not in {"train", "val", "test"} or split in assignments:
-            print(f"Invalid or duplicate legacy split: {split}", file=sys.stderr)
-            return 2
-        assignments[split] = Path(raw_path)
-
-    legacy_to_stable: dict[str, str] = {}
-    for split, path in assignments.items():
-        if not path.is_file():
-            print(f"Legacy video index not found: {path}", file=sys.stderr)
-            return 2
-        rows = pq.read_table(path, memory_map=False).to_pylist()
-        for row in rows:
-            legacy_id = str(
-                row.get("canonical_source_video_uid")
-                or f"{row['game']}::{int(row['label'])}::{row['video_id']}"
-            )
-            stable_id = source_video_uid(
-                str(row["game"]),
-                str(row["video_id"]),
-                int(row["label"]),
-                mode=mode,
-                namespace=namespaces.get(split),
-            )
-            previous_stable = legacy_to_stable.get(legacy_id)
-            if previous_stable is not None and previous_stable != stable_id:
-                print(
-                    f"Legacy identity {legacy_id!r} maps to both {previous_stable!r} "
-                    f"and {stable_id!r}; migration is ambiguous.",
-                    file=sys.stderr,
-                )
-                return 2
-            legacy_to_stable[legacy_id] = stable_id
-
-    legacy_sidecar = Path(args.legacy_sidecar)
-    if not legacy_sidecar.is_file():
-        print(f"Legacy sidecar not found: {legacy_sidecar}", file=sys.stderr)
-        return 2
-    rows = pq.read_table(legacy_sidecar, memory_map=False).to_pylist()
-    migrated: dict[str, dict[str, Any]] = {}
-    seen_legacy: set[str] = set()
-    for row in rows:
-        legacy_id = str(row.get("source_video_uid") or "")
-        if not legacy_id or legacy_id in seen_legacy:
-            print(
-                f"Legacy sidecar has missing or duplicate source_video_uid: "
-                f"{legacy_id!r}",
-                file=sys.stderr,
-            )
-            return 2
-        seen_legacy.add(legacy_id)
-        mapped_stable_id = legacy_to_stable.get(legacy_id)
-        if mapped_stable_id is None:
-            print(
-                f"Legacy sidecar identity {legacy_id!r} is absent from the "
-                "supplied legacy video indexes.",
-                file=sys.stderr,
-            )
-            return 2
-        metadata = {
-            field: row.get(field)
-            for field in _SIDECAR_FIELDS
-            if row.get(field) is not None
-        }
-        metadata.setdefault("sample_weight", 1.0)
-        previous_metadata = migrated.get(mapped_stable_id)
-        if previous_metadata is not None and previous_metadata != metadata:
-            print(
-                f"Conflicting legacy annotations collapse into stable identity "
-                f"{mapped_stable_id!r}; resolve them before migration.",
-                file=sys.stderr,
-            )
-            return 2
-        migrated[mapped_stable_id] = metadata
-
-    output_rows = [
-        {"stable_source_id": stable_id, **metadata}
-        for stable_id, metadata in sorted(migrated.items())
-    ]
-    fingerprint = write_metadata_sidecar(output_rows, args.out)
-    print(
-        json.dumps(
-            {
-                "sidecar": str(args.out),
-                "videos": len(output_rows),
-                "metadata_version": 2,
-                "metadata_fingerprint": fingerprint,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
     return 0

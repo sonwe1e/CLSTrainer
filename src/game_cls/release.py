@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from game_cls.contract import CONTRACT_VERSION, require_contract
+
 
 class ReleaseVerificationError(RuntimeError):
     """The requested artifact has no verifiable benchmark PASS."""
@@ -25,13 +27,14 @@ class ReleaseVerification:
     checkpoint_sha256: str
     report_path: Path
     release_identity_sha256: str
-    identity: dict[str, str]
+    identity: dict[str, Any]
 
 
 def release_identity(
     *, run_id: str, checkpoint_sha256: str, config: dict[str, Any]
-) -> tuple[dict[str, str], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     from game_cls.reports.benchmark import (
+        benchmark_source_fingerprint,
         canonical_config_sha256,
         challenge_bundle_fingerprint,
         gate_spec_fingerprint,
@@ -45,11 +48,13 @@ def release_identity(
         "resolved_config_sha256": canonical_config_sha256(config),
         "challenge_dataset_fingerprint": challenge_sha,
         "gate_spec_fingerprint": gate_spec_fingerprint(gate_metrics),
+        "contract_version": CONTRACT_VERSION,
+        "benchmark_source_sha256": benchmark_source_fingerprint(),
     }
     return identity, components
 
 
-def release_identity_sha256(identity: dict[str, str]) -> str:
+def release_identity_sha256(identity: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -70,14 +75,17 @@ def resolve_checkpoint_path(run_dir: Path, name: str) -> Path | None:
 def _read_report(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        require_contract(payload, f"Benchmark report {path}")
+        return payload
     except (OSError, ValueError):
         return None
-    return payload if isinstance(payload, dict) else None
 
 
 def _identity_problems(
     payload: dict[str, Any],
-    expected: dict[str, str],
+    expected: dict[str, Any],
     current_components: dict[str, Any],
 ) -> list[str]:
     from game_cls.reports.benchmark import challenge_component_differences
@@ -147,18 +155,25 @@ def verify_release_artifact(
         raise ReleaseVerificationError("; ".join(gate_config_problems))
 
     checkpoint_sha = file_sha256(checkpoint_path)
-    expected, components = release_identity(
-        run_id=run_dir.name,
-        checkpoint_sha256=checkpoint_sha,
-        config=config,
-    )
+    try:
+        expected, components = release_identity(
+            run_id=run_dir.name,
+            checkpoint_sha256=checkpoint_sha,
+            config=config,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise ReleaseVerificationError(
+            f"challenge identity cannot be verified: {exc}"
+        ) from exc
     if not expected["challenge_dataset_fingerprint"]:
         raise ReleaseVerificationError(
             "challenge bundle fingerprint cannot be recomputed; restore every "
             "configured challenge artifact"
         )
 
-    output_dir = Path((config.get("benchmark") or {}).get("output_dir", "benchmarks"))
+    from game_cls.reports.benchmark import benchmark_output_dir
+
+    output_dir = benchmark_output_dir(config, run_dir)
     candidates = sorted(
         output_dir.rglob("report.json") if output_dir.is_dir() else (),
         key=lambda path: path.stat().st_mtime,

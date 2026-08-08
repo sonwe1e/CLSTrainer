@@ -27,14 +27,13 @@ class SchemaStrictnessTests(unittest.TestCase):
         self.assertIn("optimizer.lerning_rate", message)
         self.assertIn("Did you mean 'learning_rate'", message)
 
-    def test_removed_keys_raise_migration_hint(self) -> None:
+    def test_unsupported_key_is_unknown(self) -> None:
         config = load_config("configs/recipes/example_debug.yaml")
         config["optimizer"]["name"] = "AdamW"
         with self.assertRaises(ConfigSchemaError) as ctx:
             finalize_config(config)
         message = str(ctx.exception)
-        self.assertIn("Removed config key: optimizer.name", message)
-        self.assertIn("fixed to AdamW", message)
+        self.assertIn("Unknown config key: optimizer.name", message)
 
     def test_save_all_errors_is_rejected(self) -> None:
         config = load_config("configs/recipes/example_debug.yaml")
@@ -75,10 +74,8 @@ class OverrideStrictnessTests(unittest.TestCase):
         self.assertIn("optimzier.learning_rate", message)
         self.assertIn("optimizer.learning_rate", message)
 
-    def test_removed_key_override_is_rejected(self) -> None:
-        with self.assertRaisesRegex(
-            ConfigSchemaError, "Removed config key: optimizer.name"
-        ):
+    def test_unsupported_override_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigSchemaError, "Unknown config override"):
             load_config("configs/recipes/example_debug.yaml", ["optimizer.name=SGD"])
 
     def test_valid_override_applies(self) -> None:
@@ -134,7 +131,9 @@ class SemanticValidationTests(unittest.TestCase):
         # it is now a warning via schedule_budget_warnings(), not a hard error.
         from game_cls.config_schema import schedule_budget_warnings
 
-        config = self._load(**{"scheduler.warmup_steps": "200", "train.max_steps": "100"})
+        config = self._load(
+            **{"scheduler.warmup_steps": "200", "train.max_steps": "100"}
+        )
         warnings = schedule_budget_warnings(config)
         self.assertEqual(len(warnings), 1)
         self.assertIn("200", warnings[0])
@@ -184,18 +183,18 @@ class SemanticValidationTests(unittest.TestCase):
         self.assertIn("early_stopping.monitor", message)
         self.assertIn("early_stopping.mode", message)
 
-    def test_selection_alias_with_mode_min_is_also_rejected(self) -> None:
-        """The `selection` alias must trigger the same error."""
+    def test_removed_selection_alias_is_rejected(self) -> None:
+        """Only the canonical selection_score monitor is accepted."""
         with self.assertRaises(ConfigSchemaError) as ctx:
             self._load(
                 **{
                     "early_stopping.monitor": "selection",
-                    "early_stopping.mode": "min",
+                    "early_stopping.mode": "max",
                 }
             )
         message = str(ctx.exception)
         self.assertIn("early_stopping.monitor", message)
-        self.assertIn("early_stopping.mode", message)
+        self.assertIn("selection_score", message)
 
     def test_selection_monitor_with_mode_max_is_accepted(self) -> None:
         """monitor: selection_score with mode: max is the legitimate default."""
@@ -228,7 +227,12 @@ class BenchmarkGateSchemaTests(unittest.TestCase):
 
     def test_unproducible_metric_name_is_rejected(self) -> None:
         # These are exactly the keys the schema example used to document.
-        config = self._with_gates({"max_global_fpr": 0.01, "min_positive_recall": 0.8})
+        config = self._with_gates(
+            {
+                "max_global_fpr": {"op": "<=", "value": 0.01},
+                "min_positive_recall": {"op": ">=", "value": 0.8},
+            }
+        )
         with self.assertRaises(ConfigSchemaError) as ctx:
             finalize_config(config)
         message = str(ctx.exception)
@@ -242,17 +246,18 @@ class BenchmarkGateSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigSchemaError, "not a comparison operator"):
             finalize_config(config)
 
-    def test_scalar_on_a_non_directional_metric_is_rejected(self) -> None:
+    def test_scalar_gate_is_rejected(self) -> None:
         config = self._with_gates({"sample_count": 2000})
-        with self.assertRaisesRegex(
-            ConfigSchemaError, "no documented better-direction"
-        ):
+        with self.assertRaisesRegex(ConfigSchemaError, "must use"):
             finalize_config(config)
 
-    def test_explicit_and_legacy_scalar_gates_are_accepted(self) -> None:
+    def test_explicit_gates_are_accepted(self) -> None:
         config = self._with_gates(
             {
-                "global_fpr_at_decision_threshold": 0.01,
+                "global_fpr_at_decision_threshold": {
+                    "op": "<=",
+                    "value": 0.01,
+                },
                 "global_positive_recall_at_decision_threshold": {
                     "op": ">=",
                     "value": 0.8,
@@ -335,27 +340,17 @@ class DecisionThresholdTests(unittest.TestCase):
             "evaluation": {},
         }
         resolve_decision_threshold(config)
-        self.assertEqual(config["loss"]["threshold"], 0.9)
-        self.assertEqual(config["evaluation"]["threshold"], 0.9)
+        self.assertNotIn("threshold", config["loss"])
+        self.assertNotIn("threshold", config["evaluation"])
 
-    def test_legacy_keys_agreeing_with_decision_are_tolerated(self) -> None:
+    def test_removed_threshold_keys_are_rejected(self) -> None:
         config = {
             "decision": {"threshold": 0.99},
             "loss": {"threshold": 0.99},
             "evaluation": {"threshold": 0.99},
         }
-        self.assertEqual(resolve_decision_threshold(config), 0.99)
-
-    def test_conflicting_thresholds_are_rejected(self) -> None:
-        config = {
-            "decision": {"threshold": 0.99},
-            "loss": {"threshold": 0.95},
-            "evaluation": {},
-        }
-        with self.assertRaisesRegex(
-            ConfigSchemaError, "Conflicting decision thresholds"
-        ):
-            resolve_decision_threshold(config)
+        with self.assertRaises(ConfigSchemaError):
+            finalize_config(config)
 
     def test_default_threshold_is_the_business_contract(self) -> None:
         config: dict = {}
@@ -365,8 +360,8 @@ class DecisionThresholdTests(unittest.TestCase):
     def test_shipped_configs_expose_decision_threshold(self) -> None:
         config = load_config("configs/recipes/game_cls_production.yaml")
         self.assertEqual(config["decision"]["threshold"], 0.99)
-        self.assertEqual(config["loss"]["threshold"], 0.99)
-        self.assertEqual(config["evaluation"]["threshold"], 0.99)
+        self.assertNotIn("threshold", config["loss"])
+        self.assertNotIn("threshold", config["evaluation"])
 
 
 class SourceTrackingTests(unittest.TestCase):
@@ -395,7 +390,6 @@ class SourceTrackingTests(unittest.TestCase):
         paths = set(known_dotted_paths())
         for required in (
             "experiment.output_dir",
-            "experiment.run_mode",
             "decision.threshold",
             "dataloader.train.num_workers",
             "evaluation.selection_metric",

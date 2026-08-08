@@ -196,9 +196,7 @@ def _rewrap_stress_worker(
         }
         target = Path(output_dir)
         target.mkdir(parents=True, exist_ok=True)
-        (target / f"rank{rank}.json").write_text(
-            json.dumps(payload), encoding="utf-8"
-        )
+        (target / f"rank{rank}.json").write_text(json.dumps(payload), encoding="utf-8")
     finally:
         dist.destroy_process_group()
 
@@ -222,8 +220,8 @@ def _end_to_end_worker(
         }
     )
     from game_cls.config import load_config
-    from game_cls.engine.trainer import run_training
     from game_cls.engine.training import loop as loop_module
+    from game_cls.engine.training.loop import run_training
 
     # Only rank 0 writes checkpoints, so capture each rank's own live module to
     # compare weights across ranks. The wrapper call count also proves the
@@ -246,9 +244,9 @@ def _end_to_end_worker(
     config["train"].update(
         {
             "max_steps": max_steps,
-            "steps_per_epoch": max_steps,
+            "steps_per_epoch": TOTAL_STEPS,
             "local_batch_size": 2,
-            "log_every_steps": max_steps,
+            "log_every_steps": TOTAL_STEPS,
             # The frozen-parameter verifier must survive a staged unfreeze.
             "verify_frozen_parameters": True,
         }
@@ -361,12 +359,8 @@ class DdpStagedUnfreezeTests(unittest.TestCase):
                 nprocs=2,
                 join=True,
             )
-            rank0 = json.loads(
-                (reports / "rank0.json").read_text(encoding="utf-8")
-            )
-            rank1 = json.loads(
-                (reports / "rank1.json").read_text(encoding="utf-8")
-            )
+            rank0 = json.loads((reports / "rank0.json").read_text(encoding="utf-8"))
+            rank1 = json.loads((reports / "rank1.json").read_text(encoding="utf-8"))
             for name, values in rank0["params"].items():
                 self.assertEqual(values, rank1["params"][name], f"{name} diverged")
 
@@ -415,7 +409,9 @@ class DdpStagedUnfreezeTests(unittest.TestCase):
                 nprocs=2,
                 join=True,
             )
-            checkpoint = out / "run" / "checkpoints" / "checkpoint_last.pth"
+            checkpoints = list(out.rglob("checkpoint_last.pth"))
+            self.assertEqual(len(checkpoints), 1)
+            checkpoint = checkpoints[0]
             self.assertTrue(checkpoint.is_file())
             saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
             # The mask stored past the boundary includes the backbone tensor.

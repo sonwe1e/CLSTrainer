@@ -38,7 +38,7 @@ def valid_audit() -> dict:
         ],
     }
     return {
-        "audit_format_version": 2,
+        "contract_version": 5,
         "expected": {
             "width": SPEC.width,
             "height": SPEC.height,
@@ -58,7 +58,7 @@ def valid_audit() -> dict:
             },
         },
         "leakage": {
-            "video_keys_across_splits": [],
+            "split_pair_video_key_overlap": {"train__test": []},
             "source_identity_mode": "game_video",
         },
     }
@@ -117,23 +117,25 @@ class StrictAuditTests(unittest.TestCase):
     def test_video_key_overlap_is_always_fatal(self) -> None:
         """Cross-split video keys are leakage; no opt-out flag anymore."""
         audit = valid_audit()
-        audit["leakage"]["video_keys_across_splits"] = [
-            {"game": "game_A", "label": 1, "video_id": "01"}
-        ]
-        with self.assertRaisesRegex(RuntimeError, "share source video keys"):
-            validate_audit(audit, require_content_hash=True)
+        audit["leakage"]["split_pair_video_key_overlap"] = {
+            "train__test": [{"game": "game_A", "label": 1, "video_id": "01"}]
+        }
+        with self.assertRaisesRegex(RuntimeError, "video keys span"):
+            validate_audit(
+                audit, require_content_hash=True, require_unique_video_keys=True
+            )
 
-    def test_source_video_uid_overlap_is_fatal(self) -> None:
-        """source_video_uid (game::video_id) must not span splits."""
+    def test_stable_source_id_overlap_is_fatal(self) -> None:
+        """stable_source_id (game::video_id) must not span splits."""
         audit = valid_audit()
-        audit["leakage"]["source_video_uid_overlap"] = {
+        audit["leakage"]["stable_source_id_overlap"] = {
             "train__test": ["game_A::01"],
             "train__val": [],
             "val__test": [],
         }
         with self.assertRaisesRegex(RuntimeError, "source videos span"):
             validate_audit(audit)
-        audit["leakage"]["source_video_uid_overlap"] = {
+        audit["leakage"]["stable_source_id_overlap"] = {
             "train__test": [],
             "train__val": [],
             "val__test": [],
@@ -151,23 +153,23 @@ class StrictAuditTests(unittest.TestCase):
 
     def test_game_label_video_uid_overlap_is_fatal(self) -> None:
         """game::label::video_id uids must not span splits either."""
-        from game_cls.data.splitter import source_video_uid
+        from game_cls.data.splitter import stable_source_id
 
         train = frame(
             split="train", label=0, path="/train/0100001.png", sha256="hash-a"
         )
         test = frame(split="test", label=0, path="/test/0100001.png", sha256="hash-b")
-        train_uid = source_video_uid(
+        train_uid = stable_source_id(
             train.game, train.video_id, train.label, mode="game_label_video"
         )
-        test_uid = source_video_uid(
+        test_uid = stable_source_id(
             test.game, test.video_id, test.label, mode="game_label_video"
         )
         self.assertEqual(train_uid, "game_A::0::01")
         self.assertEqual(test_uid, "game_A::0::01")
         audit = valid_audit()
         audit["leakage"]["source_identity_mode"] = "game_label_video"
-        audit["leakage"]["source_video_uid_overlap"] = {
+        audit["leakage"]["stable_source_id_overlap"] = {
             "train__test": [train_uid],
             "train__val": [],
             "val__test": [],
@@ -318,7 +320,7 @@ class NamespaceAuditTests(unittest.TestCase):
     def test_namespaces_mismatch_is_fatal(self) -> None:
         audit = valid_audit()
         audit["leakage"]["source_identity_namespaces"] = self.NAMESPACES
-        audit["leakage"]["source_video_uid_overlap"] = {
+        audit["leakage"]["stable_source_id_overlap"] = {
             "train__test": [],
             "train__val": [],
             "val__test": [],
@@ -347,7 +349,7 @@ class NamespaceAuditTests(unittest.TestCase):
         audit["leakage"]["source_identity_namespaces"] = self.NAMESPACES
         # Under namespaces the stored overlap is empty (coincidental ids in
         # distinct pools), so the strict gate passes.
-        audit["leakage"]["source_video_uid_overlap"] = {
+        audit["leakage"]["stable_source_id_overlap"] = {
             "train__test": [],
             "train__val": [],
             "val__test": [],
@@ -366,7 +368,7 @@ class NamespaceAuditTests(unittest.TestCase):
                 "pairs": {
                     "train__test": [
                         {
-                            "source_video_uid": "MC::01",
+                            "stable_source_id": "MC::01",
                             "shared_content_frames": 0,
                         }
                     ]

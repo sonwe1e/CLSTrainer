@@ -5,6 +5,10 @@
 
 # CLSTrainer
 
+当前发布版：**5.0.0**。所有由项目生成和消费的 JSON、checkpoint 与 Parquet
+持久化产物统一使用 `contract_version: 5`；缺少该标记或值不为 `5` 的产物会被
+直接拒绝，需使用本版本重新生成。
+
 双帧、多游戏二分类训练框架。输入两张 `[B,3,208,448]` RGB 帧，模型输出
 `[B,2]`，部署判定以第二通道概率与业务阈值 `decision.threshold`（默认 `0.99`）
 比较——训练损失、评估器与导出 manifest 共用同一阈值来源，不会因环节不同而漂移。
@@ -25,7 +29,7 @@ NPU 验收的完整工具链：
 | **数据闭环** | 源视频级 train/val 划分（`data.source_video_identity.mode` 显式建模源身份，混合标签源视频原子划分）、SHA-256 泄漏审计、packed uint8 分片、逐视频 `negative_subtype` 元数据、困难负样本挖掘与 mixing |
 | **训练** | FPR 受约束的 `constrained` 模型选择、分阶段解冻（`trainable_rules`）、早停 selection 合约、top-k checkpoint 注册表 |
 | **评估** | 全局/最差游戏/亚型三维 FPR-recall 矩阵、固定 challenge 集验收、Brier/ECE/负样本尾部分位数 |
-| **导出** | TorchScript 权重 + ONNX 导出、部署 manifest（含阈值/输入形状）、release gate 自动拦截未达标模型 |
+| **导出** | PyTorch 权重 + ONNX 导出、部署 manifest（含阈值/输入形状）、release gate 自动拦截未达标模型 |
 | **硬件** | CUDA 单/多卡 + Ascend NPU（CANN / HCCL 八卡），可复现：同一 seed 产生字节级一致划分 |
 
 每个 Run 都是不可覆盖的目录，`--resume`/`--fork` 记录完整谱系。
@@ -67,7 +71,7 @@ python -m pip install -e ".[cuda]"
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest   # 427+ 测试全部通过
+python -m pytest
 ```
 
 ### 2. 第一次训练
@@ -159,6 +163,7 @@ cls-trainer dataset audit --config configs/recipes/game_cls_production.yaml
 | --- | --- | --- |
 | 📷 原始帧 | `dataset prepare` → `dataset audit` | 源视频级划分 + SHA-256 泄漏检查 |
 | 📦 高吞吐 packed | `dataset pack` | uint8 分片，消除训练热路径 PNG 解码开销 |
+| 🧪 外部 challenge/mining | `dataset external-prepare` → `dataset pack`（可选） | 独立、可验证的 external bundle；后端不跟随训练 backend |
 | 🛠 逐视频元数据 | `dataset annotate` | `negative_subtype` / `sample_weight` 侧车 |
 | 🔎 困难负样本 | `benchmark scan-negatives` → `dataset annotate --from-mining` | 闭环挖掘 |
 
@@ -202,9 +207,9 @@ data:
 时才能使用**，否则同一真实视频会被拆进 train/val，造成严重数据泄漏。默认必须
 保持 `game_video`。
 
-本次划分 manifest 的 schema 升级到 **v3**：每行新增按 label 分列的有效 pair 计数、
-`labels` 列与 `split_source_identity_mode` 字段。旧的 v2 manifest 会被明确拒绝并
-提示 "Delete/rebuild the manifest"（删除后重建即可）。
+划分 manifest 是 contract 5 Parquet：每行包含按 label 分列的有效 pair 计数、
+`labels` 列与 `split_source_identity_mode` 字段。任何不带 contract 5 元数据的
+manifest 都必须重新执行 `dataset prepare` 生成。
 
 **源池命名空间（source namespace）** 解决另一个独立问题：`train` 与 `test` 是
 分别准备、互不重叠的两组原始视频，只是局部编号恰好相同（例如两边都有 `MC/0/01`），
@@ -255,11 +260,16 @@ monitor 同时出现会在配置校验阶段报错。
 # configs/recipes/game_cls_production.yaml 片段
 model:
   trainable_rules:
-    - pattern: "^cls\\."          # step 0 起训练线性头
+    cls_head:
+      pattern: "^cls\\."          # step 0 起训练线性头
       unfreeze_at_step: 0
-    - pattern: "^backbone\\.stage4\\."   # step 500 起解冻 stage4
+      lr_scale: 1.0
+      priority: 10
+    backbone_stage4:
+      pattern: "^backbone\\.stage4\\."   # step 500 起解冻 stage4
       unfreeze_at_step: 500
       lr_scale: 0.1
+      priority: 5
 ```
 
 规则包含 fingerprint，resume 时若规则变动会立即报错，防止谱系污染。
@@ -277,6 +287,12 @@ cls-trainer evaluate --run <RUN_ID> --checkpoint best_selection --split test
 #### 困难负样本挖掘与 challenge 验收
 
 ```bash
+# challenge/mining 必须先生成带逐帧 content hash 的 external bundle：
+cls-trainer dataset external-prepare \
+  --config configs/recipes/game_cls_release.yaml \
+  --pool challenge --root <CHALLENGE_ROOT> \
+  --output-dir indexes/challenge
+
 # 用最佳 checkpoint 扫描训练侧负样本池：
 cls-trainer benchmark scan-negatives \
   --run <RUN_ID> --checkpoint best_selection
@@ -286,15 +302,6 @@ cls-trainer dataset annotate \
   --config configs/recipes/game_cls_production.yaml \
   --from-mining indexes/hard_negatives.parquet \
   --subtype wooden_bridge
-
-# 从旧 source_video_uid sidecar 一次性迁移到 v2：
-cls-trainer dataset metadata-migrate \
-  --config configs/recipes/game_cls_production.yaml \
-  --legacy-sidecar indexes/video_metadata_v1.parquet \
-  --legacy-video-index train=indexes_v1/train_video_entries.parquet \
-  --legacy-video-index val=indexes_v1/val_video_entries.parquet \
-  --legacy-video-index test=indexes_v1/test_video_entries.parquet \
-  --out indexes/video_metadata.parquet
 
 # 在固定 challenge 集上做不可漂移的验收基准：
 cls-trainer benchmark evaluate --run <RUN_ID> --checkpoint best_selection
@@ -360,6 +367,8 @@ bash scripts/smoke_npu_8p.sh
 | 🎒 **入门** | |
 | [教程 `tutorial.html`](tutorial.html) | 自包含中文教程：目的 → 架构 → 数据 → 训练评估 → NPU 验收 |
 | [配置参考](docs/config_reference.md) | 每个配置键的类型、默认值与含义（自动生成） |
+| [5.0.0 发布说明](docs/release_5.0.0.md) | 合同边界、主要变化与发布验证清单 |
+| [方案历史归档](docs/history/README.md) | 整改阶段审查与最终实施方案，仅用于追溯 |
 | 💻 **开发者** | |
 | [CI 状态](https://github.com/sonwe1e/CLSTrainer/actions) | CPU：ruff + mypy + pytest（3.11/3.12/3.13）+ wheel smoke；NPU：自托管 1P/8P 门禁 |
 | [NPU 算子检查](tools/check_npu_ops.py) | `doctor --config npu` 时探测 bincount/HCCL/GradScaler 等算子可用性 |
@@ -369,7 +378,7 @@ bash scripts/smoke_npu_8p.sh
 
 ## 特性
 
-- 🔎 **不可覆盖的 Run** — 每次训练分配唯一版本化目录（manifest / status / summary），
+- 🔎 **不可覆盖的 Run** — 每次训练分配唯一目录（manifest / status / summary），
   `--resume`/`--fork` 记录完整谱系，重复执行永不覆盖。
 
 - ✏️ **严格配置** — 未知键报错并提示候选；`decision.threshold` 是训练、评估与导出
@@ -387,7 +396,7 @@ bash scripts/smoke_npu_8p.sh
 - 🏗 **分阶段解冻** — `trainable_rules` 支持正则匹配 + `unfreeze_at_step` +
   `lr_scale`，rule fingerprint 防止 resume 谱系污染。
 
-- 📦 **导出 & Release Gate** — TorchScript / ONNX 导出 + 部署 manifest，
+- 📦 **导出 & Release Gate** — PyTorch 权重 / ONNX 导出 + 部署 manifest，
   `release check` 以 checkpoint/config/challenge/gate 的完整 identity 拦截候选模型。
 
 ---

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CLSTrainer 使用教程</title>
+  <title>CLSTrainer 5.0.0 使用教程</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -99,6 +99,9 @@
     <div class="sec-label">01 / 本教程的定位</div>
     <h2>这份教程讲什么，不讲什么</h2>
     <p class="sec-intro">README 告诉你有哪些命令；本教程解释背后的逻辑，以及如果你要修改行为该动哪里。</p>
+    <div class="callout ok">
+      <strong>当前合同：</strong>本教程只描述 CLSTrainer 5.0.0。所有持久化产物必须声明 <code>contract_version=5</code>，其他产物需用当前流程重新生成。
+    </div>
     <div class="grid-2">
       <div class="card">
         <h3>本教程重点</h3>
@@ -144,7 +147,7 @@
       <div class="arrow">→</div>
       <div class="arch-box"><div class="label">选模层</div><p><code>constrained</code> 模式：先按 FPR/recall 合格性过滤，再按三元键排序</p></div>
       <div class="arrow">→</div>
-      <div class="arch-box"><div class="label">导出层</div><p>TorchScript / ONNX + <code>export_manifest.json</code>（含阈值、形状）；release gate 拦截未达标模型</p></div>
+      <div class="arch-box"><div class="label">导出层</div><p>PyTorch 权重 / ONNX + <code>export_manifest.json</code>（含阈值、形状）；release gate 拦截未达标模型</p></div>
     </div>
     <div class="callout" style="margin-bottom:0">
       <strong>单一阈值原则：</strong><code>decision.threshold</code>（默认 <code>0.99</code>）是训练损失、评估器与导出 manifest 的唯一来源。不要在不同环节分别设置阈值。
@@ -301,15 +304,14 @@ cls-trainer dataset pack --config configs/recipes/game_cls_production.yaml \
           <tr data-group="data"><td class="param-name"><code>data.backend</code></td><td><code>png</code></td><td>图像解码后端：<code>png</code>（Pillow）或 <code>packed_uint8</code>（memmap）</td><td>PNG 解码/小文件 I/O 限制 NPU 吞吐时</td><td>packed 占用大量磁盘；需在同机 A/B 确认有收益</td></tr>
           <tr data-group="data"><td class="param-name"><code>data.width / height / channels</code></td><td><code>448 / 208 / 3</code></td><td>图像和 tensor 契约，与模型输入形状绑定</td><td>仅在模型、数据、索引和 checkpoint 全部同步变更时</td><td>任意一方不同步会导致 shape 校验失败或权重不兼容</td></tr>
           <tr data-group="data"><td class="param-name"><code>data.strict_audit</code></td><td><code>true</code></td><td>训练前强制验证 audit（SHA-256 内容哈希 + 泄漏检测）</td><td>生产应保持开启</td><td>关闭后可能使用过期或泄漏数据而无感知</td></tr>
-          <tr data-group="data"><td class="param-name"><code>data.val_index</code></td><td>缺省时 test 充当 val</td><td>独立 validation split，参与选模与 early stopping</td><td>生产必须配置，让 test 成为真正的 holdout</td><td>缺失时框架用 test 代替并给出明确警告</td></tr>
+          <tr data-group="data"><td class="param-name"><code>data.val_index / val_video_index</code></td><td>必须显式配置</td><td>独立 validation split，参与选模与 early stopping</td><td>由 <code>dataset prepare</code> 生成</td><td>缺失时验证直接拒绝启动，不会复用 test</td></tr>
           <tr data-group="data"><td class="param-name"><code>data.packed_max_open_shards</code></td><td><code>16</code></td><td>packed 后端每个 worker 的 LRU memmap 数量</td><td>根据访问局部性与内存调整</td><td>过小频繁重映射；过大增加文件描述符和映射数量</td></tr>
           <tr data-group="sampler"><td class="param-name"><code>sampler.game_alpha</code></td><td><code>0.25</code></td><td>游戏采样权重与数据量的关系（0=均匀，1=按量）</td><td>小游戏欠拟合时降低；大游戏代表性不足时提高</td><td>极端值会破坏真实分布或小样本稳定性</td></tr>
           <tr data-group="sampler"><td class="param-name"><code>sampler.class_probability</code></td><td><code>{0: .5, 1: .5}</code></td><td>训练类别采样比例</td><td>需要改变优化先验时</td><td>训练分数不再等同自然概率，需额外校准</td></tr>
           <tr data-group="sampler"><td class="param-name"><code>pair.train_delta_probability</code></td><td><code>{1:.15,2:.70,3:.15}</code></td><td>训练 pair 的帧间隔分布</td><td>业务希望强调不同运动跨度时</td><td>某个 delta 数据不足会导致采样退化或审计失败</td></tr>
           <tr data-group="model"><td class="param-name"><code>model.factory</code></td><td><code>package.module:function</code></td><td>模型构建函数的 import 路径（<code>module:func</code> 格式）</td><td>接入自定义模型时必须修改</td><td>路径错误、签名不匹配或 import 副作用都会阻止启动</td></tr>
           <tr data-group="model"><td class="param-name"><code>model.checkpoint_path</code></td><td>绝对路径</td><td>基础预训练权重路径</td><td>生产必须设置</td><td>权重不存在或 state_dict 不兼容会直接终止</td></tr>
-          <tr data-group="model"><td class="param-name"><code>model.trainable_name_contains</code></td><td><code>cls</code></td><td>名称含此字符串的参数可训练；其余全部冻结</td><td>分类头命名不含 <code>cls</code> 时修改</td><td>过宽误训练主干；过窄导致无可训练参数</td></tr>
-          <tr data-group="model"><td class="param-name"><code>model.trainable_rules</code></td><td>—</td><td>分阶段解冻规则列表，每条含 <code>pattern</code>、<code>unfreeze_at_step</code>、<code>lr_scale</code></td><td>需要按 step 逐步解冻更多参数时</td><td>resume 时规则变动会立即报错（fingerprint 校验）</td></tr>
+          <tr data-group="model"><td class="param-name"><code>model.trainable_rules</code></td><td>至少一条规则</td><td>按名称键控的分阶段解冻规则，每条含 <code>pattern</code>、<code>unfreeze_at_step</code>、<code>lr_scale</code>、<code>priority</code></td><td>定义从 step 0 开始的全部可训练参数</td><td>规则没有匹配参数或 resume 时规则变化会直接报错</td></tr>
           <tr data-group="model"><td class="param-name"><code>loss.label_smoothing</code></td><td><code>0.0</code></td><td>交叉熵标签平滑系数</td><td>过拟合消融时先试 0.02–0.05</td><td>过大会改变 0.99 阈值处的校准</td></tr>
           <tr data-group="model"><td class="param-name"><code>loss.threshold_loss_weight</code></td><td><code>0.20</code></td><td>阈值间隔损失最大权重；在训练初期线性升温后保持</td><td>CE 收敛但 0.99 附近分离不足时调高</td><td>过高可能同时放大 FP/FN 或造成优化不稳定</td></tr>
           <tr data-group="model"><td class="param-name"><code>loss.threshold_warmup_ratio</code></td><td><code>0.10</code></td><td>前期只用 CE 的训练比例（之后线性引入阈值损失）</td><td>初期 loss 不稳定或阈值损失介入过早时延长</td><td>过长会延迟业务阈值对齐</td></tr>
@@ -455,27 +457,38 @@ def build_my_model(
       <pre><code>model:
   factory: "my_package.models:build_my_model"
   checkpoint_path: /path/to/pretrained_backbone.pth
-  trainable_name_contains: "cls"   # 只训练名称包含 cls 的参数
+  trainable_rules:
+    cls_head:
+      pattern: "^cls\\."
+      lr_scale: 1.0
+      unfreeze_at_step: 0
+      priority: 10
   kwargs:
     cls_dropout: 0.1               # 传给工厂的额外参数</code></pre>
     </div>
-    <p style="font-size:.92rem;margin-bottom:6px"><strong>分阶段解冻（trainable_rules）：</strong>比 <code>trainable_name_contains</code> 更细粒度，支持按 step 逐步解冻、为不同参数组设置独立学习率缩放。</p>
+    <p style="font-size:.92rem;margin-bottom:6px"><strong>分阶段解冻（trainable_rules）：</strong>这是唯一的可训练参数定义，支持按 step 逐步解冻、为不同参数组设置独立学习率缩放。</p>
     <div class="code-block">
       <div class="head"><span>分阶段解冻配置示例</span><button class="copy-btn" type="button">复制</button></div>
       <pre><code>model:
-  trainable_name_contains: null   # 不使用简单字符串匹配
   trainable_rules:
-    - pattern: "^cls\\."           # 正则：step 0 起训练分类头
+    cls_head:
+      pattern: "^cls\\."           # 正则：step 0 起训练分类头
       unfreeze_at_step: 0
-    - pattern: "^backbone\\.stage4\\."  # step 500 起解冻 stage4
+      lr_scale: 1.0
+      priority: 10
+    backbone_stage4:
+      pattern: "^backbone\\.stage4\\."  # step 500 起解冻 stage4
       unfreeze_at_step: 500
       lr_scale: 0.1                # 该参数组的学习率 = base_lr × 0.1
-    - pattern: "^backbone\\.stage3\\."
+      priority: 5
+    backbone_stage3:
+      pattern: "^backbone\\.stage3\\."
       unfreeze_at_step: 2000
-      lr_scale: 0.01</code></pre>
+      lr_scale: 0.01
+      priority: 1</code></pre>
     </div>
     <div class="callout">
-      <strong>规则 fingerprint：</strong>rules 列表会被哈希存入 checkpoint。resume 时若规则发生变动，训练立即报错，防止谱系污染。如需调整规则，应用 <code>--fork</code> 而非 <code>--resume</code>。
+      <strong>规则 fingerprint：</strong>命名规则集合会被哈希存入 checkpoint。resume 时若规则发生变动，训练立即报错，防止谱系污染。如需调整规则，应用 <code>--fork</code> 而非 <code>--resume</code>。
     </div>
     <div class="callout ok">
       <strong>严格加载验证：</strong>框架会检查所有被冻结的非 cls 参数均来自 <code>checkpoint_path</code> 而非随机初始化。若 checkpoint 缺少某个非 cls 参数，训练启动时报错，不允许静默降级。
@@ -619,7 +632,7 @@ _HIGHER_BETTER = frozenset({
         <p><strong>train</strong>：只参与梯度更新。</p>
         <p><strong>validation</strong>：参与曲线、模型选择和 early stopping；可以多次评估。</p>
         <p><strong>test</strong>：训练结束后只评估一次（<code>cls-trainer evaluate --split test</code>），绝不参与选模。若没有独立 test 集，<code>--split test</code> 会被拒绝（退出码 3）。</p>
-        <p style="margin-bottom:0">旧键 <code>quick_test_every_steps</code> / <code>full_test_every_steps</code> 会自动迁移为 <code>val_quick_every_steps</code> / <code>val_full_every_steps</code>。</p>
+        <p style="margin-bottom:0">validation 索引必须显式配置；test 索引仅供训练结束后的独立评估使用。</p>
       </div>
     </details>
     <details>
@@ -642,8 +655,8 @@ _HIGHER_BETTER = frozenset({
       </div>
     </details>
     <details>
-      <summary>为什么 model.trainable_name_contains 过宽或过窄都会失败？</summary>
-      <div class="detail-body">过宽（如 <code>""</code>）会把主干所有参数都纳入可训练，导致对冻结主干的严格加载检查无法通过，或训练规模远超预期。过窄（如一个不存在的字符串）导致 0 个可训练参数，<code>doctor</code> 会拒绝启动。建议先在 debug 配置上用 <code>cls-trainer doctor</code> 确认可训练参数数量。</div>
+      <summary>为什么 trainable_rules 必须准确匹配参数？</summary>
+      <div class="detail-body">过宽的正则会把主干参数意外纳入训练，过窄则可能得到 0 个可训练参数。规则必须非空，学习率缩放必须为正数；<code>doctor</code> 和训练启动都会打印最终可训练参数集合。</div>
     </details>
   </div>
 </section>
@@ -721,4 +734,3 @@ _HIGHER_BETTER = frozenset({
 </script>
 </body>
 </html>
-

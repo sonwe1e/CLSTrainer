@@ -31,7 +31,7 @@ class LoaderBundle:
     test_full    full test split             off     only via ``evaluate``
     ============ =========================== ======= =======================
 
-    ``test_full`` is ``None`` when the test split is aliased as validation;
+    ``test_full`` is ``None`` when no independent test split is configured;
     it never runs inside the training loop.
     """
 
@@ -117,7 +117,7 @@ def _build_real_data_components(
     """Shared split metadata for training and standalone evaluation.
 
     Returns train/val/test video entries plus per-split decoders. The test
-    entry is ``None`` when the config aliases test as validation.
+    entry is ``None`` when no independent test split is configured.
     """
     from game_cls.data.index_policy import DuplicatePolicy, ScanPolicy
     from game_cls.data.indexing import (
@@ -194,16 +194,16 @@ def _build_real_data_components(
             "val": ("val_video_index", "val_packed_video_index"),
             "test": ("test_video_index", "test_packed_video_index"),
         }
-        fallback_keys = {
-            "train": ("train_index", "train_packed_index"),
-            "val": ("val_index", "val_packed_index"),
-            "test": ("test_index", "test_packed_index"),
-        }
         packed = backend_name == "packed_uint8"
         explicit = data_cfg.get(explicit_keys[split][1 if packed else 0])
-        if explicit:
-            return explicit
-        return data_cfg[fallback_keys[split][1 if packed else 0]]
+        if not explicit:
+            key = explicit_keys[split][1 if packed else 0]
+            raise ValueError(
+                f"data.{key} is required. Frame indexes are no longer used "
+                "as an implicit video-index fallback because that changes "
+                "source identity semantics."
+            )
+        return str(explicit)
 
     train_videos = read_video_entries_parquet(
         _video_index_path("train"), delta_probability.keys()
@@ -256,12 +256,13 @@ def _build_real_data_components(
             provenance_audit_path = Path(
                 data_cfg.get("audit_path") or source_dir / "audit.json"
             )
-            if not provenance_audit_path.is_absolute() and not provenance_audit_path.is_file():
+            if (
+                not provenance_audit_path.is_absolute()
+                and not provenance_audit_path.is_file()
+            ):
                 provenance_audit_path = source_dir / provenance_audit_path.name
             split_manifest_path = Path(
-                (data_cfg.get("split") or {}).get(
-                    "manifest", "split_manifest.parquet"
-                )
+                (data_cfg.get("split") or {}).get("manifest", "split_manifest.parquet")
             )
             if not split_manifest_path.is_absolute():
                 split_manifest_path = source_dir / split_manifest_path
@@ -434,10 +435,8 @@ def build_eval_loader_for_split(
     elif split == "test":
         if components["test_videos"] is None:
             raise ValueError(
-                "This run has no independent test set: data.test_index was "
-                "aliased as the validation split. Evaluate "
-                "--split validation instead, or retrain with a dedicated "
-                "data.val_index."
+                "This run has no independent test set. Evaluate "
+                "--split validation instead, or configure dedicated test inputs."
             )
         videos = components["test_videos"]
         decoder = components["decoders"]["test"]
@@ -486,11 +485,6 @@ def build_external_pool_loader(
         raise ValueError(f"Unsupported external pool: {pool!r}")
     config = finalize_config(config)
     data_cfg = config["data"]
-    backend_name = data_cfg.get("backend", "png")
-    packed = backend_name == "packed_uint8"
-    if backend_name not in {"png", "packed_uint8"}:
-        raise ValueError(f"Unsupported data backend: {backend_name}")
-
     # Spelled-out key names, not f-string joins: the CI consumer guard scans
     # the source for each schema leaf as a literal, and a key that only exists
     # as "{prefix}packed_index" would read as orphaned.
@@ -516,8 +510,13 @@ def build_external_pool_loader(
         }
     path = {name: f"{section}.{key}" for name, key in keys.items()}
 
-    video_index = (source.get(keys["packed_video"]) if packed else None) or source.get(
-        keys["video"]
+    # External pools select their own backend.  Packed pools necessarily keep
+    # their plain frame/video indexes as provenance sources, so the presence of
+    # the packed frame index is the unambiguous discriminator.
+    packed = bool(source.get(keys["packed"]))
+
+    video_index = (
+        source.get(keys["packed_video"]) if packed else source.get(keys["video"])
     )
     if not video_index:
         wanted = (
@@ -532,14 +531,25 @@ def build_external_pool_loader(
         )
     source_frame_index = source.get(keys["frame"])
     source_video_index = source.get(keys["video"])
-    if packed and (not source_frame_index or not source_video_index):
+    if not source_frame_index or not source_video_index:
         raise ValueError(
-            f"Packed {pool} evaluation requires provenance sources "
+            f"{pool} evaluation requires external-bundle sources "
             f"{path['frame']} and {path['video']}."
         )
-    if packed:
-        assert source_frame_index is not None
-        assert source_video_index is not None
+    assert source_frame_index is not None
+    assert source_video_index is not None
+
+    from game_cls.data.indexing import (
+        verify_external_bundle,
+        verify_frame_content_integrity,
+    )
+
+    verify_external_bundle(Path(source_frame_index).parent, pool=pool)
+    from game_cls.data.packed_backend import verify_source_bundle_artifacts
+
+    verify_source_bundle_artifacts(source_frame_index, source_video_index)
+    if not packed:
+        verify_frame_content_integrity(source_frame_index)
 
     test_delta = int(config["pair"]["test_delta"])
     videos = read_video_entries_parquet(video_index, (test_delta,))
@@ -574,7 +584,7 @@ def build_external_pool_loader(
             source_frame_path,
             current_video_index=source_video_path,
             audit_path=source_dir / "audit.json",
-            split_manifest_path=source_dir / "split_manifest.parquet",
+            split_manifest_path=None,
         )
         verify_packed_shards(packed_manifest)
         decoder = PackedUint8Backend(
@@ -627,10 +637,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
     max_worst_subtype_fpr = evaluation_cfg.get("max_worst_subtype_fpr")
     probe_pairs_per_video = int(evaluation_cfg.get("train_probe_pairs_per_video", 32))
     val_quick_pairs_per_video = int(
-        evaluation_cfg.get(
-            "val_quick_pairs_per_video",
-            evaluation_cfg.get("quick_test_pairs_per_video", 128),
-        )
+        evaluation_cfg.get("val_quick_pairs_per_video", 128)
     )
 
     if data_cfg.get("synthetic", False):
@@ -746,10 +753,7 @@ def _make_dataloaders(config: dict, rank: int, world_size: int) -> LoaderBundle:
     )
     sampler_cfg = config["sampler"]
     dedup_cfg = (config.get("data") or {}).get("deduplication") or {}
-    dedup_level = str(dedup_cfg.get("level") or "") or None
-    if dedup_level is None:
-        legacy = sampler_cfg.get("deduplicate_within_global_batch", True)
-        dedup_level = "pair" if legacy else "none"
+    dedup_level = str(dedup_cfg.get("level", "pair"))
     sampler = VideoBalancedPairBatchSampler(
         train_videos,
         batch_size,

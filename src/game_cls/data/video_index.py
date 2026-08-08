@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from game_cls.contract import require_parquet_contract, stamp_parquet_table
 
 from .records import FrameRecord
 
@@ -36,9 +39,8 @@ class VideoEntry:
     # Metadata is keyed by stable_source_id; samples/reports use source_version_id.
     stable_source_id: str = ""
     content_version_id: str = ""
-    # Optional per-video metadata joined from the sidecar AFTER split
-    # (step5 P2). Never part of split/dedup identity; defaults keep the
-    # legacy behavior byte-identical when no sidecar is configured.
+    # Optional per-video metadata joined from the sidecar after splitting.
+    # It is never part of split/dedup identity.
     negative_subtype: str | None = None
     sample_weight: float = 1.0
 
@@ -46,9 +48,7 @@ class VideoEntry:
     def source_version_id(self) -> str:
         stable = self.stable_source_id or f"{self.game}::{self.label}::{self.video_id}"
         return (
-            f"{stable}#{self.content_version_id}"
-            if self.content_version_id
-            else stable
+            f"{stable}#{self.content_version_id}" if self.content_version_id else stable
         )
 
     def _reference(self, position: int) -> str | int:
@@ -91,12 +91,12 @@ def build_video_entries(
     namespace: str | None = None,
     require_content_hash: bool = False,
 ) -> list[VideoEntry]:
-    from .splitter import source_video_uid
+    from .splitter import stable_source_id
 
     frames = list(frames)
     content_by_source: dict[str, list[FrameRecord]] = {}
     for frame in frames:
-        stable = source_video_uid(
+        stable = stable_source_id(
             frame.game,
             frame.video_id,
             frame.label,
@@ -151,7 +151,7 @@ def build_video_entries(
             )
             for delta in deltas
         }
-        stable = source_video_uid(
+        stable = stable_source_id(
             game,
             video_id,
             label,
@@ -193,10 +193,10 @@ def read_video_entries_parquet(
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise RuntimeError("Reading Parquet indexes requires pyarrow") from exc
+    require_parquet_contract(path)
     schema_names = set(pq.read_schema(path).names)
     if "frame_ids" in schema_names:
         identity_columns = {
-            "identity_schema_version",
             "stable_source_id",
             "content_version_id",
             "source_version_id",
@@ -204,9 +204,8 @@ def read_video_entries_parquet(
         missing_identity = identity_columns - schema_names
         if missing_identity:
             raise ValueError(
-                f"Video index {path} predates identity schema v2 and is missing "
-                f"{sorted(missing_identity)}. Rebuild the indexes; use "
-                "'cls-trainer dataset metadata-migrate' for legacy sidecars."
+                f"Video index {path} is missing {sorted(missing_identity)}. "
+                "Rebuild it with CLSTrainer 5.0.0."
             )
         entries = []
         for batch in pq.ParquetFile(path).iter_batches(batch_size=256):
@@ -219,61 +218,50 @@ def read_video_entries_parquet(
                     for delta in deltas
                 }
                 entry = VideoEntry(
-                        game=row["game"],
-                        label=int(row["label"]),
-                        video_id=row["video_id"],
-                        frame_ids=np.asarray(row["frame_ids"], dtype=np.int32),
-                        valid_start_positions=valid,
-                        frame_paths=tuple(row.get("frame_paths") or ()),
-                        frame_locations=(
-                            np.asarray(row["frame_locations"], dtype=np.int64)
-                            if row.get("frame_locations") is not None
-                            else None
-                        ),
-                        video_directory=row.get("video_directory") or "",
-                        stable_source_id=row.get("stable_source_id") or "",
-                        content_version_id=row.get("content_version_id") or "",
-                        negative_subtype=row.get("negative_subtype"),
-                        sample_weight=float(row.get("sample_weight", 1.0)),
-                    )
-                if int(row.get("identity_schema_version", 0)) != 2:
-                    raise ValueError(
-                        f"Video index {path} has an unsupported identity schema "
-                        f"version for {entry.game}/{entry.label}/{entry.video_id}."
-                    )
+                    game=row["game"],
+                    label=int(row["label"]),
+                    video_id=row["video_id"],
+                    frame_ids=np.asarray(row["frame_ids"], dtype=np.int32),
+                    valid_start_positions=valid,
+                    frame_paths=tuple(row.get("frame_paths") or ()),
+                    frame_locations=(
+                        np.asarray(row["frame_locations"], dtype=np.int64)
+                        if row.get("frame_locations") is not None
+                        else None
+                    ),
+                    video_directory=row.get("video_directory") or "",
+                    stable_source_id=row.get("stable_source_id") or "",
+                    content_version_id=row.get("content_version_id") or "",
+                    negative_subtype=row.get("negative_subtype"),
+                    sample_weight=float(row.get("sample_weight", 1.0)),
+                )
                 if not entry.stable_source_id or not entry.content_version_id:
                     raise ValueError(
                         f"Video index {path} contains an unversioned identity for "
                         f"{entry.game}/{entry.label}/{entry.video_id}; rebuild it."
                     )
+                if not math.isfinite(entry.sample_weight) or entry.sample_weight <= 0:
+                    raise ValueError(
+                        f"Video index {path} contains invalid sample_weight="
+                        f"{entry.sample_weight!r} for {entry.stable_source_id}."
+                    )
                 recorded_source_version = row.get("source_version_id")
-                if recorded_source_version and recorded_source_version != entry.source_version_id:
+                if (
+                    recorded_source_version
+                    and recorded_source_version != entry.source_version_id
+                ):
                     raise ValueError(
                         f"Video index {path} has inconsistent source_version_id for "
                         f"{entry.game}/{entry.label}/{entry.video_id}."
                     )
                 entries.append(entry)
         return entries
-    columns = [
-        "sample_id",
-        "split",
-        "game",
-        "label",
-        "video_id",
-        "frame_id",
-        "path",
-        "width",
-        "height",
-        "channels",
-        "file_size",
-        "content_sha256",
-    ]
-    table = pq.read_table(
-        path, columns=[column for column in columns if column in schema_names]
-    )
-    return build_video_entries(
-        (FrameRecord(**row) for row in table.to_pylist()),
-        deltas=deltas,
+    raise ValueError(
+        f"{path} is a frame-level parquet, not a contract-5 video "
+        "index. Configure the corresponding *_video_index produced by "
+        "'cls-trainer dataset prepare' or 'dataset external-prepare'. "
+        "Implicit frame-index fallback has been removed because it could "
+        "silently change source identity semantics."
     )
 
 
@@ -288,7 +276,6 @@ def write_video_entries_parquet(
     rows = []
     for entry in entries:
         row = {
-            "identity_schema_version": 2,
             "game": entry.game,
             "label": entry.label,
             "video_id": entry.video_id,
@@ -314,7 +301,7 @@ def write_video_entries_parquet(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(
-        pa.Table.from_pylist(rows),
+        stamp_parquet_table(pa.Table.from_pylist(rows)),
         path,
         compression="zstd",
     )

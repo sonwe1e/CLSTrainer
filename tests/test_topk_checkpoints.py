@@ -87,30 +87,30 @@ class TopKCheckpointTests(unittest.TestCase):
         return config
 
     def test_keeps_two_best_and_evicts_worst(self) -> None:
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory, save_topk=2)
             fake_metrics = [
                 {
                     "selection_score": 0.5,
-                    "global_f1_tau099": 0.5,
+                    "global_f1_at_decision_threshold": 0.5,
                     "cross_entropy": 1.0,
-                    "worst_game_f1_tau099": 0.3,
+                    "worst_game_f1_at_decision_threshold": 0.3,
                     "checkpoint_step": 20,
                 },
                 {
                     "selection_score": 0.9,
-                    "global_f1_tau099": 0.9,
+                    "global_f1_at_decision_threshold": 0.9,
                     "cross_entropy": 0.8,
-                    "worst_game_f1_tau099": 0.7,
+                    "worst_game_f1_at_decision_threshold": 0.7,
                     "checkpoint_step": 40,
                 },
                 {
                     "selection_score": 0.4,
-                    "global_f1_tau099": 0.4,
+                    "global_f1_at_decision_threshold": 0.4,
                     "cross_entropy": 1.2,
-                    "worst_game_f1_tau099": 0.2,
+                    "worst_game_f1_at_decision_threshold": 0.2,
                     "checkpoint_step": 60,
                 },
             ]
@@ -134,7 +134,7 @@ class TopKCheckpointTests(unittest.TestCase):
             self.assertEqual(registry[0]["value"], 0.9)
             self.assertEqual(registry[1]["value"], 0.5)
 
-            checkpoints = Path(directory) / "run" / "checkpoints"
+            checkpoints = Path(result["output_dir"]) / "checkpoints"
             for step in (20, 40):
                 self.assertTrue(
                     (checkpoints / f"model_topk_{step:08d}.pth").is_file(),
@@ -155,7 +155,7 @@ class TopKCheckpointTests(unittest.TestCase):
             )
             # Summary payload carries the list for run show / summary.md.
             summary = json.loads(
-                (Path(directory) / "run" / "training_summary.json").read_text(
+                (Path(result["output_dir"]) / "training_summary.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -165,7 +165,7 @@ class TopKCheckpointTests(unittest.TestCase):
             )
 
     def test_lower_better_monitor_keeps_lowest_cross_entropy(self) -> None:
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory, save_topk=2)
@@ -173,23 +173,23 @@ class TopKCheckpointTests(unittest.TestCase):
             fake_metrics = [
                 {
                     "selection_score": 0.5,
-                    "global_f1_tau099": 0.5,
+                    "global_f1_at_decision_threshold": 0.5,
                     "cross_entropy": 1.0,
-                    "worst_game_f1_tau099": 0.3,
+                    "worst_game_f1_at_decision_threshold": 0.3,
                     "checkpoint_step": 20,
                 },
                 {
                     "selection_score": 0.9,
-                    "global_f1_tau099": 0.9,
+                    "global_f1_at_decision_threshold": 0.9,
                     "cross_entropy": 0.6,
-                    "worst_game_f1_tau099": 0.7,
+                    "worst_game_f1_at_decision_threshold": 0.7,
                     "checkpoint_step": 40,
                 },
                 {
                     "selection_score": 0.4,
-                    "global_f1_tau099": 0.4,
+                    "global_f1_at_decision_threshold": 0.4,
                     "cross_entropy": 0.8,
-                    "worst_game_f1_tau099": 0.2,
+                    "worst_game_f1_at_decision_threshold": 0.2,
                     "checkpoint_step": 60,
                 },
             ]
@@ -210,22 +210,22 @@ class TopKCheckpointTests(unittest.TestCase):
             # Lowest CE first: step 40 (0.6), then step 60 (0.8); step 20 (1.0)
             # evicted.
             self.assertEqual([entry["step"] for entry in registry], [40, 60])
-            checkpoints = Path(directory) / "run" / "checkpoints"
+            checkpoints = Path(result["output_dir"]) / "checkpoints"
             self.assertTrue((checkpoints / "model_topk_00000040.pth").is_file())
             self.assertTrue((checkpoints / "model_topk_00000060.pth").is_file())
             self.assertFalse((checkpoints / "model_topk_00000020.pth").exists())
 
     def test_disabled_topk_writes_no_topk_files(self) -> None:
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = self._config(directory, save_topk=0)
             fake_metrics = [
                 {
                     "selection_score": 0.5,
-                    "global_f1_tau099": 0.5,
+                    "global_f1_at_decision_threshold": 0.5,
                     "cross_entropy": 1.0,
-                    "worst_game_f1_tau099": 0.3,
+                    "worst_game_f1_at_decision_threshold": 0.3,
                     "checkpoint_step": 20,
                 }
             ]
@@ -239,7 +239,7 @@ class TopKCheckpointTests(unittest.TestCase):
             ):
                 result = run_training(config)
             self.assertEqual(result["evaluation_state"]["topk_registry"], [])
-            checkpoints = Path(directory) / "run" / "checkpoints"
+            checkpoints = Path(result["output_dir"]) / "checkpoints"
             self.assertFalse(list(checkpoints.glob("model_topk_*.pth")))
 
 
@@ -247,7 +247,7 @@ class TopKCheckpointTests(unittest.TestCase):
 class ConstrainedTopKTests(unittest.TestCase):
     def _run(self, directory: str, payloads: list[dict], *, save_topk: int) -> dict:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(Path(directory) / "run")
@@ -320,7 +320,7 @@ class ConstrainedTopKTests(unittest.TestCase):
             registry = result["evaluation_state"]["topk_registry"]
             self.assertEqual([entry["step"] for entry in registry], [20, 60])
             self.assertEqual([entry["eligible"] for entry in registry], [True, True])
-            checkpoints = Path(directory) / "run" / "checkpoints"
+            checkpoints = Path(result["output_dir"]) / "checkpoints"
             # The ineligible snapshot was admitted (it was the only candidate
             # at the time) but evicted once two eligible ones existed.
             self.assertFalse((checkpoints / "model_topk_00000040.pth").exists())
@@ -349,8 +349,8 @@ class ConstrainedTopKTests(unittest.TestCase):
                 _metrics(20, worst_game_recall=0.80),
                 _metrics(40, worst_game_recall=0.95),
             ]
-            self._run(directory, payloads, save_topk=2)
-            path = Path(directory) / "run" / "checkpoints" / "topk_registry.json"
+            result = self._run(directory, payloads, save_topk=2)
+            path = Path(result["output_dir"]) / "checkpoints" / "topk_registry.json"
             persisted = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["monitor"], "selection_score")
             self.assertEqual(
@@ -364,17 +364,11 @@ class ConstrainedTopKTests(unittest.TestCase):
 
 
 class TopKEntrySortValueTests(unittest.TestCase):
-    def test_legacy_entries_without_sort_value_still_rank(self) -> None:
+    def test_sort_value_is_required(self) -> None:
         from game_cls.engine.training.run_io import _topk_entry_sort_value
 
-        # Entries restored from a checkpoint written before step6.
-        self.assertEqual(
-            _topk_entry_sort_value({"value": 0.7}, lower_better=False), [0.7]
-        )
-        self.assertEqual(
-            _topk_entry_sort_value({"value": 0.7}, lower_better=True), [-0.7]
-        )
-        # A present sort_value wins over the scalar.
+        with self.assertRaisesRegex(ValueError, "sort_value"):
+            _topk_entry_sort_value({"value": 0.7}, lower_better=False)
         self.assertEqual(
             _topk_entry_sort_value(
                 {"value": 0.7, "sort_value": [1.0, 0.9, 0.8]}, lower_better=False

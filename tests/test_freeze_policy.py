@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from game_cls.model.freeze_policy import (
-    configure_trainable_parameters,
-    set_frozen_backbone_train_mode,
-)
+from game_cls.model.freeze_policy import set_frozen_backbone_train_mode
 
 try:
     import torch
@@ -38,26 +35,41 @@ class FakeModel:
 
 
 class FreezePolicyTests(unittest.TestCase):
-    def test_only_lowercase_cls_is_trainable(self) -> None:
+    def test_explicit_rule_selects_the_head(self) -> None:
+        from game_cls.model.trainable_rules import apply_trainable_state, parse_rules
+
         model = FakeModel()
-        summary = configure_trainable_parameters(model)
-        self.assertEqual(summary.trainable_names, ("head.cls.weight", "head.cls.bias"))
-        self.assertEqual(summary.trainable_count, 10)
-        self.assertEqual(summary.frozen_count, 110)
+        apply_trainable_state(
+            model,
+            parse_rules({"head": {"pattern": r"^head\.cls\.", "lr_scale": 1.0}}),
+            0,
+        )
+        trainable = tuple(
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        )
+        self.assertEqual(trainable, ("head.cls.weight", "head.cls.bias"))
         self.assertFalse(model.parameters["head.Classifier.weight"].requires_grad)
 
     def test_fails_when_no_parameter_matches(self) -> None:
+        from game_cls.model.trainable_rules import apply_trainable_state, parse_rules
+
         model = FakeModel()
         with self.assertRaises(RuntimeError):
-            configure_trainable_parameters(model, "missing")
+            apply_trainable_state(
+                model,
+                parse_rules({"missing": {"pattern": "missing", "lr_scale": 1.0}}),
+                0,
+            )
 
 
 @unittest.skipIf(torch is None, "torch is not installed")
 class StagedUnfreezeTrainModeTests(unittest.TestCase):
     """Audit P1-2: an unfrozen stage must run in train mode.
 
-    The legacy train-mode rule was ``"cls" in module_name``, so a staged
-    unfreeze that opens ``stage4`` (whose names carry no "cls" token) left the
+    A name-token train-mode rule would leave a staged unfreeze that opens
+    ``stage4``
     freshly-trainable modules in eval mode: Dropout/DropPath never applied and
     the weights trained under inference semantics. Train mode must follow the
     ``requires_grad`` set (which reflects the active rules), not the name.
@@ -107,7 +119,6 @@ class StagedUnfreezeTrainModeTests(unittest.TestCase):
         set_frozen_backbone_train_mode(
             model,
             "cls",
-            None,
             freeze_backbone_batchnorm_stats=True,
             freeze_cls_batchnorm_stats=True,
         )
@@ -145,7 +156,6 @@ class StagedUnfreezeTrainModeTests(unittest.TestCase):
         set_frozen_backbone_train_mode(
             model,
             "cls",
-            None,
             freeze_backbone_batchnorm_stats=False,
             freeze_cls_batchnorm_stats=True,
         )

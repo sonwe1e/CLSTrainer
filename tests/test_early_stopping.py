@@ -284,7 +284,7 @@ class EarlyStoppingSelectionContractTests(unittest.TestCase):
         self.assertEqual(state["best_value"], 1.5)
         self.assertEqual(state["best_step"], 20)
 
-    def test_metric_mode_matches_the_legacy_scalar_behavior(self) -> None:
+    def test_metric_mode_matches_the_scalar_reference_behavior(self) -> None:
         # In metric mode the rank key is the scalar selection metric, so the
         # decisions must be exactly the pre-step6 ones.
         state = _early_stopping_defaults()
@@ -332,7 +332,7 @@ class EarlyStoppingSelectionContractTests(unittest.TestCase):
 class EarlyStoppingTests(unittest.TestCase):
     def test_plateau_stops_before_budget_and_restores_best(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -367,16 +367,16 @@ class EarlyStoppingTests(unittest.TestCase):
             fake_metrics = [
                 {
                     "selection_score": 0.5,
-                    "global_f1_tau099": 0.5,
+                    "global_f1_at_decision_threshold": 0.5,
                     "cross_entropy": 1.0,
-                    "worst_game_f1_tau099": 0.3,
+                    "worst_game_f1_at_decision_threshold": 0.3,
                     "checkpoint_step": 20,
                 },
                 {
                     "selection_score": 0.4,
-                    "global_f1_tau099": 0.4,
+                    "global_f1_at_decision_threshold": 0.4,
                     "cross_entropy": 1.2,
-                    "worst_game_f1_tau099": 0.2,
+                    "worst_game_f1_at_decision_threshold": 0.2,
                     "checkpoint_step": 40,
                 },
             ]
@@ -399,7 +399,8 @@ class EarlyStoppingTests(unittest.TestCase):
             self.assertEqual(early["bad_evaluation_count"], 1)
             # Stopped well before the 60-step budget.
             self.assertEqual(result["global_step"], 40)
-            checkpoints = Path(directory) / "run" / "checkpoints"
+            run_dir = Path(result["output_dir"])
+            checkpoints = run_dir / "checkpoints"
             for name in (
                 "model_best_selection.pth",
                 "model_best_val_loss.pth",
@@ -407,7 +408,7 @@ class EarlyStoppingTests(unittest.TestCase):
                 "model_last.pth",
             ):
                 self.assertTrue((checkpoints / name).is_file(), f"missing {name}")
-            status = Path(directory) / "run" / "status.json"
+            status = run_dir / "status.json"
             payload = __import__("json").loads(status.read_text(encoding="utf-8"))
             self.assertTrue(payload.get("early_stopped"))
             self.assertEqual(payload.get("early_stopped_step"), 40)
@@ -424,7 +425,7 @@ class EarlyStoppingTests(unittest.TestCase):
         import json
 
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -490,7 +491,7 @@ class EarlyStoppingTests(unittest.TestCase):
             self.assertIn("monitor=selection_rank_key", console)
             self.assertNotIn("monitor=selection_score", console)
             summary = json.loads(
-                (Path(directory) / "run" / "training_summary.json").read_text(
+                (Path(result["output_dir"]) / "training_summary.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -498,7 +499,7 @@ class EarlyStoppingTests(unittest.TestCase):
 
     def test_restore_best_loads_selection_weights(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -532,16 +533,16 @@ class EarlyStoppingTests(unittest.TestCase):
             fake_metrics = [
                 {
                     "selection_score": 0.9,
-                    "global_f1_tau099": 0.9,
+                    "global_f1_at_decision_threshold": 0.9,
                     "cross_entropy": 1.0,
-                    "worst_game_f1_tau099": 0.3,
+                    "worst_game_f1_at_decision_threshold": 0.3,
                     "checkpoint_step": 20,
                 },
                 {
                     "selection_score": 0.8,
-                    "global_f1_tau099": 0.8,
+                    "global_f1_at_decision_threshold": 0.8,
                     "cross_entropy": 1.2,
-                    "worst_game_f1_tau099": 0.2,
+                    "worst_game_f1_at_decision_threshold": 0.2,
                     "checkpoint_step": 40,
                 },
             ]
@@ -558,7 +559,7 @@ class EarlyStoppingTests(unittest.TestCase):
             ):
                 result = run_training(config)
             summary = __import__("json").loads(
-                (Path(directory) / "run" / "training_summary.json").read_text(
+                (Path(result["output_dir"]) / "training_summary.json").read_text(
                     encoding="utf-8"
                 )
             )

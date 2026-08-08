@@ -16,19 +16,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from game_cls.cli import (
-    build_parser,
-    cmd_dataset_audit,
-    cmd_dataset_pack,
-    cmd_dataset_prepare,
-    main,
-)
 from game_cls.cli.dataset import (
     _maybe_prepare_split,
     _mining_rows,
     _missing_split_artifacts,
     cmd_dataset_annotate,
+    cmd_dataset_audit,
+    cmd_dataset_pack,
+    cmd_dataset_prepare,
 )
+from game_cls.cli.init import main
+from game_cls.cli.parser import build_parser
 from game_cls.data.indexing import read_frame_parquet
 from game_cls.data.splitter import load_split_manifest
 
@@ -95,7 +93,7 @@ pair:
 
 
 def _build_roots(base: Path) -> None:
-    # video ids must be unique per game (source_video_uid is
+    # video ids must be unique per game (stable_source_id is
     # label-independent), so a per-game counter spans both labels.
     train_all = base / "train_all"
     for game in ("game_a", "game_b"):
@@ -143,82 +141,12 @@ def _prepare_dataset(base: Path) -> tuple[Path, Path]:
     return config, output_dir
 
 
-class DatasetSealTests(unittest.TestCase):
-    """``dataset seal`` adopts a pre-transaction index directory (audit P0-9).
-
-    Bundles built before the transactional writer carry no commit record, so
-    the read path cannot rule out that they are a mixed generation and refuses
-    them. Rebuilding is the safe route; sealing is the explicit alternative for
-    an operator who knows the directory is one generation -- a claim the
-    framework cannot infer from files that all happen to exist.
-    """
-
-    def _seal(self, config: Path, index_dir: Path | None = None) -> int:
-        from game_cls.cli.dataset import cmd_dataset_seal
-
-        return cmd_dataset_seal(
-            argparse.Namespace(
-                config=str(config),
-                index_dir=str(index_dir) if index_dir else None,
-                overrides=[],
-            )
-        )
-
-    def _legacy(self, base: Path) -> tuple[Path, Path]:
-        """A real prepared bundle with its commit record removed."""
-        config, output_dir = _prepare_dataset(base)
-        (output_dir / "bundle_manifest.json").unlink()
-        return config, output_dir
-
-    def test_seal_adopts_a_legacy_bundle(self) -> None:
-        from game_cls.data.indexing import (
-            SplitBundleError,
-            verify_split_bundle,
-        )
-
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            config, output_dir = self._legacy(base)
-            with self.assertRaises(SplitBundleError):
-                verify_split_bundle(output_dir)
-            self.assertEqual(self._seal(config, output_dir), 0)
-            # Sealing is only worth anything if the read path now accepts it.
-            self.assertIsNotNone(verify_split_bundle(output_dir))
-
-    def test_seal_stamps_one_generation_across_both_json_artifacts(self) -> None:
-        from game_cls.data.indexing import read_bundle_manifest
-
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            config, output_dir = self._legacy(base)
-            # Leave a foreign id behind: sealing must restamp it, or the very
-            # bundle it just committed would read as a mixed generation.
-            audit_path = output_dir / "audit.json"
-            payload = json.loads(audit_path.read_text(encoding="utf-8"))
-            payload["bundle_id"] = "some-older-generation"
-            audit_path.write_text(json.dumps(payload), encoding="utf-8")
-            self.assertEqual(self._seal(config, output_dir), 0)
-            manifest = read_bundle_manifest(output_dir)
-            assert manifest is not None
-            for name in ("audit.json", "split_summary.json"):
-                stamped = json.loads((output_dir / name).read_text(encoding="utf-8"))
-                self.assertEqual(stamped["bundle_id"], manifest["bundle_id"], name)
-
-    def test_seal_refuses_an_incomplete_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            config, output_dir = self._legacy(base)
-            (output_dir / "val_frames.parquet").unlink()
-            # Sealing here would commit a bundle already known to be broken,
-            # which is worse than leaving it unsealed.
-            self.assertEqual(self._seal(config, output_dir), 2)
-            self.assertFalse((output_dir / "bundle_manifest.json").exists())
-
-    def test_seal_reports_a_missing_index_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            config, _ = self._legacy(base)
-            self.assertEqual(self._seal(config, base / "does_not_exist"), 2)
+class RemovedDatasetCommandTests(unittest.TestCase):
+    def test_removed_commands_are_not_parseable(self) -> None:
+        parser = build_parser()
+        for command in ("seal", "metadata-migrate"):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                parser.parse_args(["dataset", command])
 
 
 class DatasetCliTests(unittest.TestCase):
@@ -376,7 +304,7 @@ class DatasetCliTests(unittest.TestCase):
             self.assertEqual(manifest["width"], 448)
             self.assertEqual(manifest["height"], 208)
             self.assertEqual(manifest["channels"], 3)
-            self.assertEqual(manifest["format_version"], 4)
+            self.assertEqual(manifest["contract_version"], 5)
             self.assertTrue(manifest["source_bundle_id"])
             self.assertTrue(manifest["source_video_index_sha256"])
             packed_count = len(read_frame_parquet(output_dir / "train_frames.parquet"))
@@ -454,10 +382,9 @@ class DatasetCliTests(unittest.TestCase):
             ):
                 _maybe_prepare_split(config)
             self.assertIn("bundle_manifest.json", str(caught.exception))
-            self.assertIn("dataset seal", str(caught.exception))
+            self.assertIn("dataset prepare", str(caught.exception))
 
-    def test_a_sealed_complete_bundle_passes_straight_through(self) -> None:
-        """The sealed counterpart: no prepare, no refusal, even on 8 ranks."""
+    def test_a_published_complete_bundle_passes_straight_through(self) -> None:
         from game_cls.cli.dataset import _split_bundle_artifacts
         from game_cls.data.indexing import write_bundle_manifest
 
@@ -470,7 +397,7 @@ class DatasetCliTests(unittest.TestCase):
             index_dir = base / "indexes"
             write_bundle_manifest(
                 index_dir,
-                "sealed-generation",
+                "published-generation",
                 artifact_names=[
                     path.name
                     for path in index_dir.iterdir()
@@ -544,6 +471,32 @@ class DatasetCliTests(unittest.TestCase):
             self.assertTrue((output_dir / "audit.json").is_file())
             self.assertTrue((output_dir / "split_summary.json").is_file())
 
+    def test_main_runs_external_prepare_end_to_end(self) -> None:
+        from game_cls.data.indexing import verify_external_bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            _build_roots(base)
+            config = _write_config(base)
+            output_dir = base / "challenge_bundle"
+            code = main(
+                [
+                    "dataset",
+                    "external-prepare",
+                    "--config",
+                    str(config),
+                    "--pool",
+                    "challenge",
+                    "--root",
+                    str(base / "test"),
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+            self.assertEqual(code, 0)
+            manifest = verify_external_bundle(output_dir, pool="challenge")
+            self.assertEqual(manifest["bundle_kind"], "external")
+
 
 class DatasetAnnotateCliTests(unittest.TestCase):
     """``dataset annotate`` CLI contract: input source, dedupe, merge.
@@ -593,7 +546,7 @@ pair:
                     # The mock stands in for an indexed parquet, whose rows
                     # carry the persisted canonical uid (audit P0-5).
                     stable_source_id=uid,
-                    content_version_id=f"content-{game}-{video_id}",
+                    content_version_id="content-a",
                 )
             )
         return entries
@@ -644,7 +597,7 @@ pair:
             [
                 {
                     "stable_source_id": "game_a::01",
-                    "source_version_id": "game_a::01#v1",
+                    "source_version_id": "game_a::01#content-a",
                     "p_positive": 0.71,
                     "rank_in_video": 1,
                     "frame0_id": 3,
@@ -652,7 +605,7 @@ pair:
                 },
                 {
                     "stable_source_id": "game_a::01",
-                    "source_version_id": "game_a::01#v1",
+                    "source_version_id": "game_a::01#content-a",
                     "p_positive": 0.94,
                     "rank_in_video": 0,
                     "frame0_id": 1,
@@ -660,7 +613,7 @@ pair:
                 },
                 {
                     "stable_source_id": "game_a::01",
-                    "source_version_id": "game_a::01#v1",
+                    "source_version_id": "game_a::01#content-a",
                     "p_positive": 0.55,
                     "rank_in_video": 2,
                     "frame0_id": 7,
@@ -668,7 +621,7 @@ pair:
                 },
                 {
                     "stable_source_id": "game_a::02",
-                    "source_version_id": "game_a::02#v1",
+                    "source_version_id": "game_a::02#content-a",
                     "p_positive": 0.63,
                     "rank_in_video": 0,
                     "frame0_id": 1,
@@ -726,10 +679,26 @@ pair:
         # by uid, which would hide a regression here.
         rows = _mining_rows(
             [
-                {"stable_source_id": "game_a::01", "p_positive": 0.71},
-                {"stable_source_id": "game_a::01", "p_positive": 0.94},
-                {"stable_source_id": "game_a::01", "p_positive": 0.55},
-                {"stable_source_id": "game_a::02", "p_positive": 0.63},
+                {
+                    "stable_source_id": "game_a::01",
+                    "source_version_id": "game_a::01#content-a",
+                    "p_positive": 0.71,
+                },
+                {
+                    "stable_source_id": "game_a::01",
+                    "source_version_id": "game_a::01#content-a",
+                    "p_positive": 0.94,
+                },
+                {
+                    "stable_source_id": "game_a::01",
+                    "source_version_id": "game_a::01#content-a",
+                    "p_positive": 0.55,
+                },
+                {
+                    "stable_source_id": "game_a::02",
+                    "source_version_id": "game_a::02#content-a",
+                    "p_positive": 0.63,
+                },
             ],
             "mined_hard",
         )
@@ -757,7 +726,7 @@ pair:
             )
             self.assertEqual(code, 0)
             payload = json.loads(output)
-            # source_video_uid is the sidecar's primary key: four mined pairs
+            # stable_source_id is the sidecar's primary key: four mined pairs
             # across two videos must land as exactly two rows, and the report
             # must show the aggregation rather than claim four videos.
             self.assertEqual(payload["mining_pairs"], 4)
@@ -904,87 +873,6 @@ pair:
             # Empty CSV cells mean "not specified", not "erase this".
             self.assertEqual(row["scene_type"], "indoor")
             self.assertEqual(row["sample_weight"], 2.5)
-
-
-class MetadataMigrationCliTests(unittest.TestCase):
-    def _write_legacy(self, base: Path, *, conflicting: bool = False) -> tuple[Path, Path]:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        video_index = base / "legacy_videos.parquet"
-        video_rows = [
-            {
-                "game": "game_a",
-                "label": 0,
-                "video_id": "01",
-                "canonical_source_video_uid": "game_a::0::01#old-a",
-            }
-        ]
-        sidecar_rows = [
-            {
-                "source_video_uid": "game_a::0::01#old-a",
-                "negative_subtype": "bridge",
-            }
-        ]
-        if conflicting:
-            video_rows.append(
-                {
-                    "game": "game_a",
-                    "label": 1,
-                    "video_id": "01",
-                    "canonical_source_video_uid": "game_a::1::01#old-b",
-                }
-            )
-            sidecar_rows.append(
-                {
-                    "source_video_uid": "game_a::1::01#old-b",
-                    "negative_subtype": "floor",
-                }
-            )
-        pq.write_table(pa.Table.from_pylist(video_rows), video_index)
-        sidecar = base / "legacy_sidecar.parquet"
-        pq.write_table(pa.Table.from_pylist(sidecar_rows), sidecar)
-        return video_index, sidecar
-
-    def test_metadata_migrate_writes_authenticated_v2(self) -> None:
-        from game_cls.cli.dataset import cmd_dataset_metadata_migrate
-        from game_cls.data.sidecar import read_metadata_sidecar
-
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            video_index, sidecar = self._write_legacy(base)
-            output = base / "metadata_v2.parquet"
-            args = type(
-                "Args",
-                (),
-                {
-                    "config": "configs/recipes/example_debug.yaml",
-                    "legacy_sidecar": str(sidecar),
-                    "legacy_video_index": [f"train={video_index}"],
-                    "out": str(output),
-                },
-            )()
-            self.assertEqual(cmd_dataset_metadata_migrate(args), 0)
-            migrated = read_metadata_sidecar(output)
-            self.assertEqual(migrated["game_a::01"]["negative_subtype"], "bridge")
-
-    def test_metadata_migrate_refuses_collapsed_conflicts(self) -> None:
-        from game_cls.cli.dataset import cmd_dataset_metadata_migrate
-
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            video_index, sidecar = self._write_legacy(base, conflicting=True)
-            args = type(
-                "Args",
-                (),
-                {
-                    "config": "configs/recipes/example_debug.yaml",
-                    "legacy_sidecar": str(sidecar),
-                    "legacy_video_index": [f"train={video_index}"],
-                    "out": str(base / "metadata_v2.parquet"),
-                },
-            )()
-            self.assertEqual(cmd_dataset_metadata_migrate(args), 2)
 
 
 if __name__ == "__main__":

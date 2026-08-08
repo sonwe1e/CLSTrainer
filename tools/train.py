@@ -1,13 +1,6 @@
-"""Training entry point.
+"""Training entry point for contract 5.
 
-Thin wrapper around the cls-trainer CLI ``train`` command so existing
-script invocations keep working:
-
-    python tools/train.py --config configs/recipes/example_debug.yaml key=value ...
-
-Note: runs are unique by default now — each start allocates a fresh
-timestamped directory under ``experiment.output_dir``. Pass
-``--run-mode fixed`` to write into ``output_dir`` in place.
+python tools/train.py --config configs/recipes/example_debug.yaml key=value ...
 """
 
 from __future__ import annotations
@@ -17,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from game_cls.cli import train_command_main
+from game_cls.cli.init import train_command_main
 
 
 def main() -> None:

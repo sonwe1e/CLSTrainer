@@ -33,12 +33,16 @@ class BatchNormAndOptimizerTests(unittest.TestCase):
         self.assertTrue(model.cls[1].training)
 
     def test_bias_and_one_dimensional_parameters_have_zero_decay(self) -> None:
-        from game_cls.engine.trainer import build_optimizer_parameter_groups
-        from game_cls.model.freeze_policy import configure_trainable_parameters
+        from game_cls.engine.training.optimizer import build_optimizer_parameter_groups
+        from game_cls.model.trainable_rules import apply_trainable_state, parse_rules
 
         model = torch.nn.Module()
         model.cls = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.BatchNorm1d(4))
-        configure_trainable_parameters(model)
+        apply_trainable_state(
+            model,
+            parse_rules({"head": {"pattern": r"^cls\.", "lr_scale": 1.0}}),
+            0,
+        )
         groups = build_optimizer_parameter_groups(model, 0.01)
         by_decay = {group["weight_decay"]: group["params"] for group in groups}
         self.assertEqual(len(by_decay[0.01]), 1)
@@ -46,7 +50,7 @@ class BatchNormAndOptimizerTests(unittest.TestCase):
 
     def test_ddp_rejects_unsynchronized_cls_batchnorm_statistics(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import validate_training_config
+        from game_cls.engine.training.config_validation import validate_training_config
 
         config = load_config("configs/recipes/example_debug.yaml")
         config.setdefault("distributed", {})["enabled"] = True

@@ -17,7 +17,7 @@ except ImportError:
 class EvaluationHistoryTests(unittest.TestCase):
     def test_train_probe_and_gap_records_are_written(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -39,13 +39,14 @@ class EvaluationHistoryTests(unittest.TestCase):
                     "val_full_at_end": False,
                 }
             )
-            run_training(config)
-            history_path = Path(directory) / "run" / "metrics" / "evaluation.jsonl"
+            result = run_training(config)
+            history_path = Path(result["output_dir"]) / "metrics" / "evaluation.jsonl"
             self.assertTrue(history_path.is_file())
             history = [
                 json.loads(line)
                 for line in history_path.read_text(encoding="utf-8").splitlines()
             ]
+            self.assertTrue(all(row["contract_version"] == 5 for row in history))
             kinds = [row["kind"] for row in history]
             self.assertIn("train_probe", kinds)
             self.assertIn("val_full", kinds)
@@ -77,7 +78,7 @@ class EvaluationHistoryTests(unittest.TestCase):
 
     def test_interval_metrics_are_sample_weighted(self) -> None:
         from game_cls.config import load_config
-        from game_cls.engine.trainer import run_training
+        from game_cls.engine.training.loop import run_training
 
         with tempfile.TemporaryDirectory() as directory:
             config = load_config("configs/recipes/example_debug.yaml")
@@ -98,23 +99,25 @@ class EvaluationHistoryTests(unittest.TestCase):
                     "val_full_at_end": False,
                 }
             )
-            run_training(config)
+            result = run_training(config)
+            run_dir = Path(result["output_dir"])
             rows = [
                 json.loads(line)
-                for line in (Path(directory) / "run" / "train_metrics.jsonl")
+                for line in (run_dir / "train_metrics.jsonl")
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
             self.assertEqual(len(rows), 2)
             for row in rows:
+                self.assertEqual(row["contract_version"], 5)
                 for key in (
                     "interval_loss",
                     "interval_ce",
                     "interval_threshold_loss",
                     "interval_threshold_weight",
                     "interval_accuracy",
-                    "interval_positive_recall_tau099",
-                    "interval_negative_specificity_tau099",
+                    "interval_positive_recall_at_decision_threshold",
+                    "interval_negative_specificity_at_decision_threshold",
                     "interval_samples",
                 ):
                     self.assertIn(key, row)

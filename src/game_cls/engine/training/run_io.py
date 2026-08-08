@@ -6,6 +6,7 @@ import shutil
 import time
 from pathlib import Path
 
+from game_cls.contract import stamp_payload
 from game_cls.engine.checkpoint import (
     clone_checkpoint_pair,
     remove_checkpoint_pair,
@@ -28,7 +29,7 @@ from game_cls.runs import (
 )
 
 # ``topk_monitor`` values that mean "rank by the selection contract".
-_SELECTION_TOPK_MONITORS = frozenset({"selection_score", "selection"})
+_SELECTION_TOPK_MONITORS = frozenset({"selection_score"})
 
 
 def acquire_resume_lock(run_dir: Path) -> Path:
@@ -41,9 +42,7 @@ def acquire_resume_lock(run_dir: Path) -> Path:
     """
     lock_path = run_dir / ".resume.lock"
     try:
-        descriptor = os.open(
-            lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        )
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         raise RuntimeError(
             f"Run {run_dir} is already being resumed (lock {lock_path} exists); "
@@ -54,18 +53,12 @@ def acquire_resume_lock(run_dir: Path) -> Path:
 
 
 def _topk_entry_sort_value(entry: dict, *, lower_better: bool) -> list[float]:
-    """Sort key of an existing registry entry, best-first when descending.
-
-    Entries written by the current code carry ``sort_value``. Entries restored
-    from a checkpoint written before that only have the scalar ``value``, so
-    it is lifted into the same shape (negated for lower-is-better monitors,
-    which the rank key never needs because it always maximizes).
-    """
+    """Return the required contract-5 registry sort key."""
+    del lower_better
     sort_value = entry.get("sort_value")
-    if isinstance(sort_value, (list, tuple)):
-        return [float(component) for component in sort_value]
-    value = float(entry.get("value") or 0.0)
-    return [-value] if lower_better else [value]
+    if not isinstance(sort_value, list) or not sort_value:
+        raise ValueError("Top-K registry entry requires a non-empty sort_value list.")
+    return [float(component) for component in sort_value]
 
 
 def _maybe_save_topk(
@@ -192,7 +185,6 @@ def _write_run_manifest(
     config: dict,
     run_meta: dict | None,
     run_id: str | None,
-    run_mode: str,
     world_size: int,
 ) -> str | None:
     """Create or preserve the run's immutable manifest.
@@ -206,9 +198,10 @@ def _write_run_manifest(
     if existing is not None:
         return existing.get("run_id")
     meta = run_meta or {}
+    from game_cls.data.identity import compute_dataset_identity
+
     manifest = {
         "run_id": run_id,
-        "run_mode": run_mode,
         "run_name": config["experiment"].get("name"),
         "created": _iso_now(),
         "command": meta.get("command"),
@@ -224,6 +217,7 @@ def _write_run_manifest(
         "base_checkpoint": config["model"].get("checkpoint_path"),
         "base_checkpoint_sha256": meta.get("base_checkpoint_sha256"),
         "environment": meta.get("environment"),
+        "dataset_identity": compute_dataset_identity(config, verify_content=True),
     }
     write_manifest(output_dir, manifest)
     return run_id
@@ -259,7 +253,6 @@ def _record_run_failure(
     *,
     global_step: int,
     run_id: str | None,
-    run_mode: str,
     runs_root: Path,
     config: dict,
     started_wall: float,
@@ -302,7 +295,6 @@ def _finalize_run_success(
     output_dir: Path,
     config: dict,
     run_id: str | None,
-    run_mode: str,
     runs_root: Path,
     summary_payload: dict,
     global_step: int,
@@ -352,7 +344,7 @@ def _finalize_run_success(
         (output_dir / "overview.html").write_text(overview_html, encoding="utf-8")
     except OSError:
         pass
-    if run_mode == "unique" or run_id is not None:
+    if run_id is not None:
         selection = _run_index_selection(best_metrics, config.get("evaluation") or {})
         append_run_index(
             runs_root,
@@ -412,7 +404,11 @@ _EVALUATION_SCOPES: dict[str, str] = {
 
 def _append_jsonl(path: Path, payload: dict) -> None:
     with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        stream.write(
+            json.dumps(
+                stamp_payload(payload), ensure_ascii=False, separators=(",", ":")
+            )
+        )
         stream.write("\n")
 
 
@@ -449,9 +445,6 @@ def _evaluation_history_record(
         "worst_game_f1_at_decision_threshold": metrics.get(
             "worst_game_f1_at_decision_threshold"
         ),
-        "global_f1_tau099": metrics.get("global_f1_tau099"),
-        "macro_game_f1_tau099": metrics.get("macro_game_f1_tau099"),
-        "worst_game_f1_tau099": metrics.get("worst_game_f1_tau099"),
         "selection_score": metrics.get("selection_score"),
         "positive_margin_pass_rate": metrics.get("positive_margin_pass_rate"),
         "negative_margin_pass_rate": metrics.get("negative_margin_pass_rate"),

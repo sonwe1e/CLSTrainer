@@ -100,7 +100,7 @@ class EvaluationContractTests(unittest.TestCase):
         self.assertEqual(result.grouped_metrics, fallback.grouped_metrics)
 
     def test_composite_selection_and_worst_game_floor(self) -> None:
-        from game_cls.engine.trainer import (
+        from game_cls.engine.training.selection import (
             _annotate_selection,
             _is_better_model,
         )
@@ -115,14 +115,14 @@ class EvaluationContractTests(unittest.TestCase):
             "minimum_worst_game_f1": 0.5,
         }
         candidate = {
-            "global_f1_tau099": 0.9,
-            "macro_game_f1_tau099": 0.8,
-            "worst_game_f1_tau099": 0.6,
+            "global_f1_at_decision_threshold": 0.9,
+            "macro_game_f1_at_decision_threshold": 0.8,
+            "worst_game_f1_at_decision_threshold": 0.6,
         }
         annotated = _annotate_selection(candidate, config)
         self.assertAlmostEqual(annotated["selection_score"], 0.8)
         self.assertTrue(annotated["selection_eligible"])
-        rejected = dict(candidate, worst_game_f1_tau099=0.4)
+        rejected = dict(candidate, worst_game_f1_at_decision_threshold=0.4)
         self.assertFalse(_is_better_model(rejected, {}, config))
 
 

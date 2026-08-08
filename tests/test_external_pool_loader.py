@@ -10,6 +10,8 @@ constructor's behaviour on all three, plus the single-process CLI guard.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +30,8 @@ WIDTH, HEIGHT = 448, 208
 
 def _write_pool(root: Path) -> tuple[Path, dict[int, Path]]:
     """Write a tiny PNG pool: 2 videos (one per label), 4 frames each."""
+    from game_cls.contract import stamp_parquet_table
+
     rows = []
     directories: dict[int, Path] = {}
     for label in (0, 1):
@@ -46,17 +50,27 @@ def _write_pool(root: Path) -> tuple[Path, dict[int, Path]]:
                     "label": label,
                     "video_id": video_id,
                     "frame_id": frame_id,
+                    "content_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 }
             )
     frame_index = root / "frames.parquet"
-    pq.write_table(pa.Table.from_pylist(rows), frame_index)
+    pq.write_table(stamp_parquet_table(pa.Table.from_pylist(rows)), frame_index)
     return frame_index, directories
 
 
-def _video_index(pool: tuple[Path, dict[int, Path]], destination: Path) -> Path:
-    from game_cls.data.video_index import VideoEntry, write_video_entries_parquet
+def _video_index(
+    pool: tuple[Path, dict[int, Path]], destination: Path, *, role: str = "mining"
+) -> Path:
+    from game_cls.contract import stamp_payload
+    from game_cls.data.indexing import write_bundle_manifest
+    from game_cls.data.video_index import (
+        VideoEntry,
+        video_content_id,
+        write_video_entries_parquet,
+    )
 
-    _, directories = pool
+    frame_index, directories = pool
+    rows = pq.read_table(frame_index).to_pylist()
     entries = [
         VideoEntry(
             game="game_a",
@@ -66,11 +80,43 @@ def _video_index(pool: tuple[Path, dict[int, Path]], destination: Path) -> Path:
             valid_start_positions={2: np.asarray([0, 1], dtype=np.int32)},
             video_directory=str(directories[label]),
             stable_source_id=f"game_a::{label}::0{label + 1}",
-            content_version_id=f"content-{label}",
+            content_version_id=video_content_id(
+                4,
+                [
+                    f"{label}:{int(row['frame_id'])}:{row['content_sha256']}"
+                    for row in rows
+                    if int(row["label"]) == label
+                ],
+            )
+            or "",
         )
         for label in (0, 1)
     ]
+    destination = frame_index.with_name("video_entries.parquet")
     write_video_entries_parquet(entries, destination)
+    bundle_id = "external-bundle-a"
+    for name, payload in (
+        ("audit.json", {"bundle_id": bundle_id, "pool": role}),
+        (
+            "external_summary.json",
+            {"bundle_id": bundle_id, "bundle_kind": "external", "pool": role},
+        ),
+    ):
+        (frame_index.parent / name).write_text(
+            json.dumps(stamp_payload(payload)), encoding="utf-8"
+        )
+    write_bundle_manifest(
+        frame_index.parent,
+        bundle_id,
+        artifact_names=(
+            "frames.parquet",
+            "video_entries.parquet",
+            "audit.json",
+            "external_summary.json",
+        ),
+        bundle_kind="external",
+        pool=role,
+    )
     return destination
 
 
@@ -109,23 +155,18 @@ class ExternalPoolLoaderTests(unittest.TestCase):
             root = Path(directory)
             pool = _write_pool(root)
             frame_index, _ = pool
-            source_video_index = _video_index(pool, root / "source_videos.parquet")
-            audit = root / "audit.json"
-            split_manifest = root / "split_manifest.parquet"
-            audit.write_text("{}", encoding="utf-8")
-            split_manifest.write_bytes(b"split")
-            (root / "bundle_manifest.json").write_text(
-                '{"bundle_id":"bundle-v1"}', encoding="utf-8"
+            source_video_index = _video_index(
+                pool, root / "source_videos.parquet", role="mining"
             )
+            audit = root / "audit.json"
             packed_index = pack_frame_index(
                 frame_index,
                 root / "packed",
                 image_spec=ImageSpec(width=WIDTH, height=HEIGHT, channels=3),
                 images_per_shard=3,
                 source_video_index=source_video_index,
-                source_bundle_id="bundle-v1",
+                source_bundle_id="external-bundle-a",
                 audit_path=audit,
-                split_manifest_path=split_manifest,
             )
             config = _base_config(root)
             config["data"]["backend"] = "packed_uint8"
@@ -154,20 +195,26 @@ class ExternalPoolLoaderTests(unittest.TestCase):
             # Windows keeps the memmapped shards locked until they close.
             loader.dataset.decoder.close()
 
-    def test_packed_backend_without_shard_index_is_rejected(self) -> None:
+    def test_training_backend_does_not_force_external_pool_backend(self) -> None:
         from game_cls.engine.training.loaders import build_external_pool_loader
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            index = _video_index(_write_pool(root), root / "pool_videos.parquet")
+            pool = _write_pool(root)
+            index = _video_index(pool, root / "pool_videos.parquet", role="mining")
             config = _base_config(root)
             config["data"]["backend"] = "packed_uint8"
-            config["data"]["mining"]["pool_video_index"] = str(index)
+            config["data"]["mining"].update(
+                {
+                    "pool_index": str(pool[0]),
+                    "pool_video_index": str(index),
+                }
+            )
 
-            # Falling back to the PNG decoder on packed shards would produce
-            # garbage pixels, so this must fail loudly instead.
-            with self.assertRaisesRegex(ValueError, "pool_packed_index"):
-                build_external_pool_loader(config, pool="mining")
+            loader, _ = build_external_pool_loader(config, pool="mining")
+            from game_cls.data.packed_backend import PackedUint8Backend
+
+            self.assertNotIsInstance(loader.dataset.decoder, PackedUint8Backend)
 
     def test_missing_video_index_is_rejected(self) -> None:
         from game_cls.engine.training.loaders import build_external_pool_loader
@@ -192,9 +239,12 @@ class ExternalPoolLoaderTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            index = _video_index(_write_pool(root), root / "challenge_videos.parquet")
+            index = _video_index(
+                _write_pool(root), root / "challenge_videos.parquet", role="challenge"
+            )
             config = _base_config(root)
             config["data"]["backend"] = "png"
+            config["data"]["challenge_index"] = str(root / "frames.parquet")
             config["data"]["challenge_video_index"] = str(index)
 
             loader, videos = build_external_pool_loader(config, pool="challenge")
@@ -213,8 +263,11 @@ class ExternalPoolLoaderTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            index = _video_index(_write_pool(root), root / "pool_videos.parquet")
+            index = _video_index(
+                _write_pool(root), root / "pool_videos.parquet", role="mining"
+            )
             config = _base_config(root)
+            config["data"]["mining"]["pool_index"] = str(root / "frames.parquet")
             config["data"]["mining"]["pool_video_index"] = str(index)
 
             whole, _ = build_external_pool_loader(config, pool="mining")

@@ -12,10 +12,7 @@ Workflows:
     cls-trainer run show latest|<run_dir>
     cls-trainer doctor --config ...
 
-Every ``train`` start defaults to ``--run-mode unique``: the configured
-``experiment.output_dir`` is treated as a runs root and a fresh timestamped
-run directory is allocated, so re-running a command can never overwrite a
-previous run. ``--run-mode fixed`` restores the legacy in-place behavior.
+Every fresh training start creates an immutable timestamped run directory.
 """
 
 from __future__ import annotations
@@ -38,10 +35,9 @@ from game_cls.cli.config_tools import (
 from game_cls.cli.dataset import (
     cmd_dataset_annotate,
     cmd_dataset_audit,
-    cmd_dataset_metadata_migrate,
+    cmd_dataset_external_prepare,
     cmd_dataset_pack,
     cmd_dataset_prepare,
-    cmd_dataset_seal,
 )
 from game_cls.cli.doctor import cmd_doctor
 from game_cls.cli.evaluate import cmd_evaluate
@@ -61,6 +57,9 @@ from game_cls.cli.train import cmd_train
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from game_cls import __version__
+    from game_cls.contract import CONTRACT_VERSION
+
     parser = argparse.ArgumentParser(
         prog="cls-trainer",
         description="Dual-frame multi-game binary classification trainer.",
@@ -76,25 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
         "resolved_config.json).",
     )
     train.add_argument(
-        "--run-mode",
-        choices=("unique", "fixed"),
-        default="unique",
-        help=(
-            "unique (default): allocate an immutable timestamped run dir "
-            "under experiment.output_dir. fixed: write into output_dir in "
-            "place (legacy)."
-        ),
-    )
-    train.add_argument(
         "--resume",
         metavar="RUN_DIR",
-        help="Continue an existing run directory (implies fixed mode).",
+        help="Continue an existing immutable run directory.",
     )
     train.add_argument(
         "--fork",
         metavar="RUN",
         help="Start a new run derived from an existing run's config "
-        "(records parent lineage; implies unique mode).",
+        "(records parent lineage).",
     )
     train.add_argument(
         "--runs-root",
@@ -266,6 +255,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare.add_argument("overrides", nargs="*", metavar="key=value")
     prepare.set_defaults(func=cmd_dataset_prepare)
+    external_prepare = dataset_sub.add_parser(
+        "external-prepare",
+        help="Build a published, identity-bearing challenge or mining bundle.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"CLSTrainer {__version__} (contract {CONTRACT_VERSION})",
+    )
+    external_prepare.add_argument("--config", required=True)
+    external_prepare.add_argument(
+        "--pool", choices=("challenge", "mining"), required=True
+    )
+    external_prepare.add_argument("--root", required=True)
+    external_prepare.add_argument("--output-dir", required=True)
+    external_prepare.add_argument("overrides", nargs="*", metavar="key=value")
+    external_prepare.set_defaults(func=cmd_dataset_external_prepare)
     audit = dataset_sub.add_parser("audit", help="Validate an index audit report.")
     audit.add_argument("--config", required=True)
     audit.add_argument("--index-dir", default="indexes")
@@ -276,19 +282,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit.add_argument("overrides", nargs="*", metavar="key=value")
     audit.set_defaults(func=cmd_dataset_audit)
-    seal = dataset_sub.add_parser(
-        "seal",
-        help="Adopt an existing index directory as one bundle generation "
-        "(writes bundle_manifest.json).",
-    )
-    seal.add_argument("--config", required=True)
-    seal.add_argument(
-        "--index-dir",
-        default=None,
-        help="Index directory to seal (default: the parent of data.train_index).",
-    )
-    seal.add_argument("overrides", nargs="*", metavar="key=value")
-    seal.set_defaults(func=cmd_dataset_seal)
     pack = dataset_sub.add_parser(
         "pack", help="Pack decoded CHW uint8 frames into memmapped shards."
     )
@@ -328,10 +321,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output sidecar parquet path (default: data.metadata_sidecar).",
     )
-    annotate.add_argument(
+    subtype_action = annotate.add_mutually_exclusive_group()
+    subtype_action.add_argument(
         "--subtype",
         default=None,
         help="negative_subtype assigned to mined videos (requires --from-mining).",
+    )
+    subtype_action.add_argument(
+        "--clear-subtype",
+        action="store_true",
+        help="Explicitly clear negative_subtype on imported rows.",
     )
     annotate.add_argument(
         "--on-subtype-conflict",
@@ -343,22 +342,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     annotate.add_argument("overrides", nargs="*", metavar="key=value")
     annotate.set_defaults(func=cmd_dataset_annotate)
-    migrate = dataset_sub.add_parser(
-        "metadata-migrate",
-        help="Convert a legacy source_video_uid sidecar to stable-id schema v2.",
-    )
-    migrate.add_argument("--config", required=True)
-    migrate.add_argument("--legacy-sidecar", required=True)
-    migrate.add_argument(
-        "--legacy-video-index",
-        action="append",
-        required=True,
-        metavar="SPLIT=PATH",
-        help="Legacy video index and its split; repeat for train/val/test.",
-    )
-    migrate.add_argument("--out", required=True)
-    migrate.set_defaults(func=cmd_dataset_metadata_migrate)
-
     export = subparsers.add_parser(
         "export",
         help="Export a checkpoint as a deployment artifact (weights|onnx).",

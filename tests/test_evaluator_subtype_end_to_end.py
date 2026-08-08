@@ -118,6 +118,18 @@ class _Loader:
 
 @unittest.skipIf(torch is None, "torch is not installed")
 class EvaluatorSubtypeReductionTests(unittest.TestCase):
+    def test_production_collate_preserves_subtype_ids(self) -> None:
+        from game_cls.data.collate import pair_collate
+
+        sample = {
+            "images": torch.zeros((2, 3, 2, 2), dtype=torch.uint8),
+            "label": 0,
+            "meta": {},
+            "game_label_subtype_id": 7,
+        }
+        batch = pair_collate([sample, dict(sample, game_label_subtype_id=9)])
+        self.assertEqual(batch["game_label_subtype_id"].tolist(), [7, 9])
+
     def _evaluate(self, catalogs: dict | None):
         from game_cls.engine.evaluator import evaluate
 
