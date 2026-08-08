@@ -186,7 +186,7 @@ Mixed-label examples:
 
 源身份由可选配置 `data.source_video_identity.mode` 显式建模：
 
-| 模式 | 源身份 `source_video_uid` | 适用场景 |
+| 模式 | 稳定身份 `stable_source_id` | 适用场景 |
 | --- | --- | --- |
 | `game_video`（默认） | `game::video_id` | 一个源视频同时含两个 label 的帧；整个视频是一个原子单位，防泄漏最保守 |
 | `game_label_video` | `game::label::video_id` | 0/01 与 1/01 是物理上无关的两个独立视频、只是各自从 01 编号 |
@@ -226,9 +226,9 @@ data:
 
 - `train` 与 `val` 必须共享同一 namespace（它们来自同一个物理池，自动划分）。
 - `test` 必须存在且与 train 侧不同，否则配置校验直接报错。
-- 不配置 `namespaces` 时行为与旧版完全一致（字节级不变）。
-- namespace 只作用于 audit 的跨 split 身份比较；split manifest、dataset 指纹、
-  逐 split parquet 的 uid、metadata sidecar key 均不受影响。三 root
+- 不配置 `namespaces` 时稳定身份不带来源池前缀。
+- namespace 同时进入 audit 和 video-index 的 `stable_source_id`，确保独立来源池的
+  metadata 不会串联；内容变化只更新 `content_version_id`，人工标注仍按稳定身份延续。三 root
   （`split.mode=off`）下 `train`/`val` 也必须共享 namespace；同 namespace 内
   train/val 的真重叠仍被强制判定为泄漏。
 - SHA-256 内容层对 namespace **不可见**：即使声明了不同 namespace，任何跨 split
@@ -287,6 +287,15 @@ cls-trainer dataset annotate \
   --from-mining indexes/hard_negatives.parquet \
   --subtype wooden_bridge
 
+# 从旧 source_video_uid sidecar 一次性迁移到 v2：
+cls-trainer dataset metadata-migrate \
+  --config configs/recipes/game_cls_production.yaml \
+  --legacy-sidecar indexes/video_metadata_v1.parquet \
+  --legacy-video-index train=indexes_v1/train_video_entries.parquet \
+  --legacy-video-index val=indexes_v1/val_video_entries.parquet \
+  --legacy-video-index test=indexes_v1/test_video_entries.parquet \
+  --out indexes/video_metadata.parquet
+
 # 在固定 challenge 集上做不可漂移的验收基准：
 cls-trainer benchmark evaluate --run <RUN_ID> --checkpoint best_selection
 ```
@@ -294,21 +303,25 @@ cls-trainer benchmark evaluate --run <RUN_ID> --checkpoint best_selection
 #### 导出与 Release Gate
 
 ```bash
-# 导出 TorchScript 权重（含 input shape / 阈值 manifest）：
+# 导出权重（要求当前完整 release identity 已获得 PASS）：
 cls-trainer export --format weights --run <RUN_ID> --checkpoint best_selection \
-  --out exports/model.pt
+  --out exports
 
 # 导出 ONNX：
 cls-trainer export --format onnx --run <RUN_ID> --checkpoint best_selection \
-  --out exports/model.onnx
+  --out exports
 
-# Release gate：校验指标是否满足 gate_metrics 阈值，不满足则以非零退出码拦截：
-cls-trainer benchmark gate-check --run <RUN_ID> \
+# 唯一可用于部署门禁的 release 检查：
+cls-trainer release check --run <RUN_ID> --checkpoint best_selection \
   --config configs/recipes/game_cls_release.yaml
+
+# 只读展示历史报告（不提供部署门禁语义）：
+cls-trainer benchmark gate-show --run <RUN_ID>
 ```
 
-导出 manifest（`export_manifest.json`）包含 `decision_threshold`、`input_shape`、
-`selection_mode`、`selection_eligible` 等字段，供部署侧消费。
+导出 manifest（`export_manifest.json`）包含完整 release identity、精确 benchmark
+报告路径、决策阈值和 input shape。项目不再生成 `benchmark_gate.json`，也不存在
+跳过 release gate 的导出参数。
 
 #### 恢复与派生
 
@@ -375,7 +388,7 @@ bash scripts/smoke_npu_8p.sh
   `lr_scale`，rule fingerprint 防止 resume 谱系污染。
 
 - 📦 **导出 & Release Gate** — TorchScript / ONNX 导出 + 部署 manifest，
-  `benchmark gate-check` 自动拦截未达业务指标的候选模型。
+  `release check` 以 checkpoint/config/challenge/gate 的完整 identity 拦截候选模型。
 
 ---
 

@@ -277,7 +277,7 @@ SCHEMA: dict[str, Any] = {
         },
         "metadata_sidecar": _k(
             "str",
-            "Optional per-video metadata parquet keyed by source_video_uid "
+            "Optional authenticated v2 metadata parquet keyed by stable_source_id "
             "(negative_subtype, sample_weight). Joined AFTER the split; "
             "never part of split/dedup identity (step5 P2).",
             nullable=True,
@@ -1323,7 +1323,7 @@ _DEFAULT_MINING: dict[str, Any] = {
     "top_k_per_video": 8,
     "max_samples": None,
     "score_threshold": None,
-    "version": 1,
+    "version": 2,
 }
 
 

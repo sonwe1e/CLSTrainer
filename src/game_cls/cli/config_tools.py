@@ -196,7 +196,7 @@ def _newest_benchmark_report(output_dir: Path) -> Path | None:
     if not output_dir.is_dir():
         return None
     reports = sorted(
-        output_dir.glob("*/report.json"),
+        output_dir.rglob("report.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -398,11 +398,7 @@ def cmd_release_check(args: argparse.Namespace) -> int:
     any other artifact -- the acceptance "#5" gate for release/export.
     """
     from game_cls.cli.common import _resolve_run_dir
-    from game_cls.reports.benchmark import (
-        check_gates,
-        file_sha256,
-        validate_gate_metrics,
-    )
+    from game_cls.release import ReleaseVerificationError, verify_release_artifact
 
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root or "runs"))
     if not run_dir.is_dir():
@@ -419,70 +415,17 @@ def cmd_release_check(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
 
     config = load_config(config_source)
-    benchmark_cfg = config.get("benchmark") or {}
-    gate_metrics = benchmark_cfg.get("gate_metrics") or {}
-    problems = list(validate_gate_metrics(gate_metrics))
-    if problems:
-        for problem in problems:
-            print(f"Config error: {problem}", file=sys.stderr)
-        return 2
-    checkpoint_path = _resolve_checkpoint_path(run_dir, args.checkpoint)
-    if checkpoint_path is None:
-        print(
-            f"Checkpoint '{args.checkpoint}' not found under "
-            f"{run_dir / 'checkpoints'}.",
-            file=sys.stderr,
-        )
-        return 2
-    checkpoint_sha = file_sha256(checkpoint_path)
-    report = _find_report_for_checkpoint(
-        Path(benchmark_cfg.get("output_dir", "benchmarks")),
-        checkpoint_sha=checkpoint_sha,
-        run_id=run_dir.name,
-        checkpoint_alias=args.checkpoint,
-    )
-    if report is None:
-        print(
-            f"Release check FAILED: no benchmark PASS is bound to checkpoint "
-            f"sha256={checkpoint_sha} ({checkpoint_path}). Run "
-            "'cls-trainer benchmark evaluate' against this exact checkpoint "
-            "before releasing it.",
-            file=sys.stderr,
-        )
-        return 2
-    # Audit P0-2: a matching checkpoint hash is NOT a release identity. FPR,
-    # recall and selection eligibility are functions of model + threshold +
-    # dataset + preprocessing, so a PASS earned under a different config,
-    # challenge set or gate contract must never be borrowed -- even when the
-    # weights are byte-identical.
-    identity = _release_identity_mismatches(
-        report,
-        run_id=run_dir.name,
-        config=config,
-        gate_metrics=gate_metrics,
-    )
-    if identity:
-        print("Release check FAILED: release identity mismatch:", file=sys.stderr)
-        for problem in identity:
-            print(f"  - {problem}", file=sys.stderr)
-        print(
-            "The benchmark PASS was earned by a different release identity. "
-            "Re-run 'cls-trainer benchmark evaluate' under this exact "
-            "config/challenge/gate contract.",
-            file=sys.stderr,
-        )
-        return 2
-    verdict = _verify_report_against_gates(report, gate_metrics, check_gates)
-    if verdict:
-        print("Release check FAILED:", file=sys.stderr)
-        for problem in verdict:
-            print(f"  - {problem}", file=sys.stderr)
+    try:
+        verified = verify_release_artifact(run_dir, args.checkpoint, config)
+    except ReleaseVerificationError as exc:
+        print(f"Release check FAILED: {exc}", file=sys.stderr)
         return 2
     print("  release check    : PASS")
-    print(f"  run_id           : {run_dir.name}")
-    print(f"  checkpoint       : {checkpoint_path}")
-    print(f"  checkpoint sha256: {checkpoint_sha}")
-    print(f"  benchmark report : {report}")
+    print(f"  run_id           : {verified.run_id}")
+    print(f"  checkpoint       : {verified.checkpoint_path}")
+    print(f"  checkpoint sha256: {verified.checkpoint_sha256}")
+    print(f"  release identity : {verified.release_identity_sha256}")
+    print(f"  benchmark report : {verified.report_path}")
     return 0
 
 

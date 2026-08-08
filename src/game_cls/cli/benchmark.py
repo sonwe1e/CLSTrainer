@@ -10,7 +10,6 @@ nor feeds model selection.
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import sys
 from pathlib import Path
@@ -88,7 +87,7 @@ def cmd_benchmark_scan_negatives(args: argparse.Namespace) -> int:
     pool_packed_index = mining.get("pool_packed_index")
     pool_packed_video_index = mining.get("pool_packed_video_index")
     pool_metadata = mining.get("pool_metadata")
-    mining_version = int(mining.get("version", 1))
+    mining_version = int(mining.get("version", 2))
     mining_enabled = bool(mining.get("enabled", False))
     has_plain_pool = bool(pool_index and pool_video_index)
     has_packed_pool = bool(pool_packed_index and pool_packed_video_index)
@@ -364,38 +363,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
 
         checkpoint_sha256 = file_sha256(checkpoint_path)
         gate_spec_hash = gate_spec_fingerprint(gate_metrics)
-        # Persist the gate verdict to run_dir so export and CI can read it
-        # without re-running evaluation.
         all_passed = all(passed for _, passed, _ in gates)
-        gate_report = {
-            "passed": all_passed,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-            "run_id": run_dir.name,
-            "checkpoint": args.checkpoint,
-            "checkpoint_sha256": checkpoint_sha256,
-            "resolved_config_sha256": resolved_config_sha256,
-            "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
-            "challenge_bundle_components": challenge_components,
-            "gate_spec_fingerprint": gate_spec_hash,
-            "gate_metrics": gate_metrics,
-            "actual_metrics": {
-                name: metrics.get(str(name)) for name in gate_metrics
-            },
-            "violations": [
-                {"metric": name, "detail": detail}
-                for name, passed, detail in gates
-                if not passed
-            ],
-        }
-        gate_report_path = run_dir / "benchmark_gate.json"
-        gate_report_path.write_text(
-            json.dumps(gate_report, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(
-            f"gate: {'PASSED' if all_passed else 'FAILED'} — {gate_report_path}",
-            file=sys.stderr,
-        )
         report_path = write_benchmark_report(
             Path(config["benchmark"].get("output_dir", "benchmarks")),
             run_id=run_dir.name,
@@ -409,6 +377,10 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             challenge_dataset_fingerprint=challenge_dataset_fingerprint,
             challenge_bundle_components=challenge_components,
             gate_spec_fingerprint=gate_spec_hash,
+        )
+        print(
+            f"gate: {'PASSED' if all_passed else 'FAILED'} — {report_path}",
+            file=sys.stderr,
         )
         print(f"challenge_metadata: {challenge_metadata}", file=sys.stderr)
         unmet = [name for name, passed, _ in gates if not passed]
@@ -439,43 +411,39 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         cleanup_distributed()
 
 
-def cmd_benchmark_gate_check(args: argparse.Namespace) -> int:
-    """Check a persisted gate report without re-running evaluation.
-
-    Exits 0 when the stored gate passed, 1 when it failed, 2 when the
-    file is missing or malformed.  Lets CI pipeline scripts gate a
-    deployment on a previously-measured benchmark result without paying
-    the cost of a full evaluation pass.
-    """
+def cmd_benchmark_gate_show(args: argparse.Namespace) -> int:
+    """Display immutable benchmark history without acting as a release gate."""
     run_dir = _resolve_run_dir(args.run, Path(args.runs_root))
-    gate_report_path = run_dir / "benchmark_gate.json"
-    if not gate_report_path.is_file():
+    config_path = run_dir / "resolved_config.json"
+    if not config_path.is_file():
         print(
-            f"No gate report found at {gate_report_path}. "
-            "Run 'cls-trainer benchmark evaluate' first.",
+            f"No resolved config found at {config_path}.",
             file=sys.stderr,
         )
         return 2
     try:
-        gate_data = json.loads(gate_report_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        print(
-            f"Failed to read gate report {gate_report_path}: {exc}",
-            file=sys.stderr,
-        )
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
         return 2
-    passed = bool(gate_data.get("passed", False))
-    print(
-        json.dumps(
+    output_dir = Path((config.get("benchmark") or {}).get("output_dir", "benchmarks"))
+    reports = []
+    for path in output_dir.rglob("report.json") if output_dir.is_dir() else ():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if payload.get("run_id") != run_dir.name:
+            continue
+        gates = payload.get("gates") or []
+        reports.append(
             {
-                "passed": passed,
-                "run_id": gate_data.get("run_id"),
-                "checkpoint": gate_data.get("checkpoint"),
-                "timestamp": gate_data.get("timestamp"),
-                "violations": gate_data.get("violations", []),
-            },
-            ensure_ascii=False,
-            indent=2,
+                "report": str(path),
+                "checkpoint": payload.get("checkpoint"),
+                "checkpoint_sha256": payload.get("checkpoint_sha256"),
+                "release_identity_sha256": payload.get("release_identity_sha256"),
+                "passed": bool(gates)
+                and all(bool(gate.get("passed")) for gate in gates),
+            }
         )
-    )
-    return 0 if passed else 1
+    print(json.dumps({"run_id": run_dir.name, "reports": reports}, indent=2))
+    return 0

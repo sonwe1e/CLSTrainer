@@ -63,8 +63,8 @@ def _frames(
     ]
 
 
-class CanonicalContentAnchoredIdentityTests(unittest.TestCase):
-    """Audit P0-5: the persisted canonical uid is content-anchored.
+class StableAndContentVersionIdentityTests(unittest.TestCase):
+    """Stable physical identity is independent from the content version.
 
     The source identity namespaces are audit-boundary-only, so coincidentally
     equal train/test local numbering must never collapse at the metadata layer.
@@ -99,24 +99,23 @@ class CanonicalContentAnchoredIdentityTests(unittest.TestCase):
         test_pool = self._content_frames("MC", 0, "01", ("d", "e", "f"))
         train_video = build_video_entries(train_pool)[0]
         test_video = build_video_entries(test_pool)[0]
-        # Same (game, label, video_id), different pixels -> distinct uids.
-        self.assertNotEqual(train_video.source_video_uid, test_video.source_video_uid)
-        # The name part stays namespace-free and the label is always present.
-        for video in (train_video, test_video):
-            self.assertTrue(video.source_video_uid.startswith("MC::0::01#"))
-        self.assertEqual(train_video.source_video_uid.count("#"), 1)
+        self.assertEqual(train_video.stable_source_id, test_video.stable_source_id)
+        self.assertNotEqual(
+            train_video.content_version_id, test_video.content_version_id
+        )
+        self.assertNotEqual(train_video.source_version_id, test_video.source_version_id)
 
     def test_content_id_is_deterministic(self) -> None:
         from game_cls.data.video_index import build_video_entries
 
         frames = self._content_frames("MC", 0, "01", ("a", "b", "c"))
-        first = build_video_entries(frames)[0].source_video_uid
-        second = build_video_entries(frames)[0].source_video_uid
+        first = build_video_entries(frames)[0].source_version_id
+        second = build_video_entries(frames)[0].source_version_id
         self.assertEqual(first, second)
         # Identical content in both pools is the SAME video: uid must collide
         # so the strict audit's SHA-256 layer can catch a real leak.
         same = build_video_entries(self._content_frames("MC", 0, "01", ("a", "b", "c")))
-        self.assertEqual(same[0].source_video_uid, first)
+        self.assertEqual(same[0].source_version_id, first)
 
     def test_sidecar_join_never_bleeds_across_pools(self) -> None:
         from game_cls.data.sidecar import apply_sidecar
@@ -124,24 +123,21 @@ class CanonicalContentAnchoredIdentityTests(unittest.TestCase):
 
         train_pool = self._content_frames("MC", 0, "01", ("a", "b", "c"))
         test_pool = self._content_frames("MC", 0, "01", ("d", "e", "f"))
-        train_video = build_video_entries(train_pool)[0]
-        test_video = build_video_entries(test_pool)[0]
-        # Sidecar keyed by the train pool's canonical uid only.
+        train_video = build_video_entries(train_pool, namespace="train_pool")[0]
+        test_video = build_video_entries(test_pool, namespace="test_pool")[0]
         sidecar = {
-            train_video.source_video_uid: {
+            train_video.stable_source_id: {
                 "negative_subtype": "near_miss",
                 "sample_weight": 0.5,
             }
         }
         applied = apply_sidecar([train_video, test_video], sidecar)
-        by_uid = {video.source_video_uid: video for video in applied}
-        # Before content anchoring both pools shared "MC::0::01" and the dict
-        # overwrote one of them; now each pool keeps its own metadata.
+        by_uid = {video.stable_source_id: video for video in applied}
         self.assertEqual(
-            by_uid[train_video.source_video_uid].negative_subtype, "near_miss"
+            by_uid[train_video.stable_source_id].negative_subtype, "near_miss"
         )
-        self.assertIsNone(by_uid[test_video.source_video_uid].negative_subtype)
-        self.assertEqual(by_uid[test_video.source_video_uid].sample_weight, 1.0)
+        self.assertIsNone(by_uid[test_video.stable_source_id].negative_subtype)
+        self.assertEqual(by_uid[test_video.stable_source_id].sample_weight, 1.0)
 
     def test_collision_classification_uses_configured_identity_mode(self) -> None:
         """Audit B2: the overlap diagnostic must group by the configured mode.
@@ -203,11 +199,15 @@ class CanonicalContentAnchoredIdentityTests(unittest.TestCase):
             restored = read_video_entries_parquet(path)
             self.assertEqual(len(restored), 1)
             self.assertEqual(
-                restored[0].source_video_uid, videos[0].source_video_uid
+                restored[0].source_version_id, videos[0].source_version_id
             )
             self.assertEqual(
-                restored[0].canonical_source_video_uid,
-                videos[0].canonical_source_video_uid,
+                restored[0].stable_source_id,
+                videos[0].stable_source_id,
+            )
+            self.assertEqual(
+                restored[0].content_version_id,
+                videos[0].content_version_id,
             )
 
 

@@ -16,6 +16,52 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "packed backend dependencies are not installed")
 class PackedBackendTests(unittest.TestCase):
+    def _contract(self, root: Path, rows: list[dict]) -> dict:
+        import json
+
+        from game_cls.data.video_index import VideoEntry, write_video_entries_parquet
+
+        grouped = {}
+        for row in rows:
+            key = (row["game"], int(row["label"]), row["video_id"])
+            grouped.setdefault(key, []).append(int(row["frame_id"]))
+        entries = []
+        for (game, label, video_id), frame_ids_list in grouped.items():
+            frame_ids = np.asarray(sorted(frame_ids_list), dtype=np.int32)
+            id_set = set(frame_ids.tolist())
+            entries.append(
+                VideoEntry(
+                    game=game,
+                    label=label,
+                    video_id=video_id,
+                    frame_ids=frame_ids,
+                    valid_start_positions={
+                        delta: np.asarray(
+                            [i for i, value in enumerate(frame_ids) if int(value) + delta in id_set],
+                            dtype=np.int32,
+                        )
+                        for delta in (1, 2, 3)
+                    },
+                    stable_source_id=f"{game}::{label}::{video_id}",
+                    content_version_id=f"content-{game}-{label}-{video_id}",
+                )
+            )
+        video_index = root / "source_videos.parquet"
+        write_video_entries_parquet(entries, video_index)
+        audit = root / "audit.json"
+        split_manifest = root / "split_manifest.parquet"
+        audit.write_text("{}", encoding="utf-8")
+        split_manifest.write_bytes(b"split")
+        (root / "bundle_manifest.json").write_text(
+            json.dumps({"bundle_id": "bundle-v1"}), encoding="utf-8"
+        )
+        return {
+            "source_video_index": video_index,
+            "source_bundle_id": "bundle-v1",
+            "audit_path": audit,
+            "split_manifest_path": split_manifest,
+        }
+
     def test_packed_decode_matches_png_pixels(self) -> None:
         from game_cls.data.image_spec import ImageSpec
         from game_cls.data.lazy_pair_dataset import (
@@ -56,6 +102,7 @@ class PackedBackendTests(unittest.TestCase):
                 root / "packed",
                 image_spec=image_spec,
                 images_per_shard=2,
+                **self._contract(root, rows),
             )
             backend = PackedUint8Backend(
                 packed_index,
@@ -146,10 +193,22 @@ class PackedBackendTests(unittest.TestCase):
             frame_index = root / "frames.parquet"
             pq.write_table(pa.Table.from_pylist(rows), frame_index)
             image_spec = ImageSpec(width=448, height=208, channels=3)
-            pack_frame_index(frame_index, root / "packed", image_spec=image_spec)
+            contract = self._contract(root, rows)
+            pack_frame_index(
+                frame_index,
+                root / "packed",
+                image_spec=image_spec,
+                **contract,
+            )
             manifest = root / "packed" / "packed_manifest.json"
             # Unchanged source index verifies cleanly.
-            verify_packed_provenance(manifest, frame_index)
+            verify_packed_provenance(
+                manifest,
+                frame_index,
+                current_video_index=contract["source_video_index"],
+                audit_path=contract["audit_path"],
+                split_manifest_path=contract["split_manifest_path"],
+            )
             # A regenerated (different) source index -> stale -> refused.
             pq.write_table(
                 pa.Table.from_pylist(
@@ -158,7 +217,13 @@ class PackedBackendTests(unittest.TestCase):
                 frame_index,
             )
             with self.assertRaisesRegex(RuntimeError, "stale"):
-                verify_packed_provenance(manifest, frame_index)
+                verify_packed_provenance(
+                    manifest,
+                    frame_index,
+                    current_video_index=contract["source_video_index"],
+                    audit_path=contract["audit_path"],
+                    split_manifest_path=contract["split_manifest_path"],
+                )
 
     def test_manifest_without_provenance_is_refused(self) -> None:
         # A manifest that predates the provenance binding cannot prove the
@@ -172,7 +237,7 @@ class PackedBackendTests(unittest.TestCase):
             root = Path(directory)
             manifest = root / "packed_manifest.json"
             manifest.write_text(_json.dumps({"shards": []}), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "predates"):
+            with self.assertRaisesRegex(RuntimeError, "not format v4"):
                 verify_packed_provenance(manifest, root / "frames.parquet")
 
     def test_packed_dataset_spawn_worker_owns_its_memmap(self) -> None:
@@ -211,6 +276,7 @@ class PackedBackendTests(unittest.TestCase):
                 root / "packed",
                 image_spec=image_spec,
                 images_per_shard=2,
+                **self._contract(root, rows),
             )
             backend = PackedUint8Backend(
                 packed_index,

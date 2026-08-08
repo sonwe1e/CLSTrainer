@@ -35,8 +35,8 @@ class MetadataSidecarTests(unittest.TestCase):
     def test_write_read_apply_roundtrip(self) -> None:
         videos = _videos()
         rows = [
-            {"source_video_uid": "A::0::01", "negative_subtype": "wooden_bridge"},
-            {"source_video_uid": "B::0::02", "negative_subtype": "flat_floor"},
+            {"stable_source_id": "A::0::01", "negative_subtype": "wooden_bridge"},
+            {"stable_source_id": "B::0::02", "negative_subtype": "flat_floor"},
         ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "video_metadata.parquet"
@@ -48,7 +48,7 @@ class MetadataSidecarTests(unittest.TestCase):
             self.assertEqual(sidecar["A::0::01"]["sample_weight"], 1.0)
             validate_sidecar_against_index(sidecar, videos)
             applied = apply_sidecar(videos, sidecar)
-            by_uid = {video.source_video_uid: video for video in applied}
+            by_uid = {video.stable_source_id: video for video in applied}
             self.assertEqual(by_uid["A::0::01"].negative_subtype, "wooden_bridge")
             self.assertEqual(by_uid["B::0::02"].negative_subtype, "flat_floor")
             # Untyped videos keep their default.
@@ -58,13 +58,40 @@ class MetadataSidecarTests(unittest.TestCase):
             self.assertEqual(read_metadata_sidecar(path), sidecar)
 
     def test_fingerprint_changes_with_content(self) -> None:
-        rows_a = [{"source_video_uid": "A::01", "negative_subtype": "hard"}]
-        rows_b = [{"source_video_uid": "A::01", "negative_subtype": "easy"}]
+        rows_a = [{"stable_source_id": "A::01", "negative_subtype": "hard"}]
+        rows_b = [{"stable_source_id": "A::01", "negative_subtype": "easy"}]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "meta.parquet"
             fa = write_metadata_sidecar(rows_a, path)
             fb = write_metadata_sidecar(rows_b, path)
             self.assertNotEqual(fa, fb)
+
+    def test_duplicate_primary_key_is_rejected(self) -> None:
+        rows = [
+            {"stable_source_id": "A::01", "negative_subtype": "hard"},
+            {"stable_source_id": "A::01", "negative_subtype": "easy"},
+        ]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaisesRegex(ValueError, "Duplicate metadata"),
+        ):
+            write_metadata_sidecar(rows, Path(directory) / "meta.parquet")
+
+    def test_tampered_fingerprint_is_rejected(self) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "meta.parquet"
+            write_metadata_sidecar(
+                [{"stable_source_id": "A::01", "negative_subtype": "hard"}],
+                path,
+            )
+            rows = pq.read_table(path).to_pylist()
+            rows[0]["negative_subtype"] = "tampered"
+            pq.write_table(pa.Table.from_pylist(rows), path)
+            with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
+                read_metadata_sidecar(path)
 
     def test_unknown_uid_rejected(self) -> None:
         videos = _videos()
@@ -81,12 +108,12 @@ class MetadataSidecarTests(unittest.TestCase):
 
     def test_sample_weight_applied(self) -> None:
         videos = _videos()
-        rows = [{"source_video_uid": "A::0::01", "sample_weight": 0.5}]
+        rows = [{"stable_source_id": "A::0::01", "sample_weight": 0.5}]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(rows, path)
             applied = apply_sidecar(videos, read_metadata_sidecar(path))
-            by_uid = {video.source_video_uid: video for video in applied}
+            by_uid = {video.stable_source_id: video for video in applied}
             self.assertEqual(by_uid["A::0::01"].sample_weight, 0.5)
             self.assertEqual(by_uid["A::0::02"].sample_weight, 1.0)
 
@@ -136,8 +163,8 @@ class HardNegativeReadinessTests(unittest.TestCase):
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(
                 [
-                    {"source_video_uid": "A::01", "negative_subtype": "flat_floor"},
-                    {"source_video_uid": "A::02", "negative_subtype": "flat_floor"},
+                    {"stable_source_id": "A::01", "negative_subtype": "flat_floor"},
+                    {"stable_source_id": "A::02", "negative_subtype": "flat_floor"},
                 ],
                 path,
             )
@@ -154,8 +181,8 @@ class HardNegativeReadinessTests(unittest.TestCase):
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(
                 [
-                    {"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"},
-                    {"source_video_uid": "A::02", "negative_subtype": "flat_floor"},
+                    {"stable_source_id": "A::01", "negative_subtype": "wooden_bridge"},
+                    {"stable_source_id": "A::02", "negative_subtype": "flat_floor"},
                 ],
                 path,
             )
@@ -165,7 +192,7 @@ class HardNegativeReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(
-                [{"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"}],
+                [{"stable_source_id": "A::01", "negative_subtype": "wooden_bridge"}],
                 path,
             )
             problems = check_hard_negative_readiness(
@@ -181,7 +208,7 @@ class HardNegativeReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "meta.parquet"
             write_metadata_sidecar(
-                [{"source_video_uid": "A::01", "negative_subtype": "wooden_bridge"}],
+                [{"stable_source_id": "A::01", "negative_subtype": "wooden_bridge"}],
                 path,
             )
             problems = check_hard_negative_readiness(

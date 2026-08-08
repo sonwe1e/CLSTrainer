@@ -15,6 +15,48 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "torch is not installed")
 class ExportVerifyTests(unittest.TestCase):
+    def _authorize_export(self, run_dir: Path, config_path: Path | None = None) -> None:
+        from game_cls.release import release_identity
+        from game_cls.reports.benchmark import (
+            check_gates,
+            file_sha256,
+            write_benchmark_report,
+        )
+
+        path = config_path or (run_dir / "resolved_config.json")
+        config = json.loads(path.read_text(encoding="utf-8"))
+        challenge = path.parent / "challenge.identity"
+        challenge.write_bytes(b"fixed challenge bundle")
+        config["data"]["challenge_index"] = str(challenge)
+        gates = {"global_fpr_at_decision_threshold": {"op": "<=", "value": 0.01}}
+        benchmark_dir = path.parent / "benchmarks"
+        config["benchmark"]["gate_metrics"] = gates
+        config["benchmark"]["output_dir"] = str(benchmark_dir)
+        path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        checkpoint = run_dir / "checkpoints" / "model_last.pth"
+        if not checkpoint.is_file():
+            checkpoint = run_dir / "checkpoints" / "checkpoint_last.pth"
+        identity, components = release_identity(
+            run_id=run_dir.name,
+            checkpoint_sha256=file_sha256(checkpoint),
+            config=config,
+        )
+        metrics = {"global_fpr_at_decision_threshold": 0.0}
+        write_benchmark_report(
+            benchmark_dir,
+            run_id=run_dir.name,
+            checkpoint_alias="last",
+            metrics=metrics,
+            gates=check_gates(metrics, gates),
+            grouped_metrics=None,
+            gate_metrics=gates,
+            checkpoint_sha256=identity["checkpoint_sha256"],
+            resolved_config_sha256=identity["resolved_config_sha256"],
+            challenge_dataset_fingerprint=identity["challenge_dataset_fingerprint"],
+            challenge_bundle_components=components,
+            gate_spec_fingerprint=identity["gate_spec_fingerprint"],
+        )
+
     def _trained_run(self, directory: str) -> Path:
         from game_cls.config import load_config
         from game_cls.engine.trainer import run_training
@@ -72,6 +114,7 @@ class ExportVerifyTests(unittest.TestCase):
                     "out": str(export_dir),
                 },
             )()
+            self._authorize_export(run_dir)
             rc = cmd_export(args)
             self.assertEqual(rc, 0)
             artifact_dir = self._artifact_dir(export_dir, run_dir)
@@ -113,6 +156,7 @@ class ExportVerifyTests(unittest.TestCase):
                     "out": str(export_dir),
                 },
             )()
+            self._authorize_export(run_dir)
             self.assertEqual(cmd_export(args), 0)
             self.assertEqual(cmd_export(args), 2)
 
@@ -152,6 +196,7 @@ class ExportVerifyTests(unittest.TestCase):
                     "out": str(export_dir),
                 },
             )()
+            self._authorize_export(run_dir, config)
             self.assertEqual(cmd_export(args), 0)
             artifact_dir = self._artifact_dir(export_dir, run_dir)
             manifest = json.loads(
@@ -162,6 +207,8 @@ class ExportVerifyTests(unittest.TestCase):
     def _export_via_cli(self, run_dir: Path, base: Path, config: Path) -> int:
         """Run ``export`` with neither --out nor --format, as a user would."""
         from game_cls.cli import main
+
+        self._authorize_export(run_dir, config)
 
         return main(
             [
@@ -174,7 +221,6 @@ class ExportVerifyTests(unittest.TestCase):
                 str(config),
                 "--checkpoint",
                 "last",
-                "--skip-gate",
             ]
         )
 
@@ -218,13 +264,14 @@ class ExportVerifyTests(unittest.TestCase):
             # whether onnxruntime is installed decides between a traced graph
             # (0) and the friendly "install it or use --format weights" (2).
             # Either way the weights branch must not have run.
-            artifact_dir = self._artifact_dir(out_dir, run_dir)
-            self.assertFalse((artifact_dir / "model.pt").is_file())
             if code == 0:
+                artifact_dir = self._artifact_dir(out_dir, run_dir)
+                self.assertFalse((artifact_dir / "model.pt").is_file())
                 self.assertTrue((artifact_dir / "model.onnx").is_file())
             else:
                 self.assertEqual(code, 2)
-                self.assertFalse((artifact_dir / "export_manifest.json").is_file())
+                # Transactional export publishes nothing on a failed trace.
+                self.assertEqual(list((out_dir / run_dir.name).iterdir()), [])
 
     def test_manifest_records_base_checkpoint_sha_and_metric_summary(self) -> None:
         from game_cls.cli.export import cmd_export
@@ -278,6 +325,7 @@ class ExportVerifyTests(unittest.TestCase):
                     "out": str(export_dir),
                 },
             )()
+            self._authorize_export(run_dir, config)
             self.assertEqual(cmd_export(args), 0)
             artifact_dir = self._artifact_dir(export_dir, run_dir)
             manifest = json.loads(
@@ -335,6 +383,7 @@ class ExportVerifyTests(unittest.TestCase):
                     "out": str(export_dir),
                 },
             )()
+            self._authorize_export(run_dir, config)
             self.assertEqual(cmd_export(args), 0)
             artifact_dir = self._artifact_dir(export_dir, run_dir)
             manifest = json.loads(

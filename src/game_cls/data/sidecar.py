@@ -1,6 +1,6 @@
 """Optional per-video metadata sidecar (step5 P2).
 
-The sidecar is an *additive* source of truth keyed by ``source_video_uid``
+The sidecar is an *additive* source of truth keyed by ``stable_source_id``
 (``game::video_id``). It is joined to the video index **after** the split is
 derived, so it can never leak frames across splits or drift the split
 manifest, and it is not part of any dedup identity. When ``data.metadata_sidecar``
@@ -15,7 +15,7 @@ the degenerate combination (enabled + missing/unusable sidecar) at
 
 Schema (parquet columns):
 
-    source_video_uid   string (primary key)
+    stable_source_id   string (primary key)
     negative_subtype   string|null
     scene_type         string|null
     capture_domain     string|null
@@ -35,7 +35,7 @@ from typing import Any
 
 from .video_index import VideoEntry
 
-METADATA_SCHEMA_VERSION = 1
+METADATA_SCHEMA_VERSION = 2
 
 
 def _pyarrow():
@@ -52,13 +52,15 @@ def _pyarrow():
 
 def _fingerprint(rows: list[dict[str, Any]]) -> str:
     digest = hashlib.sha256()
-    for row in sorted(rows, key=lambda item: str(item["source_video_uid"])):
-        digest.update(json.dumps(row, sort_keys=True).encode("utf-8"))
+    for row in sorted(rows, key=lambda item: str(item["stable_source_id"])):
+        digest.update(
+            json.dumps(row, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
     return digest.hexdigest()
 
 
 def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
-    """Load the sidecar into ``{source_video_uid: meta}``.
+    """Load and authenticate a v2 sidecar into ``{stable_source_id: meta}``.
 
     Missing or empty sidecar files return an empty mapping (never an error),
     so a config that points at a not-yet-created sidecar behaves like the
@@ -75,7 +77,11 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
     # of the sidecar file.
     with open(path, "rb") as fh:
         schema_names = set(pq.read_schema(fh).names)
-    required = {"source_video_uid"}
+    required = {
+        "stable_source_id",
+        "metadata_version",
+        "metadata_fingerprint",
+    }
     missing = required - schema_names
     if missing:
         raise ValueError(
@@ -83,10 +89,42 @@ def read_metadata_sidecar(path: str | Path) -> dict[str, dict[str, Any]]:
         )
     with open(path, "rb") as fh:
         rows = pq.read_table(fh).to_pylist()
+    if not rows:
+        return {}
+    versions = {int(row.get("metadata_version", 0)) for row in rows}
+    if versions != {METADATA_SCHEMA_VERSION}:
+        raise ValueError(
+            f"Metadata sidecar {path} has schema version(s) {sorted(versions)}; "
+            f"expected only v{METADATA_SCHEMA_VERSION}. Run "
+            "'cls-trainer dataset metadata-migrate'."
+        )
+    recorded_fingerprints = {
+        str(row.get("metadata_fingerprint") or "") for row in rows
+    }
+    if len(recorded_fingerprints) != 1 or "" in recorded_fingerprints:
+        raise ValueError(
+            f"Metadata sidecar {path} has missing or mixed fingerprints."
+        )
+    normalized_for_hash = [
+        {key: value for key, value in row.items() if key != "metadata_fingerprint"}
+        for row in rows
+    ]
+    actual_fingerprint = _fingerprint(normalized_for_hash)
+    recorded_fingerprint = next(iter(recorded_fingerprints))
+    if actual_fingerprint != recorded_fingerprint:
+        raise ValueError(
+            f"Metadata sidecar {path} fingerprint mismatch: recorded "
+            f"{recorded_fingerprint}, actual {actual_fingerprint}."
+        )
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
-        uid = str(row["source_video_uid"])
-        result[uid] = {
+        stable_id = str(row["stable_source_id"])
+        if stable_id in result:
+            raise ValueError(
+                f"Metadata sidecar {path} contains duplicate primary key "
+                f"stable_source_id={stable_id!r}."
+            )
+        result[stable_id] = {
             "negative_subtype": row.get("negative_subtype"),
             "scene_type": row.get("scene_type"),
             "capture_domain": row.get("capture_domain"),
@@ -151,7 +189,7 @@ def check_hard_negative_readiness(config: dict[str, Any]) -> list[str]:
         ]
     try:
         sidecar = read_metadata_sidecar(path)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         # pyarrow missing: say so instead of crashing a config check.
         return [f"Cannot verify data.metadata_sidecar={sidecar_path}: {exc}"]
     tagged = sorted(
@@ -184,7 +222,7 @@ def validate_sidecar_against_index(
     entries: list[VideoEntry],
 ) -> None:
     """Every sidecar uid must exist in the index; raise otherwise."""
-    known = {entry.source_video_uid for entry in entries}
+    known = {entry.stable_source_id for entry in entries}
     unknown = [uid for uid in sidecar if uid not in known]
     if unknown:
         raise ValueError(
@@ -205,7 +243,7 @@ def apply_sidecar(
         return entries
     updated: list[VideoEntry] = []
     for entry in entries:
-        meta = sidecar.get(entry.source_video_uid)
+        meta = sidecar.get(entry.stable_source_id)
         if meta is None:
             updated.append(entry)
             continue
@@ -230,10 +268,19 @@ def write_metadata_sidecar(
     """Write the sidecar atomically and return its fingerprint."""
     pa, pq = _pyarrow()
     normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for row in rows:
+        stable_id = str(row.get("stable_source_id") or "")
+        if not stable_id:
+            raise ValueError("Metadata rows require a non-empty stable_source_id.")
+        if stable_id in seen:
+            raise ValueError(
+                f"Duplicate metadata primary key stable_source_id={stable_id!r}."
+            )
+        seen.add(stable_id)
         normalized.append(
             {
-                "source_video_uid": str(row["source_video_uid"]),
+                "stable_source_id": stable_id,
                 "negative_subtype": row.get("negative_subtype"),
                 "scene_type": row.get("scene_type"),
                 "capture_domain": row.get("capture_domain"),

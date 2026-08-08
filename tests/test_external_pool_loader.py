@@ -65,6 +65,8 @@ def _video_index(pool: tuple[Path, dict[int, Path]], destination: Path) -> Path:
             frame_ids=np.asarray([1, 2, 3, 4], dtype=np.int32),
             valid_start_positions={2: np.asarray([0, 1], dtype=np.int32)},
             video_directory=str(directories[label]),
+            stable_source_id=f"game_a::{label}::0{label + 1}",
+            content_version_id=f"content-{label}",
         )
         for label in (0, 1)
     ]
@@ -77,7 +79,7 @@ def _sidecar(root: Path, name: str = "pool_metadata.parquet") -> Path:
 
     path = root / name
     write_metadata_sidecar(
-        [{"source_video_uid": "game_a::0::01", "negative_subtype": "bridge"}], path
+        [{"stable_source_id": "game_a::0::01", "negative_subtype": "bridge"}], path
     )
     return path
 
@@ -105,17 +107,32 @@ class ExternalPoolLoaderTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            frame_index, _ = _write_pool(root)
+            pool = _write_pool(root)
+            frame_index, _ = pool
+            source_video_index = _video_index(pool, root / "source_videos.parquet")
+            audit = root / "audit.json"
+            split_manifest = root / "split_manifest.parquet"
+            audit.write_text("{}", encoding="utf-8")
+            split_manifest.write_bytes(b"split")
+            (root / "bundle_manifest.json").write_text(
+                '{"bundle_id":"bundle-v1"}', encoding="utf-8"
+            )
             packed_index = pack_frame_index(
                 frame_index,
                 root / "packed",
                 image_spec=ImageSpec(width=WIDTH, height=HEIGHT, channels=3),
                 images_per_shard=3,
+                source_video_index=source_video_index,
+                source_bundle_id="bundle-v1",
+                audit_path=audit,
+                split_manifest_path=split_manifest,
             )
             config = _base_config(root)
             config["data"]["backend"] = "packed_uint8"
             config["data"]["mining"].update(
                 {
+                    "pool_index": str(frame_index),
+                    "pool_video_index": str(source_video_index),
                     "pool_packed_video_index": str(
                         root / "packed" / "packed_video_entries.parquet"
                     ),
@@ -128,7 +145,7 @@ class ExternalPoolLoaderTests(unittest.TestCase):
             # The packed decoder is wired in, not the PNG fallback.
             self.assertIsInstance(loader.dataset.decoder, PackedUint8Backend)
             # The sidecar was joined, so subtype grouping is live.
-            by_uid = {video.source_video_uid: video for video in videos}
+            by_uid = {video.stable_source_id: video for video in videos}
             self.assertEqual(by_uid["game_a::0::01"].negative_subtype, "bridge")
             self.assertIn("game_label_subtype", loader.dataset.group_catalogs)
             # And the pairs actually decode at the configured shape.

@@ -178,7 +178,9 @@ def _rewrap_stress_worker(
             _old = model
             model = None
             del _old
-            import gc; gc.collect()
+            import gc
+
+            gc.collect()
             model = _rewrap_distributed(bare_model, device, rank)
         # One final optimizer step so synced weights move identically.
         optimizer.zero_grad(set_to_none=True)

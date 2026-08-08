@@ -376,8 +376,26 @@ class DatasetCliTests(unittest.TestCase):
             self.assertEqual(manifest["width"], 448)
             self.assertEqual(manifest["height"], 208)
             self.assertEqual(manifest["channels"], 3)
+            self.assertEqual(manifest["format_version"], 4)
+            self.assertTrue(manifest["source_bundle_id"])
+            self.assertTrue(manifest["source_video_index_sha256"])
             packed_count = len(read_frame_parquet(output_dir / "train_frames.parquet"))
             self.assertEqual(manifest["frame_count"], packed_count)
+
+    def test_dataset_pack_refuses_misspelled_explicit_video_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config, output_dir = _prepare_dataset(base)
+            args = argparse.Namespace(
+                config=str(config),
+                frame_index=str(output_dir / "train_frames.parquet"),
+                source_video_index=str(output_dir / "trian_video_entries.parquet"),
+                output_dir=str(base / "packed"),
+                images_per_shard=4096,
+                overrides=[],
+            )
+            self.assertEqual(cmd_dataset_pack(args), 2)
+            self.assertFalse((base / "packed").exists())
 
     def test_main_dispatch_recognizes_evaluate_and_dataset(self) -> None:
         parser = build_parser()
@@ -574,7 +592,8 @@ pair:
                     valid_start_positions={},
                     # The mock stands in for an indexed parquet, whose rows
                     # carry the persisted canonical uid (audit P0-5).
-                    canonical_source_video_uid=uid,
+                    stable_source_id=uid,
+                    content_version_id=f"content-{game}-{video_id}",
                 )
             )
         return entries
@@ -624,28 +643,32 @@ pair:
         write_mining_manifest(
             [
                 {
-                    "source_video_uid": "game_a::01",
+                    "stable_source_id": "game_a::01",
+                    "source_version_id": "game_a::01#v1",
                     "p_positive": 0.71,
                     "rank_in_video": 1,
                     "frame0_id": 3,
                     "frame1_id": 5,
                 },
                 {
-                    "source_video_uid": "game_a::01",
+                    "stable_source_id": "game_a::01",
+                    "source_version_id": "game_a::01#v1",
                     "p_positive": 0.94,
                     "rank_in_video": 0,
                     "frame0_id": 1,
                     "frame1_id": 3,
                 },
                 {
-                    "source_video_uid": "game_a::01",
+                    "stable_source_id": "game_a::01",
+                    "source_version_id": "game_a::01#v1",
                     "p_positive": 0.55,
                     "rank_in_video": 2,
                     "frame0_id": 7,
                     "frame1_id": 9,
                 },
                 {
-                    "source_video_uid": "game_a::02",
+                    "stable_source_id": "game_a::02",
+                    "source_version_id": "game_a::02#v1",
                     "p_positive": 0.63,
                     "rank_in_video": 0,
                     "frame0_id": 1,
@@ -703,15 +726,15 @@ pair:
         # by uid, which would hide a regression here.
         rows = _mining_rows(
             [
-                {"source_video_uid": "game_a::01", "p_positive": 0.71},
-                {"source_video_uid": "game_a::01", "p_positive": 0.94},
-                {"source_video_uid": "game_a::01", "p_positive": 0.55},
-                {"source_video_uid": "game_a::02", "p_positive": 0.63},
+                {"stable_source_id": "game_a::01", "p_positive": 0.71},
+                {"stable_source_id": "game_a::01", "p_positive": 0.94},
+                {"stable_source_id": "game_a::01", "p_positive": 0.55},
+                {"stable_source_id": "game_a::02", "p_positive": 0.63},
             ],
             "mined_hard",
         )
         self.assertEqual(
-            [row["source_video_uid"] for row in rows], ["game_a::01", "game_a::02"]
+            [row["stable_source_id"] for row in rows], ["game_a::01", "game_a::02"]
         )
         # The representative is the video's hardest pair, not the first seen.
         self.assertEqual(rows[0]["p_positive"], 0.94)
@@ -754,12 +777,12 @@ pair:
             write_metadata_sidecar(
                 [
                     {
-                        "source_video_uid": "game_a::03",
+                        "stable_source_id": "game_a::03",
                         "negative_subtype": "flat_floor",
                         "scene_type": "indoor",
                         "sample_weight": 2.5,
                     },
-                    {"source_video_uid": "game_a::01", "sample_weight": 3.5},
+                    {"stable_source_id": "game_a::01", "sample_weight": 3.5},
                 ],
                 sidecar,
             )
@@ -793,7 +816,7 @@ pair:
             write_metadata_sidecar(
                 [
                     {
-                        "source_video_uid": "game_a::01",
+                        "stable_source_id": "game_a::01",
                         "negative_subtype": "flat_floor",
                     }
                 ],
@@ -828,7 +851,7 @@ pair:
                 write_metadata_sidecar(
                     [
                         {
-                            "source_video_uid": "game_a::01",
+                            "stable_source_id": "game_a::01",
                             "negative_subtype": "flat_floor",
                         }
                     ],
@@ -857,7 +880,7 @@ pair:
             write_metadata_sidecar(
                 [
                     {
-                        "source_video_uid": "game_a::01",
+                        "stable_source_id": "game_a::01",
                         "scene_type": "indoor",
                         "sample_weight": 2.5,
                     }
@@ -866,7 +889,7 @@ pair:
             )
             metadata = base / "meta.csv"
             metadata.write_text(
-                "source_video_uid,negative_subtype,scene_type,sample_weight\n"
+                "stable_source_id,negative_subtype,scene_type,sample_weight\n"
                 "game_a::01,mined_hard,,\n",
                 encoding="utf-8",
             )
@@ -881,6 +904,87 @@ pair:
             # Empty CSV cells mean "not specified", not "erase this".
             self.assertEqual(row["scene_type"], "indoor")
             self.assertEqual(row["sample_weight"], 2.5)
+
+
+class MetadataMigrationCliTests(unittest.TestCase):
+    def _write_legacy(self, base: Path, *, conflicting: bool = False) -> tuple[Path, Path]:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        video_index = base / "legacy_videos.parquet"
+        video_rows = [
+            {
+                "game": "game_a",
+                "label": 0,
+                "video_id": "01",
+                "canonical_source_video_uid": "game_a::0::01#old-a",
+            }
+        ]
+        sidecar_rows = [
+            {
+                "source_video_uid": "game_a::0::01#old-a",
+                "negative_subtype": "bridge",
+            }
+        ]
+        if conflicting:
+            video_rows.append(
+                {
+                    "game": "game_a",
+                    "label": 1,
+                    "video_id": "01",
+                    "canonical_source_video_uid": "game_a::1::01#old-b",
+                }
+            )
+            sidecar_rows.append(
+                {
+                    "source_video_uid": "game_a::1::01#old-b",
+                    "negative_subtype": "floor",
+                }
+            )
+        pq.write_table(pa.Table.from_pylist(video_rows), video_index)
+        sidecar = base / "legacy_sidecar.parquet"
+        pq.write_table(pa.Table.from_pylist(sidecar_rows), sidecar)
+        return video_index, sidecar
+
+    def test_metadata_migrate_writes_authenticated_v2(self) -> None:
+        from game_cls.cli.dataset import cmd_dataset_metadata_migrate
+        from game_cls.data.sidecar import read_metadata_sidecar
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            video_index, sidecar = self._write_legacy(base)
+            output = base / "metadata_v2.parquet"
+            args = type(
+                "Args",
+                (),
+                {
+                    "config": "configs/recipes/example_debug.yaml",
+                    "legacy_sidecar": str(sidecar),
+                    "legacy_video_index": [f"train={video_index}"],
+                    "out": str(output),
+                },
+            )()
+            self.assertEqual(cmd_dataset_metadata_migrate(args), 0)
+            migrated = read_metadata_sidecar(output)
+            self.assertEqual(migrated["game_a::01"]["negative_subtype"], "bridge")
+
+    def test_metadata_migrate_refuses_collapsed_conflicts(self) -> None:
+        from game_cls.cli.dataset import cmd_dataset_metadata_migrate
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            video_index, sidecar = self._write_legacy(base, conflicting=True)
+            args = type(
+                "Args",
+                (),
+                {
+                    "config": "configs/recipes/example_debug.yaml",
+                    "legacy_sidecar": str(sidecar),
+                    "legacy_video_index": [f"train={video_index}"],
+                    "out": str(base / "metadata_v2.parquet"),
+                },
+            )()
+            self.assertEqual(cmd_dataset_metadata_migrate(args), 2)
 
 
 if __name__ == "__main__":

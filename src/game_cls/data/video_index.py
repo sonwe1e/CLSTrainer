@@ -11,14 +11,10 @@ from .records import FrameRecord
 
 
 def video_content_id(frame_count: int, ordered_content_hashes: list[str]) -> str | None:
-    """Deterministic content signature of a video (audit P0-5).
+    """Deterministic content-version signature of a video.
 
-    The signature hashes the frame count plus the per-frame content SHA-256s in
-    frame order, so two videos with coincidentally equal local numbering but
-    different pixels get distinct canonical uids even though the source
-    identity namespaces stay audit-boundary-only. Returns ``None`` when any
-    frame lacks a content hash, in which case the caller falls back to the
-    name-based uid.
+    Each input token carries label, frame id and content SHA-256. Returns
+    ``None`` when any frame lacks a content hash.
     """
     if not ordered_content_hashes or any(not h for h in ordered_content_hashes):
         return None
@@ -36,13 +32,10 @@ class VideoEntry:
     frame_paths: tuple[str, ...] = ()
     frame_locations: np.ndarray | None = None
     video_directory: str = ""
-    # The canonical, content-anchored source-video identity, computed once at
-    # indexing time and persisted (audit P0-5). Every consumer (sidecar join,
-    # hard-negative mining, subtype eval, error report) reads this instead of
-    # re-deriving ``game::video_id``, so coincidentally equal train/test local
-    # numbering can never collapse two distinct videos into one key. Empty when
-    # read from a legacy parquet that predates the column.
-    canonical_source_video_uid: str = ""
+    # Stable physical identity and the independently changing content version.
+    # Metadata is keyed by stable_source_id; samples/reports use source_version_id.
+    stable_source_id: str = ""
+    content_version_id: str = ""
     # Optional per-video metadata joined from the sidecar AFTER split
     # (step5 P2). Never part of split/dedup identity; defaults keep the
     # legacy behavior byte-identical when no sidecar is configured.
@@ -50,11 +43,12 @@ class VideoEntry:
     sample_weight: float = 1.0
 
     @property
-    def source_video_uid(self) -> str:
-        # The persisted canonical identity; the name-based fallback keeps the
-        # label so every consumer sees one consistent format.
-        return self.canonical_source_video_uid or (
-            f"{self.game}::{self.label}::{self.video_id}"
+    def source_version_id(self) -> str:
+        stable = self.stable_source_id or f"{self.game}::{self.label}::{self.video_id}"
+        return (
+            f"{stable}#{self.content_version_id}"
+            if self.content_version_id
+            else stable
         )
 
     def _reference(self, position: int) -> str | int:
@@ -90,8 +84,46 @@ class VideoEntry:
 
 
 def build_video_entries(
-    frames: Iterable[FrameRecord], deltas: Iterable[int] = (1, 2, 3)
+    frames: Iterable[FrameRecord],
+    deltas: Iterable[int] = (1, 2, 3),
+    *,
+    identity_mode: str = "game_label_video",
+    namespace: str | None = None,
+    require_content_hash: bool = False,
 ) -> list[VideoEntry]:
+    from .splitter import source_video_uid
+
+    frames = list(frames)
+    content_by_source: dict[str, list[FrameRecord]] = {}
+    for frame in frames:
+        stable = source_video_uid(
+            frame.game,
+            frame.video_id,
+            frame.label,
+            mode=identity_mode,
+            namespace=namespace,
+        )
+        content_by_source.setdefault(stable, []).append(frame)
+    content_versions: dict[str, str] = {}
+    for stable, source_frames in content_by_source.items():
+        ordered_source = sorted(
+            source_frames, key=lambda item: (int(item.label), int(item.frame_id))
+        )
+        content_tokens = [
+            (
+                f"{int(item.label)}:{int(item.frame_id)}:{item.content_sha256}"
+                if item.content_sha256
+                else ""
+            )
+            for item in ordered_source
+        ]
+        content = video_content_id(len(ordered_source), content_tokens)
+        if content is None and require_content_hash:
+            raise ValueError(
+                f"Source video {stable} has frames without content_sha256; "
+                "a content-versioned video index cannot be built."
+            )
+        content_versions[stable] = content or ""
     grouped: dict[tuple[str, int, str], list[FrameRecord]] = {}
     for frame in frames:
         grouped.setdefault((frame.game, frame.label, frame.video_id), []).append(frame)
@@ -119,17 +151,12 @@ def build_video_entries(
             )
             for delta in deltas
         }
-        # Audit P0-5: compute the content-anchored canonical uid here, once,
-        # from the ordered per-frame content hashes. The content signature
-        # distinguishes coincidentally equal numbering across distinct pools
-        # without touching the audit-only namespace dimension.
-        content_id = video_content_id(
-            len(ordered), [item.content_sha256 for item in ordered]
-        )
-        canonical_uid = (
-            f"{game}::{int(label)}::{video_id}#{content_id}"
-            if content_id is not None
-            else f"{game}::{int(label)}::{video_id}"
+        stable = source_video_uid(
+            game,
+            video_id,
+            label,
+            mode=identity_mode,
+            namespace=namespace,
         )
         entries.append(
             VideoEntry(
@@ -140,7 +167,8 @@ def build_video_entries(
                 valid_start_positions=valid,
                 frame_paths=frame_paths,
                 video_directory=video_directory,
-                canonical_source_video_uid=canonical_uid,
+                stable_source_id=stable,
+                content_version_id=content_versions[stable],
             )
         )
     return entries
@@ -167,6 +195,19 @@ def read_video_entries_parquet(
         raise RuntimeError("Reading Parquet indexes requires pyarrow") from exc
     schema_names = set(pq.read_schema(path).names)
     if "frame_ids" in schema_names:
+        identity_columns = {
+            "identity_schema_version",
+            "stable_source_id",
+            "content_version_id",
+            "source_version_id",
+        }
+        missing_identity = identity_columns - schema_names
+        if missing_identity:
+            raise ValueError(
+                f"Video index {path} predates identity schema v2 and is missing "
+                f"{sorted(missing_identity)}. Rebuild the indexes; use "
+                "'cls-trainer dataset metadata-migrate' for legacy sidecars."
+            )
         entries = []
         for batch in pq.ParquetFile(path).iter_batches(batch_size=256):
             for row in batch.to_pylist():
@@ -177,8 +218,7 @@ def read_video_entries_parquet(
                     )
                     for delta in deltas
                 }
-                entries.append(
-                    VideoEntry(
+                entry = VideoEntry(
                         game=row["game"],
                         label=int(row["label"]),
                         video_id=row["video_id"],
@@ -191,14 +231,28 @@ def read_video_entries_parquet(
                             else None
                         ),
                         video_directory=row.get("video_directory") or "",
-                        canonical_source_video_uid=row.get(
-                            "canonical_source_video_uid"
-                        )
-                        or "",
+                        stable_source_id=row.get("stable_source_id") or "",
+                        content_version_id=row.get("content_version_id") or "",
                         negative_subtype=row.get("negative_subtype"),
                         sample_weight=float(row.get("sample_weight", 1.0)),
                     )
-                )
+                if int(row.get("identity_schema_version", 0)) != 2:
+                    raise ValueError(
+                        f"Video index {path} has an unsupported identity schema "
+                        f"version for {entry.game}/{entry.label}/{entry.video_id}."
+                    )
+                if not entry.stable_source_id or not entry.content_version_id:
+                    raise ValueError(
+                        f"Video index {path} contains an unversioned identity for "
+                        f"{entry.game}/{entry.label}/{entry.video_id}; rebuild it."
+                    )
+                recorded_source_version = row.get("source_version_id")
+                if recorded_source_version and recorded_source_version != entry.source_version_id:
+                    raise ValueError(
+                        f"Video index {path} has inconsistent source_version_id for "
+                        f"{entry.game}/{entry.label}/{entry.video_id}."
+                    )
+                entries.append(entry)
         return entries
     columns = [
         "sample_id",
@@ -234,6 +288,7 @@ def write_video_entries_parquet(
     rows = []
     for entry in entries:
         row = {
+            "identity_schema_version": 2,
             "game": entry.game,
             "label": entry.label,
             "video_id": entry.video_id,
@@ -245,7 +300,9 @@ def write_video_entries_parquet(
                 else None
             ),
             "video_directory": entry.video_directory or None,
-            "canonical_source_video_uid": entry.canonical_source_video_uid or None,
+            "stable_source_id": entry.stable_source_id or None,
+            "content_version_id": entry.content_version_id or None,
+            "source_version_id": entry.source_version_id,
             "negative_subtype": entry.negative_subtype,
             "sample_weight": entry.sample_weight,
         }
@@ -270,6 +327,7 @@ def video_index_memory_bytes(entries: Iterable[VideoEntry]) -> int:
         + (entry.frame_locations.nbytes if entry.frame_locations is not None else 0)
         + sum(len(path.encode("utf-8")) for path in entry.frame_paths)
         + len(entry.video_directory.encode("utf-8"))
-        + len(entry.canonical_source_video_uid.encode("utf-8"))
+        + len(entry.stable_source_id.encode("utf-8"))
+        + len(entry.content_version_id.encode("utf-8"))
         for entry in entries
     )

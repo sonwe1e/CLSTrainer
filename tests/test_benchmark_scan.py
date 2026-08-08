@@ -306,6 +306,29 @@ class GateMetricRegistryDriftTests(unittest.TestCase):
 
 
 class BenchmarkReportTests(unittest.TestCase):
+    def test_reports_are_append_only_per_release_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            common = {
+                "run_id": "run-1",
+                "checkpoint_alias": "best_selection",
+                "metrics": {"global_fpr_at_decision_threshold": 0.0},
+                "gates": [("global_fpr_at_decision_threshold", True, "pass")],
+                "grouped_metrics": None,
+                "checkpoint_sha256": "a" * 64,
+                "resolved_config_sha256": "b" * 64,
+                "challenge_dataset_fingerprint": "c" * 64,
+            }
+            first = write_benchmark_report(
+                root, gate_spec_fingerprint="d" * 64, **common
+            )
+            second = write_benchmark_report(
+                root, gate_spec_fingerprint="e" * 64, **common
+            )
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.is_file())
+            self.assertTrue(second.is_file())
+
     def test_report_written_with_scores_and_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             report = write_benchmark_report(
@@ -661,12 +684,16 @@ class ExportGateBindingTests(unittest.TestCase):
     """Audit P0-4: export refuses an artifact without its own gate PASS."""
 
     def _run_with_gate(self, base: Path, passed: bool) -> Path:
-        import hashlib
-
         import torch
 
         from game_cls.config import load_config
         from game_cls.model.builder import build_demo_model
+        from game_cls.release import release_identity
+        from game_cls.reports.benchmark import (
+            check_gates,
+            file_sha256,
+            write_benchmark_report,
+        )
 
         run_dir = base / "run"
         (run_dir / "checkpoints").mkdir(parents=True)
@@ -675,21 +702,34 @@ class ExportGateBindingTests(unittest.TestCase):
         config = load_config("configs/recipes/example_debug.yaml")
         config["experiment"]["output_dir"] = str(run_dir)
         config["export"]["output_dir"] = str(base / "exports")
+        challenge = base / "challenge.identity"
+        challenge.write_bytes(b"challenge")
+        config["data"]["challenge_index"] = str(challenge)
+        gates = {"global_fpr_at_decision_threshold": {"op": "<=", "value": 0.01}}
+        config["benchmark"]["gate_metrics"] = gates
+        config["benchmark"]["output_dir"] = str(base / "benchmarks")
         (run_dir / "resolved_config.json").write_text(
             json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        (run_dir / "benchmark_gate.json").write_text(
-            json.dumps(
-                {
-                    "passed": passed,
-                    "checkpoint": "best_selection",
-                    "checkpoint_sha256": hashlib.sha256(
-                        checkpoint.read_bytes()
-                    ).hexdigest(),
-                    "violations": [{"metric": "global_fpr"}],
-                }
-            ),
-            encoding="utf-8",
+        identity, components = release_identity(
+            run_id=run_dir.name,
+            checkpoint_sha256=file_sha256(checkpoint),
+            config=config,
+        )
+        metrics = {"global_fpr_at_decision_threshold": 0.0 if passed else 0.1}
+        write_benchmark_report(
+            base / "benchmarks",
+            run_id=run_dir.name,
+            checkpoint_alias="best_selection",
+            metrics=metrics,
+            gates=check_gates(metrics, gates),
+            grouped_metrics=None,
+            gate_metrics=gates,
+            checkpoint_sha256=identity["checkpoint_sha256"],
+            resolved_config_sha256=identity["resolved_config_sha256"],
+            challenge_dataset_fingerprint=identity["challenge_dataset_fingerprint"],
+            challenge_bundle_components=components,
+            gate_spec_fingerprint=identity["gate_spec_fingerprint"],
         )
         return run_dir
 
@@ -746,42 +786,62 @@ class ExportGateBindingTests(unittest.TestCase):
             )()
             self.assertEqual(cmd_export(args), 2)
 
-    def test_export_skips_gate_with_flag(self) -> None:
-        import torch
-
+    def test_release_and_export_reject_identity_drift(self) -> None:
+        from game_cls.cli.config_tools import cmd_release_check
         from game_cls.cli.export import cmd_export
-        from game_cls.config import load_config
-        from game_cls.model.builder import build_demo_model
 
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            run_dir = base / "run"
-            (run_dir / "checkpoints").mkdir(parents=True)
-            torch.save(
-                build_demo_model({}).state_dict(),
-                run_dir / "checkpoints" / "model_best_selection.pth",
-            )
-            config = load_config("configs/recipes/example_debug.yaml")
-            config["experiment"]["output_dir"] = str(run_dir)
-            config["export"]["output_dir"] = str(base / "exports")
-            (run_dir / "resolved_config.json").write_text(
-                json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            args = type(
-                "Args",
-                (),
-                {
-                    "run": str(run_dir),
-                    "runs_root": str(base),
-                    "config": None,
-                    "checkpoint": "best_selection",
-                    "format": "weights",
-                    "out": str(base / "exports"),
-                    "skip_gate": True,
-                },
-            )()
-            # --skip-gate explicitly opts out of the gate.
-            self.assertEqual(cmd_export(args), 0)
+        for mutation in ("threshold", "challenge", "gate"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                run_dir = self._run_with_gate(base, passed=True)
+                config_path = run_dir / "resolved_config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                if mutation == "threshold":
+                    config["decision"]["threshold"] = 0.95
+                    config["loss"]["threshold"] = 0.95
+                    config["evaluation"]["threshold"] = 0.95
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                elif mutation == "challenge":
+                    Path(config["data"]["challenge_index"]).write_bytes(b"changed")
+                else:
+                    config["benchmark"]["gate_metrics"] = {
+                        "global_fpr_at_decision_threshold": {
+                            "op": "<=",
+                            "value": 0.005,
+                        }
+                    }
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                release_args = type(
+                    "Args",
+                    (),
+                    {
+                        "run": str(run_dir),
+                        "runs_root": str(base),
+                        "config": None,
+                        "checkpoint": "best_selection",
+                    },
+                )()
+                export_args = type(
+                    "Args",
+                    (),
+                    {
+                        "run": str(run_dir),
+                        "runs_root": str(base),
+                        "config": None,
+                        "checkpoint": "best_selection",
+                        "format": "weights",
+                        "out": str(base / "exports"),
+                    },
+                )()
+                self.assertEqual(cmd_release_check(release_args), 2)
+                self.assertEqual(cmd_export(export_args), 2)
+                self.assertFalse((base / "exports" / run_dir.name).exists())
+
+    def test_export_has_no_skip_gate_bypass(self) -> None:
+        from game_cls.cli import main
+
+        with self.assertRaises(SystemExit):
+            main(["export", "--run", "x", "--skip-gate"])
 
 
 if __name__ == "__main__":

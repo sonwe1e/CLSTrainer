@@ -41,6 +41,8 @@ class BenchmarkDataTests(unittest.TestCase):
                 frame_ids=np.asarray([1, 2, 3, 4], dtype=np.int32),
                 valid_start_positions={2: np.asarray([0, 1], dtype=np.int32)},
                 video_directory=str(roots[label]),
+                stable_source_id=f"game_a::{label}::01",
+                content_version_id=f"content-{label}",
             )
             for label in (0, 1)
         ]

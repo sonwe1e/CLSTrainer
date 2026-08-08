@@ -30,19 +30,22 @@ from typing import Any
 def _resolve_source_video_index(
     frame_index: str | Path | None,
     explicit: str | Path | None = None,
-) -> Path | None:
-    """The source video-entry parquet to inherit canonical uid from (audit P0-5).
+) -> Path:
+    """Resolve the required identity-bearing source video index.
 
     Precedence:
     1. ``explicit`` -- the operator said so with ``--source-video-index``.
     2. The sibling ``*_video_entries.parquet`` of ``frame_index`` (e.g.
        ``indexes/train_frames.parquet`` -> ``indexes/train_video_entries.parquet``).
-    3. ``None`` -- uid falls back to ``game::label::video_id``.
+    Missing or misspelled paths are contract failures; packing never falls back.
     """
     if explicit:
-        return Path(explicit)
+        path = Path(explicit)
+        if not path.is_file():
+            raise FileNotFoundError(f"Source video index does not exist: {path}")
+        return path
     if not frame_index:
-        return None
+        raise FileNotFoundError("A frame index is required to resolve its video index.")
     stem = Path(frame_index).stem  # e.g. "train_frames"
     if stem.endswith("_frames"):
         candidate = Path(frame_index).with_name(
@@ -50,7 +53,14 @@ def _resolve_source_video_index(
         )
         if candidate.is_file():
             return candidate
-    return None
+        raise FileNotFoundError(
+            f"Derived source video index does not exist: {candidate}. Pass "
+            "--source-video-index explicitly."
+        )
+    raise FileNotFoundError(
+        f"Cannot derive a source video index from {frame_index}; pass "
+        "--source-video-index explicitly."
+    )
 
 # ---------------------------------------------------------------------------
 # dataset prepare / audit / pack
@@ -474,6 +484,7 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
     from game_cls.config import load_config
     from game_cls.config_schema import ConfigSchemaError
     from game_cls.data.image_spec import ImageSpec
+    from game_cls.data.indexing import SplitBundleError, verify_split_bundle
     from game_cls.data.packed_backend import pack_frame_index
 
     try:
@@ -482,31 +493,39 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
         for problem in exc.problems:
             print(f"Config error: {problem}", file=sys.stderr)
         return 2
-    index_path = pack_frame_index(
-        args.frame_index,
-        args.output_dir,
-        image_spec=ImageSpec.from_config(config["data"]),
-        images_per_shard=args.images_per_shard,
-        # Audit P0-6: bind the shards to the exact index/audit/split-manifest
-        # they were generated from, so a regenerated index with stale shards is
-        # refused at DataLoader creation.
-        audit_path=config["data"].get("audit_path"),
-        split_manifest_path=(config["data"].get("split") or {}).get("manifest"),
-        # Audit P0-5: inherit canonical_source_video_uid and sidecar fields so
-        # the packed backend and the PNG backend agree on identity. Without this
-        # the packed video index falls back to game::label::video_id while the
-        # source index carries game::label::video_id#content_hash, and every
-        # sidecar/mining/subtype join keyed on the uid silently drifts.
-        #
-        # Precedence: explicit --source-video-index, then auto-derive from the
-        # sibling *_video_entries.parquet of --frame-index (covers the common
-        # case where the user points at train_frames.parquet without having to
-        # add a second flag), then None (uid falls back, packing still works).
-        source_video_index=_resolve_source_video_index(
+    try:
+        bundle = verify_split_bundle(Path(args.frame_index).parent)
+        assert bundle is not None
+        source_video_index = _resolve_source_video_index(
             args.frame_index,
             getattr(args, "source_video_index", None),
-        ),
-    )
+        )
+        split_manifest_path = Path(
+            (config["data"].get("split") or {}).get(
+                "manifest", "split_manifest.parquet"
+            )
+        )
+        if not split_manifest_path.is_absolute():
+            split_manifest_path = Path(args.frame_index).parent / split_manifest_path
+        audit_path = Path(config["data"].get("audit_path") or "audit.json")
+        if not audit_path.is_absolute() and not audit_path.is_file():
+            audit_path = Path(args.frame_index).parent / audit_path.name
+        index_path = pack_frame_index(
+            args.frame_index,
+            args.output_dir,
+            image_spec=ImageSpec.from_config(config["data"]),
+            images_per_shard=args.images_per_shard,
+            # Bind every packed generation to its exact producer artifacts.
+            audit_path=audit_path,
+            split_manifest_path=split_manifest_path,
+            # The strict source index carries stable/content identity and is
+            # validated against every frame group by the packer.
+            source_video_index=source_video_index,
+            source_bundle_id=str(bundle["bundle_id"]),
+        )
+    except (FileNotFoundError, RuntimeError, ValueError, SplitBundleError) as exc:
+        print(f"Dataset pack refused: {exc}", file=sys.stderr)
+        return 2
     print(
         json.dumps(
             {
@@ -557,7 +576,7 @@ def _mining_rows(mined: list[dict[str, Any]], subtype: str) -> list[dict[str, An
     """Collapse mining top-K *pairs* into one row per source video.
 
     A mining manifest holds up to ``top_k_per_video`` rows per video, but
-    ``source_video_uid`` is the sidecar's primary key, so the rows must be
+    ``stable_source_id`` is the sidecar's primary key, so the rows must be
     aggregated before they can be written. The representative is the
     highest-``p_positive`` pair: that score is the video's hardest pair, which
     is the honest per-video difficulty signal and is exactly how
@@ -571,12 +590,12 @@ def _mining_rows(mined: list[dict[str, Any]], subtype: str) -> list[dict[str, An
     """
     best: dict[str, dict[str, Any]] = {}
     for row in mined:
-        uid = str(row["source_video_uid"])
+        stable_id = str(row["stable_source_id"])
         score = float(row.get("p_positive", 0.0))
-        current = best.get(uid)
+        current = best.get(stable_id)
         if current is None or score > current["p_positive"]:
-            best[uid] = {
-                "source_video_uid": uid,
+            best[stable_id] = {
+                "stable_source_id": stable_id,
                 "negative_subtype": subtype,
                 "p_positive": score,
             }
@@ -614,15 +633,15 @@ def _merge_sidecar_rows(
     conflicts: list[tuple[str, str, str]] = []
     stats = {"new": 0, "updated": 0}
     for row in incoming:
-        uid = str(row["source_video_uid"])
-        before = merged.get(uid)
+        stable_id = str(row["stable_source_id"])
+        before = merged.get(stable_id)
         if before is None:
             new_row = {field: _annotate_field(row, field) for field in _SIDECAR_FIELDS}
             # A null sample_weight would break both readers, so the column is
             # always a real float.
             if new_row["sample_weight"] is None:
                 new_row["sample_weight"] = 1.0
-            merged[uid] = new_row
+            merged[stable_id] = new_row
             stats["new"] += 1
             continue
         after = dict(before)
@@ -633,7 +652,7 @@ def _merge_sidecar_rows(
             if field == "negative_subtype":
                 current = before.get("negative_subtype")
                 if current and current != value:
-                    conflicts.append((uid, str(current), str(value)))
+                    conflicts.append((stable_id, str(current), str(value)))
                     # refuse aborts before anything is written; keep leaves the
                     # human annotation in place. Only overwrite falls through.
                     if on_subtype_conflict in ("refuse", "keep"):
@@ -643,14 +662,14 @@ def _merge_sidecar_rows(
             after["sample_weight"] = 1.0
         if after != before:
             stats["updated"] += 1
-        merged[uid] = after
+        merged[stable_id] = after
     return merged, conflicts, stats
 
 
 def cmd_dataset_annotate(args: argparse.Namespace) -> int:
     """Import per-video metadata into the sidecar (step5 P2).
 
-    Reads a CSV/parquet keyed by ``source_video_uid`` (or a mining manifest
+    Reads a CSV/parquet keyed by ``stable_source_id`` (or a mining manifest
     via ``--from-mining``), validates every uid against the configured
     train/val/test video indexes, merges the rows into whatever sidecar
     already exists and rewrites it atomically.
@@ -690,9 +709,9 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
         if not rows:
             print(f"No metadata rows in {source}", file=sys.stderr)
             return 2
-        if "source_video_uid" not in rows[0]:
+        if "stable_source_id" not in rows[0]:
             print(
-                "Metadata input must contain a source_video_uid column.",
+                "Metadata input must contain a stable_source_id column.",
                 file=sys.stderr,
             )
             return 2
@@ -710,14 +729,16 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
         return 2
     out_path = Path(out)
 
-    components = _build_real_data_components(config, rank=0, world_size=1)
+    components = _build_real_data_components(
+        config, rank=0, world_size=1, apply_metadata=False
+    )
     entries = (
         components["train_videos"]
         + components["val_videos"]
         + (components["test_videos"] or [])
     )
     incoming = {
-        str(row["source_video_uid"]): {
+        str(row["stable_source_id"]): {
             field: _annotate_field(row, field) for field in _SIDECAR_FIELDS
         }
         for row in rows
@@ -748,7 +769,7 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
         return 2
 
     sidecar_rows = [
-        {"source_video_uid": uid, **meta} for uid, meta in sorted(merged.items())
+        {"stable_source_id": uid, **meta} for uid, meta in sorted(merged.items())
     ]
     fingerprint = write_metadata_sidecar(sidecar_rows, out_path)
     payload = {
@@ -765,4 +786,120 @@ def cmd_dataset_annotate(args: argparse.Namespace) -> int:
         # Makes the top-K -> one-row-per-video aggregation visible.
         payload["mining_pairs"] = mining_pairs
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_dataset_metadata_migrate(args: argparse.Namespace) -> int:
+    """Convert a legacy source_video_uid sidecar into stable-id schema v2."""
+    import pyarrow.parquet as pq
+
+    from game_cls.config import load_config
+    from game_cls.config_schema import resolve_source_identity_namespaces
+    from game_cls.data.sidecar import write_metadata_sidecar
+    from game_cls.data.splitter import source_video_uid
+
+    config = load_config(args.config)
+    identity_cfg = config["data"].get("source_video_identity") or {}
+    mode = identity_cfg.get("mode", "game_video")
+    namespaces = resolve_source_identity_namespaces(identity_cfg)
+    assignments: dict[str, Path] = {}
+    for value in args.legacy_video_index:
+        if "=" not in value:
+            print(
+                "--legacy-video-index must be split=path (train, val or test).",
+                file=sys.stderr,
+            )
+            return 2
+        split, raw_path = value.split("=", 1)
+        if split not in {"train", "val", "test"} or split in assignments:
+            print(f"Invalid or duplicate legacy split: {split}", file=sys.stderr)
+            return 2
+        assignments[split] = Path(raw_path)
+
+    legacy_to_stable: dict[str, str] = {}
+    for split, path in assignments.items():
+        if not path.is_file():
+            print(f"Legacy video index not found: {path}", file=sys.stderr)
+            return 2
+        rows = pq.read_table(path, memory_map=False).to_pylist()
+        for row in rows:
+            legacy_id = str(
+                row.get("canonical_source_video_uid")
+                or f"{row['game']}::{int(row['label'])}::{row['video_id']}"
+            )
+            stable_id = source_video_uid(
+                str(row["game"]),
+                str(row["video_id"]),
+                int(row["label"]),
+                mode=mode,
+                namespace=namespaces.get(split),
+            )
+            previous_stable = legacy_to_stable.get(legacy_id)
+            if previous_stable is not None and previous_stable != stable_id:
+                print(
+                    f"Legacy identity {legacy_id!r} maps to both {previous_stable!r} "
+                    f"and {stable_id!r}; migration is ambiguous.",
+                    file=sys.stderr,
+                )
+                return 2
+            legacy_to_stable[legacy_id] = stable_id
+
+    legacy_sidecar = Path(args.legacy_sidecar)
+    if not legacy_sidecar.is_file():
+        print(f"Legacy sidecar not found: {legacy_sidecar}", file=sys.stderr)
+        return 2
+    rows = pq.read_table(legacy_sidecar, memory_map=False).to_pylist()
+    migrated: dict[str, dict[str, Any]] = {}
+    seen_legacy: set[str] = set()
+    for row in rows:
+        legacy_id = str(row.get("source_video_uid") or "")
+        if not legacy_id or legacy_id in seen_legacy:
+            print(
+                f"Legacy sidecar has missing or duplicate source_video_uid: "
+                f"{legacy_id!r}",
+                file=sys.stderr,
+            )
+            return 2
+        seen_legacy.add(legacy_id)
+        mapped_stable_id = legacy_to_stable.get(legacy_id)
+        if mapped_stable_id is None:
+            print(
+                f"Legacy sidecar identity {legacy_id!r} is absent from the "
+                "supplied legacy video indexes.",
+                file=sys.stderr,
+            )
+            return 2
+        metadata = {
+            field: row.get(field)
+            for field in _SIDECAR_FIELDS
+            if row.get(field) is not None
+        }
+        metadata.setdefault("sample_weight", 1.0)
+        previous_metadata = migrated.get(mapped_stable_id)
+        if previous_metadata is not None and previous_metadata != metadata:
+            print(
+                f"Conflicting legacy annotations collapse into stable identity "
+                f"{mapped_stable_id!r}; resolve them before migration.",
+                file=sys.stderr,
+            )
+            return 2
+        migrated[mapped_stable_id] = metadata
+
+    output_rows = [
+        {"stable_source_id": stable_id, **metadata}
+        for stable_id, metadata in sorted(migrated.items())
+    ]
+    fingerprint = write_metadata_sidecar(output_rows, args.out)
+    print(
+        json.dumps(
+            {
+                "sidecar": str(args.out),
+                "videos": len(output_rows),
+                "metadata_version": 2,
+                "metadata_fingerprint": fingerprint,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0

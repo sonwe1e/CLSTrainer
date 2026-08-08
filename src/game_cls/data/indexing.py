@@ -992,7 +992,12 @@ def write_index_bundle(
         )
 
         write_video_entries_parquet(
-            build_video_entries(result.frames),
+            build_video_entries(
+                result.frames,
+                identity_mode=identity_mode,
+                namespace=(namespaces_by_split or {}).get(split),
+                require_content_hash=compute_content_hash,
+            ),
             output_dir / f"{split}_video_entries.parquet",
         )
     audit = make_audit(
@@ -1043,6 +1048,7 @@ def write_split_bundle(
             "identity_mode must be 'game_video' or 'game_label_video', "
             f"got {identity_mode!r}"
         )
+    namespaces_by_split = namespaces_by_split or {}
     # A caller may record the mode inside split_config (tools/build_index.py
     # does); if it disagrees with the explicit kwarg, fail rather than
     # silently split under the wrong leakage unit.
@@ -1164,7 +1170,12 @@ def write_split_bundle(
                 staging / f"{split}_videos.parquet",
             )
             write_video_entries_parquet(
-                build_video_entries(frames),
+                build_video_entries(
+                    frames,
+                    identity_mode=identity_mode,
+                    namespace=namespaces_by_split.get(split),
+                    require_content_hash=True,
+                ),
                 staging / f"{split}_video_entries.parquet",
             )
 

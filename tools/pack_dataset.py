@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from game_cls.config import load_config
 from game_cls.data.image_spec import ImageSpec
+from game_cls.data.indexing import verify_split_bundle
 from game_cls.data.packed_backend import pack_frame_index
 
 
@@ -19,15 +20,24 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--frame-index", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--source-video-index", required=True)
     parser.add_argument("--images-per-shard", type=int, default=4096)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     config = load_config(args.config, args.overrides)
+    bundle = verify_split_bundle(Path(args.frame_index).parent)
+    if bundle is None:
+        raise RuntimeError("The source split bundle is not sealed.")
+    split_manifest = Path(args.frame_index).parent / "split_manifest.parquet"
     index_path = pack_frame_index(
         args.frame_index,
         args.output_dir,
         image_spec=ImageSpec.from_config(config["data"]),
         images_per_shard=args.images_per_shard,
+        source_video_index=args.source_video_index,
+        source_bundle_id=str(bundle["bundle_id"]),
+        audit_path=Path(args.frame_index).parent / "audit.json",
+        split_manifest_path=split_manifest,
     )
     print(
         json.dumps(

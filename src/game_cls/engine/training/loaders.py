@@ -107,7 +107,13 @@ def _loader_common(config: dict, role: str) -> dict:
     return common
 
 
-def _build_real_data_components(config: dict, rank: int, world_size: int) -> dict:
+def _build_real_data_components(
+    config: dict,
+    rank: int,
+    world_size: int,
+    *,
+    apply_metadata: bool = True,
+) -> dict:
     """Shared split metadata for training and standalone evaluation.
 
     Returns train/val/test video entries plus per-split decoders. The test
@@ -214,7 +220,7 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
     # part of any dedup identity, and defaults every field to None/1.0 when
     # absent — so a config without metadata_sidecar stays byte-identical.
     metadata_sidecar_path = data_cfg.get("metadata_sidecar")
-    if metadata_sidecar_path:
+    if metadata_sidecar_path and apply_metadata:
         from game_cls.data.sidecar import (
             apply_sidecar,
             read_metadata_sidecar,
@@ -242,19 +248,31 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
         # Audit P0-6: refuse stale shards before a DataLoader is built. A
         # regenerated index/audit with forgotten repacking would otherwise make
         # the framework prove the new index while the model eats old pixels.
-        provenance_audit_path = data_cfg.get("audit_path") or str(
-            Path(data_cfg["train_index"]).parent / "audit.json"
-        )
         for split in ("train", "val", "test"):
             if split == "test" and test_videos is None:
                 continue
+            source_frame_index = data_cfg.get(f"{split}_index")
+            source_dir = Path(source_frame_index).parent
+            provenance_audit_path = Path(
+                data_cfg.get("audit_path") or source_dir / "audit.json"
+            )
+            if not provenance_audit_path.is_absolute() and not provenance_audit_path.is_file():
+                provenance_audit_path = source_dir / provenance_audit_path.name
+            split_manifest_path = Path(
+                (data_cfg.get("split") or {}).get(
+                    "manifest", "split_manifest.parquet"
+                )
+            )
+            if not split_manifest_path.is_absolute():
+                split_manifest_path = source_dir / split_manifest_path
             verify_packed_provenance(
                 Path(data_cfg[f"{split}_packed_index"]).with_name(
                     "packed_manifest.json"
                 ),
-                data_cfg.get(f"{split}_index"),
+                source_frame_index,
+                current_video_index=data_cfg.get(f"{split}_video_index"),
                 audit_path=provenance_audit_path,
-                split_manifest_path=(data_cfg.get("split") or {}).get("manifest"),
+                split_manifest_path=split_manifest_path,
             )
             # Integrity is a separate failure from provenance: the shards can
             # come from the right sources and still be truncated or corrupt.
@@ -480,6 +498,7 @@ def build_external_pool_loader(
         source: dict = data_cfg
         section = "data"
         keys = {
+            "frame": "challenge_index",
             "video": "challenge_video_index",
             "packed_video": "challenge_packed_video_index",
             "packed": "challenge_packed_index",
@@ -489,6 +508,7 @@ def build_external_pool_loader(
         source = data_cfg.get("mining") or {}
         section = "data.mining"
         keys = {
+            "frame": "pool_index",
             "video": "pool_video_index",
             "packed_video": "pool_packed_video_index",
             "packed": "pool_packed_index",
@@ -510,6 +530,16 @@ def build_external_pool_loader(
             f"data.backend=packed_uint8 requires {path['packed']}. Without it "
             "the PNG decoder would be used on packed shards."
         )
+    source_frame_index = source.get(keys["frame"])
+    source_video_index = source.get(keys["video"])
+    if packed and (not source_frame_index or not source_video_index):
+        raise ValueError(
+            f"Packed {pool} evaluation requires provenance sources "
+            f"{path['frame']} and {path['video']}."
+        )
+    if packed:
+        assert source_frame_index is not None
+        assert source_video_index is not None
 
     test_delta = int(config["pair"]["test_delta"])
     videos = read_video_entries_parquet(video_index, (test_delta,))
@@ -530,17 +560,23 @@ def build_external_pool_loader(
     if packed:
         from game_cls.data.packed_backend import (
             PackedUint8Backend,
+            verify_packed_provenance,
             verify_packed_shards,
         )
 
         assert packed_index is not None
-        # Audit P0-6: the train/val/test path verifies its shards, but this
-        # path built the backend with no check at all -- so a corrupt shard
-        # was caught for training data and waved through for the challenge
-        # set that gates a release. Provenance needs the source frame index,
-        # which an external pool config does not carry; integrity needs only
-        # the manifest, so it applies here unconditionally.
-        verify_packed_shards(Path(packed_index).with_name("packed_manifest.json"))
+        source_frame_path = str(source_frame_index)
+        source_video_path = str(source_video_index)
+        packed_manifest = Path(packed_index).with_name("packed_manifest.json")
+        source_dir = Path(source_frame_path).parent
+        verify_packed_provenance(
+            packed_manifest,
+            source_frame_path,
+            current_video_index=source_video_path,
+            audit_path=source_dir / "audit.json",
+            split_manifest_path=source_dir / "split_manifest.parquet",
+        )
+        verify_packed_shards(packed_manifest)
         decoder = PackedUint8Backend(
             packed_index,
             image_spec=ImageSpec.from_config(data_cfg),

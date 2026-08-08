@@ -3,9 +3,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import shutil
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .image_spec import ImageSpec
 
@@ -51,6 +53,7 @@ def verify_packed_provenance(
     manifest_path: str | Path,
     current_frame_index: str | Path | None,
     *,
+    current_video_index: str | Path | None = None,
     audit_path: str | Path | None = None,
     split_manifest_path: str | Path | None = None,
 ) -> None:
@@ -68,6 +71,11 @@ def verify_packed_provenance(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"Packed manifest is unreadable: {manifest_path}: {exc}") from exc
+    if int(manifest.get("format_version", 0)) != 4:
+        raise RuntimeError(
+            f"Packed manifest {manifest_path} is not format v4; re-run "
+            "'cls-trainer dataset pack'."
+        )
 
     def _check(field: str, current_path: str | Path | None) -> None:
         recorded = manifest.get(field)
@@ -107,28 +115,27 @@ def verify_packed_provenance(
     # only checked when the packer recorded them (the pack may legitimately
     # have had no audit/split-manifest to bind to).
     _check("source_frame_index_sha256", current_frame_index)
-    if audit_path is not None and manifest.get("audit_fingerprint"):
-        _check("audit_fingerprint", audit_path)
-    if split_manifest_path is not None and manifest.get(
-        "split_manifest_fingerprint"
-    ):
-        _check("split_manifest_fingerprint", split_manifest_path)
+    _check("source_video_index_sha256", current_video_index)
+    _check("audit_fingerprint", audit_path)
+    _check("split_manifest_fingerprint", split_manifest_path)
 
     # Audit P0-9: the file hashes above can all agree while the shards still
     # belong to a superseded generation of the split bundle -- re-preparing
     # rewrites the bundle and mints a new bundle_id, and only comparing that id
     # catches shards packed from the previous one.
     recorded_bundle = str(manifest.get("source_bundle_id") or "")
-    if recorded_bundle:
-        current_bundle = _source_bundle_id(current_frame_index)
-        if current_bundle and current_bundle != recorded_bundle:
-            raise RuntimeError(
-                f"Packed data is stale: it was packed from split bundle "
-                f"{recorded_bundle}, but the index directory now holds bundle "
-                f"{current_bundle}. The split was re-prepared without "
-                "repacking, so the shards belong to a superseded generation; "
-                "re-run 'cls-trainer dataset pack'."
-            )
+    current_bundle = _source_bundle_id(current_frame_index)
+    if not recorded_bundle or not current_bundle:
+        raise RuntimeError(
+            "Packed provenance has no verifiable source_bundle_id; re-run "
+            "'cls-trainer dataset pack' from a sealed split bundle."
+        )
+    if current_bundle != recorded_bundle:
+        raise RuntimeError(
+            f"Packed data is stale: it was packed from split bundle "
+            f"{recorded_bundle}, but the index directory now holds bundle "
+            f"{current_bundle}. Re-run 'cls-trainer dataset pack'."
+        )
 
 
 def verify_packed_shards(manifest_path: str | Path) -> None:
@@ -353,7 +360,7 @@ class PackedUint8Backend:
             self.close()
 
 
-def pack_frame_index(
+def _pack_frame_index_into(
     frame_index: str | Path,
     output_dir: str | Path,
     *,
@@ -379,6 +386,12 @@ def pack_frame_index(
             f"Packing requires RGB images with 3 channels, got {image_spec.channels}"
         )
     parquet_file = pq.ParquetFile(frame_index)
+    if source_video_index is None or not Path(source_video_index).is_file():
+        raise FileNotFoundError(
+            f"A readable source video index is required: {source_video_index}"
+        )
+    if not source_bundle_id:
+        raise ValueError("source_bundle_id is required for packed format v4")
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     index_path = output_dir / "packed_frames.parquet"
@@ -459,19 +472,27 @@ def pack_frame_index(
                 pa.Table.from_pylist(row_buffer, schema=index_schema)
             )
         index_writer.close()
+    grouped_frame_count = sum(len(values) for values in packed_groups.values())
+    if grouped_frame_count != index:
+        raise ValueError(
+            "Every frame-index row must carry game, label, video_id and frame_id; "
+            f"only {grouped_frame_count} of {index} rows satisfied the contract."
+        )
     # Audit P0-6: bind the shards to the exact sources they were generated
     # from, so a regenerated index or audit with stale shards is refused before
     # a DataLoader is built. ``dataset_fingerprint`` and ``audit_fingerprint``
     # are both derived from the audit file: the dataset's audit is its
     # fingerprint, and the audit file hash pins the exact audit revision.
     manifest = {
-        "format_version": 3,
+        "format_version": 4,
         "channels": image_spec.channels,
         "height": image_spec.height,
         "width": image_spec.width,
         "image_bytes": (image_spec.channels * image_spec.height * image_spec.width),
         "frame_count": index,
         "source_frame_index_sha256": _file_sha256(frame_index),
+        "source_video_index_sha256": _file_sha256(source_video_index),
+        "source_bundle_id": str(source_bundle_id),
         "dataset_fingerprint": _file_sha256(audit_path),
         "audit_fingerprint": _file_sha256(audit_path),
         "split_manifest_fingerprint": _file_sha256(split_manifest_path),
@@ -494,12 +515,23 @@ def pack_frame_index(
         # Audit P0-5: carry identity across from the source video index rather
         # than recomputing it. Keyed on (game, label, video_id), which is
         # exactly how packed_groups is keyed, so the join is exact.
-        source_identity: dict[tuple[str, int, str], VideoEntry] = {}
-        if source_video_index is not None and Path(source_video_index).is_file():
-            source_identity = {
-                (entry.game, int(entry.label), entry.video_id): entry
-                for entry in read_video_entries_parquet(source_video_index)
-            }
+        source_entries = read_video_entries_parquet(source_video_index)
+        source_identity = {
+            (entry.game, int(entry.label), entry.video_id): entry
+            for entry in source_entries
+        }
+        if len(source_identity) != len(source_entries):
+            raise ValueError("Source video index contains duplicate video keys.")
+        packed_keys = set(packed_groups)
+        source_keys = set(source_identity)
+        if packed_keys != source_keys:
+            missing = sorted(packed_keys - source_keys)
+            extra = sorted(source_keys - packed_keys)
+            raise ValueError(
+                "Frame/video index key mismatch: "
+                f"missing_in_video_index={missing[:10]}, "
+                f"extra_in_video_index={extra[:10]}"
+            )
 
         entries = []
         for (game, label, video_id), values in sorted(packed_groups.items()):
@@ -523,6 +555,18 @@ def pack_frame_index(
                 for delta in (1, 2, 3)
             }
             inherited = source_identity.get((game, label, video_id))
+            assert inherited is not None
+            if frame_ids.tolist() != inherited.frame_ids.tolist():
+                raise ValueError(
+                    f"Frame ids disagree for {game}/{label}/{video_id}: "
+                    f"frame index={frame_ids.tolist()} video index="
+                    f"{inherited.frame_ids.tolist()}"
+                )
+            if not inherited.stable_source_id or not inherited.content_version_id:
+                raise ValueError(
+                    f"Source video {game}/{label}/{video_id} has no complete "
+                    "stable/content identity."
+                )
             entries.append(
                 VideoEntry(
                     game=game,
@@ -531,27 +575,45 @@ def pack_frame_index(
                     frame_ids=frame_ids,
                     valid_start_positions=valid,
                     frame_locations=locations,
-                    # Audit P0-5: the canonical uid is content-anchored and is
-                    # computed once in build_video_entries() from per-frame
-                    # content hashes, which the packed frame index does not
-                    # carry. Rebuilding VideoEntry without it silently demoted
-                    # source_video_uid to the game::label::video_id fallback,
-                    # so the packed backend and the PNG backend disagreed on
-                    # identity and every sidecar/mining/subtype join keyed on
-                    # it drifted. Inherit it (and the sidecar-joined fields)
-                    # from the source video index instead of recomputing.
-                    canonical_source_video_uid=(
-                        inherited.canonical_source_video_uid if inherited else ""
-                    ),
-                    negative_subtype=(
-                        inherited.negative_subtype if inherited else None
-                    ),
-                    sample_weight=(
-                        inherited.sample_weight if inherited else 1.0
-                    ),
+                    stable_source_id=inherited.stable_source_id,
+                    content_version_id=inherited.content_version_id,
+                    negative_subtype=inherited.negative_subtype,
+                    sample_weight=inherited.sample_weight,
                 )
             )
         write_video_entries_parquet(
             entries, output_dir / "packed_video_entries.parquet"
         )
     return index_path
+
+
+def pack_frame_index(
+    frame_index: str | Path,
+    output_dir: str | Path,
+    **kwargs: Any,
+) -> Path:
+    """Build a complete packed generation and publish it atomically."""
+    destination = Path(output_dir).resolve()
+    if destination.exists():
+        raise FileExistsError(
+            f"Packed output is immutable and already exists: {destination}"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(f".{destination.name}.staging-{uuid4().hex}")
+    try:
+        index_path = _pack_frame_index_into(frame_index, staging, **kwargs)
+        if not (staging / "packed_video_entries.parquet").is_file():
+            raise RuntimeError("Packing produced no identity-bearing video index.")
+        verify_packed_shards(staging / "packed_manifest.json")
+        verify_packed_provenance(
+            staging / "packed_manifest.json",
+            frame_index,
+            current_video_index=kwargs.get("source_video_index"),
+            audit_path=kwargs.get("audit_path"),
+            split_manifest_path=kwargs.get("split_manifest_path"),
+        )
+        staging.replace(destination)
+        return destination / index_path.name
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise

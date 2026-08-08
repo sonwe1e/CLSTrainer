@@ -29,14 +29,16 @@ silently reads ``metric absent`` after a full benchmark run.
 
 from __future__ import annotations
 
+import datetime
 import difflib
 import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-MINING_MANIFEST_VERSION = 1
+MINING_MANIFEST_VERSION = 2
 
 
 def file_sha256(path: str | Path) -> str:
@@ -487,9 +489,16 @@ def write_mining_manifest(rows: list[dict[str, Any]], path: str | Path) -> None:
     pa, pq = _pyarrow()
     normalized = []
     for row in rows:
+        requested_version = int(row.get("mining_version", MINING_MANIFEST_VERSION))
+        if requested_version != MINING_MANIFEST_VERSION:
+            raise ValueError(
+                f"Mining manifest version {requested_version} is obsolete; "
+                f"expected {MINING_MANIFEST_VERSION}."
+            )
         normalized.append(
             {
-                "source_video_uid": str(row["source_video_uid"]),
+                "stable_source_id": str(row["stable_source_id"]),
+                "source_version_id": str(row["source_version_id"]),
                 "game": row.get("game", ""),
                 "video_id": row.get("video_id", ""),
                 "frame0_id": int(row.get("frame0_id", 0)),
@@ -568,15 +577,15 @@ def scan_negative_pool(
                 # meta instead of re-deriving ``game::video_id``; the legacy
                 # fallback only covers frame-based PairSample metas that never
                 # carried one.
-                uid = meta.get("source_video_uid") or (
-                    f"{meta['game']}::{meta['video_id']}"
-                )
+                stable_id = str(meta["stable_source_id"])
+                version_id = str(meta["source_version_id"])
                 p_positive = float(probability[index].item())
                 if score_threshold is not None and p_positive < score_threshold:
                     continue
-                by_video[uid].append(
+                by_video[version_id].append(
                     {
-                        "source_video_uid": uid,
+                        "stable_source_id": stable_id,
+                        "source_version_id": version_id,
                         "game": meta["game"],
                         "video_id": meta["video_id"],
                         "frame0_id": int(meta["frame0_id"]),
@@ -697,7 +706,7 @@ def write_benchmark_report(
     gate_spec_fingerprint: str = "",
     challenge_bundle_components: dict[str, Any] | None = None,
 ) -> Path:
-    """Write ``benchmarks/<run>_<alias>/report.json`` and return its path.
+    """Append one immutable release-identity report and return its path.
 
     ``gate_metrics`` is the raw configured gate dict; recording it makes the
     report self-describing, so a release check can tell a gate that really
@@ -712,7 +721,24 @@ def write_benchmark_report(
     sees a differing digest can name the leg that moved (the sidecar, the frame
     index, the image geometry) rather than reporting two opaque hashes.
     """
-    report_dir = output_dir / f"{run_id or 'run'}_{checkpoint_alias}"
+    from game_cls.release import release_identity_sha256
+
+    identity = {
+        "run_id": str(run_id),
+        "checkpoint_sha256": str(checkpoint_sha256),
+        "resolved_config_sha256": str(resolved_config_sha256),
+        "challenge_dataset_fingerprint": str(challenge_dataset_fingerprint),
+        "gate_spec_fingerprint": str(gate_spec_fingerprint),
+    }
+    identity_sha = release_identity_sha256(identity)
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    report_dir = (
+        output_dir
+        / (run_id or "run")
+        / (checkpoint_sha256 or "unbound")
+        / identity_sha
+        / f"{stamp}-{uuid4().hex[:8]}"
+    )
     report_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
@@ -722,6 +748,7 @@ def write_benchmark_report(
         "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
         "challenge_bundle_components": challenge_bundle_components or {},
         "gate_spec_fingerprint": gate_spec_fingerprint,
+        "release_identity_sha256": identity_sha,
         "scores": _scores_from_metrics(metrics, gate_metrics),
         "gate_metrics": gate_metrics or {},
         "gates": [
@@ -731,5 +758,9 @@ def write_benchmark_report(
         "grouped": grouped_metrics or {},
     }
     path = report_dir / "report.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp = report_dir / ".report.json.tmp"
+    temp.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temp.replace(path)
     return path

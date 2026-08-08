@@ -25,7 +25,7 @@ import argparse
 from game_cls.cli.benchmark import (
     cmd_benchmark_data,
     cmd_benchmark_evaluate,
-    cmd_benchmark_gate_check,
+    cmd_benchmark_gate_show,
     cmd_benchmark_scan_negatives,
 )
 from game_cls.cli.common import DEFAULT_RUNS_ROOT
@@ -38,6 +38,7 @@ from game_cls.cli.config_tools import (
 from game_cls.cli.dataset import (
     cmd_dataset_annotate,
     cmd_dataset_audit,
+    cmd_dataset_metadata_migrate,
     cmd_dataset_pack,
     cmd_dataset_prepare,
     cmd_dataset_seal,
@@ -298,10 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument(
         "--source-video-index",
         default=None,
-        help="Video-entry parquet to inherit canonical_source_video_uid and "
-        "sidecar fields from (audit P0-5). When omitted, the packer tries "
-        "the sibling *_video_entries.parquet of --frame-index; if that also "
-        "does not exist the uid falls back to game::label::video_id.",
+        help="Required identity-bearing video-entry parquet. When omitted, "
+        "derive sibling *_video_entries.parquet; missing paths are fatal.",
     )
     pack.add_argument("overrides", nargs="*", metavar="key=value")
     pack.set_defaults(func=cmd_dataset_pack)
@@ -316,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
     annotate_source = annotate.add_mutually_exclusive_group(required=True)
     annotate_source.add_argument(
         "--metadata",
-        help="CSV/parquet of per-video rows: source_video_uid, "
+        help="CSV/parquet of per-video rows: stable_source_id, "
         "negative_subtype, sample_weight, ...",
     )
     annotate_source.add_argument(
@@ -344,6 +343,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     annotate.add_argument("overrides", nargs="*", metavar="key=value")
     annotate.set_defaults(func=cmd_dataset_annotate)
+    migrate = dataset_sub.add_parser(
+        "metadata-migrate",
+        help="Convert a legacy source_video_uid sidecar to stable-id schema v2.",
+    )
+    migrate.add_argument("--config", required=True)
+    migrate.add_argument("--legacy-sidecar", required=True)
+    migrate.add_argument(
+        "--legacy-video-index",
+        action="append",
+        required=True,
+        metavar="SPLIT=PATH",
+        help="Legacy video index and its split; repeat for train/val/test.",
+    )
+    migrate.add_argument("--out", required=True)
+    migrate.set_defaults(func=cmd_dataset_metadata_migrate)
 
     export = subparsers.add_parser(
         "export",
@@ -372,13 +386,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         default=None,
         help="Override export.output_dir (default: exports).",
-    )
-    export.add_argument(
-        "--skip-gate",
-        action="store_true",
-        help="Export even when this checkpoint has no benchmark PASS bound to "
-        "it. Default refuses: an artifact without an exact-checkpoint gate "
-        "report is not releasable (audit P0-4).",
     )
     export.set_defaults(func=cmd_export)
 
@@ -425,13 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bench_eval.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
     bench_eval.set_defaults(func=cmd_benchmark_evaluate)
-    bench_gate_check = benchmark_sub.add_parser(
-        "gate-check",
-        help="Check a persisted benchmark_gate.json without re-running evaluation. "
-        "Exits 0 (passed), 1 (failed), or 2 (file missing/malformed).",
+    bench_gate_show = benchmark_sub.add_parser(
+        "gate-show",
+        help="Display immutable benchmark history (informational only).",
     )
-    bench_gate_check.add_argument("--run", required=True)
-    bench_gate_check.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
-    bench_gate_check.set_defaults(func=cmd_benchmark_gate_check)
+    bench_gate_show.add_argument("--run", required=True)
+    bench_gate_show.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    bench_gate_show.set_defaults(func=cmd_benchmark_gate_show)
 
     return parser

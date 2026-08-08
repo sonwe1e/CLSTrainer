@@ -22,7 +22,8 @@ class MiningManifestTests(unittest.TestCase):
     def test_write_read_roundtrip(self) -> None:
         rows = [
             {
-                "source_video_uid": "A::01",
+                "stable_source_id": "A::01",
+                "source_version_id": "A::01#v1",
                 "game": "A",
                 "video_id": "01",
                 "frame0_id": 1,
@@ -38,9 +39,9 @@ class MiningManifestTests(unittest.TestCase):
             write_mining_manifest(rows, path)
             loaded = read_mining_manifest(path)
             self.assertEqual(len(loaded), 1)
-            self.assertEqual(loaded[0]["source_video_uid"], "A::01")
+            self.assertEqual(loaded[0]["stable_source_id"], "A::01")
             self.assertEqual(loaded[0]["p_positive"], 0.9)
-            self.assertEqual(loaded[0]["mining_version"], 1)
+            self.assertEqual(loaded[0]["mining_version"], 2)
 
     def test_version_mismatch_rejected(self) -> None:
         import pyarrow as pa
@@ -50,7 +51,7 @@ class MiningManifestTests(unittest.TestCase):
             path = Path(directory) / "bad.parquet"
             pq.write_table(
                 pa.Table.from_pylist(
-                    [{"source_video_uid": "A::01", "mining_version": 99}]
+                    [{"stable_source_id": "A::01", "mining_version": 99}]
                 ),
                 path,
             )
@@ -127,6 +128,10 @@ class ScanNegativePoolTests(unittest.TestCase):
                 "negative_subtype": None,
             },
         ]
+        for meta in metas:
+            stable_id = f"{meta['game']}::{meta['video_id']}"
+            meta["stable_source_id"] = stable_id
+            meta["source_version_id"] = f"{stable_id}#v1"
         return [{"images": images, "labels": labels, "meta": metas}]
 
     def test_topk_per_video_and_dedup(self) -> None:
@@ -139,7 +144,7 @@ class ScanNegativePoolTests(unittest.TestCase):
             score_threshold=None,
             max_samples=None,
         )
-        by_uid = {row["source_video_uid"]: row["p_positive"] for row in rows}
+        by_uid = {row["stable_source_id"]: row["p_positive"] for row in rows}
         # softmax((-score, score))[1] = sigmoid(2*score), so p_positive is
         # monotone in score but not equal to it.
         self.assertEqual(len(rows), 3)
