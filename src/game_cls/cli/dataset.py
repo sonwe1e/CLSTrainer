@@ -26,6 +26,32 @@ import sys
 from pathlib import Path
 from typing import Any
 
+
+def _resolve_source_video_index(
+    frame_index: str | Path | None,
+    explicit: str | Path | None = None,
+) -> Path | None:
+    """The source video-entry parquet to inherit canonical uid from (audit P0-5).
+
+    Precedence:
+    1. ``explicit`` -- the operator said so with ``--source-video-index``.
+    2. The sibling ``*_video_entries.parquet`` of ``frame_index`` (e.g.
+       ``indexes/train_frames.parquet`` -> ``indexes/train_video_entries.parquet``).
+    3. ``None`` -- uid falls back to ``game::label::video_id``.
+    """
+    if explicit:
+        return Path(explicit)
+    if not frame_index:
+        return None
+    stem = Path(frame_index).stem  # e.g. "train_frames"
+    if stem.endswith("_frames"):
+        candidate = Path(frame_index).with_name(
+            stem[: -len("_frames")] + "_video_entries.parquet"
+        )
+        if candidate.is_file():
+            return candidate
+    return None
+
 # ---------------------------------------------------------------------------
 # dataset prepare / audit / pack
 # ---------------------------------------------------------------------------
@@ -466,6 +492,20 @@ def cmd_dataset_pack(args: argparse.Namespace) -> int:
         # refused at DataLoader creation.
         audit_path=config["data"].get("audit_path"),
         split_manifest_path=(config["data"].get("split") or {}).get("manifest"),
+        # Audit P0-5: inherit canonical_source_video_uid and sidecar fields so
+        # the packed backend and the PNG backend agree on identity. Without this
+        # the packed video index falls back to game::label::video_id while the
+        # source index carries game::label::video_id#content_hash, and every
+        # sidecar/mining/subtype join keyed on the uid silently drifts.
+        #
+        # Precedence: explicit --source-video-index, then auto-derive from the
+        # sibling *_video_entries.parquet of --frame-index (covers the common
+        # case where the user points at train_frames.parquet without having to
+        # add a second flag), then None (uid falls back, packing still works).
+        source_video_index=_resolve_source_video_index(
+            args.frame_index,
+            getattr(args, "source_video_index", None),
+        ),
     )
     print(
         json.dumps(

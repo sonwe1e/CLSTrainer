@@ -295,6 +295,14 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument("--frame-index", required=True)
     pack.add_argument("--output-dir", required=True)
     pack.add_argument("--images-per-shard", type=int, default=4096)
+    pack.add_argument(
+        "--source-video-index",
+        default=None,
+        help="Video-entry parquet to inherit canonical_source_video_uid and "
+        "sidecar fields from (audit P0-5). When omitted, the packer tries "
+        "the sibling *_video_entries.parquet of --frame-index; if that also "
+        "does not exist the uid falls back to game::label::video_id.",
+    )
     pack.add_argument("overrides", nargs="*", metavar="key=value")
     pack.set_defaults(func=cmd_dataset_pack)
     annotate = dataset_sub.add_parser(
