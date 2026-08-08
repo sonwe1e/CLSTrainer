@@ -24,6 +24,29 @@ def _file_sha256(path: str | Path | None) -> str:
     return digest.hexdigest()
 
 
+def _source_bundle_id(frame_index: str | Path | None) -> str:
+    """``bundle_id`` of the split bundle a frame index belongs to (audit P0-9).
+
+    Read from the ``bundle_manifest.json`` sitting beside the frame index.
+    Empty when the index is not part of a sealed bundle, which keeps packing an
+    unsealed legacy directory possible -- the binding then simply cannot be
+    asserted later, and ``verify_packed_provenance`` says so rather than
+    inventing agreement.
+    """
+    if frame_index is None:
+        return ""
+    manifest = Path(frame_index).parent / "bundle_manifest.json"
+    if not manifest.is_file():
+        return ""
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("bundle_id") or "")
+
+
 def verify_packed_provenance(
     manifest_path: str | Path,
     current_frame_index: str | Path | None,
@@ -56,8 +79,22 @@ def verify_packed_provenance(
                 "the provenance binding. Re-run 'cls-trainer dataset pack' to "
                 "regenerate provenance-bound shards."
             )
+        # Audit P0-6: _file_sha256 returns "" for a missing/unreadable file,
+        # so the previous ``if current and current != recorded`` guard treated
+        # ABSENCE as agreement -- deleting or moving the source index made the
+        # staleness check silently pass. An unhashable source cannot prove the
+        # shards match, so it is a failure, and the message distinguishes the
+        # two causes.
         current = _file_sha256(current_path)
-        if current and current != recorded:
+        if not current:
+            raise RuntimeError(
+                f"Packed provenance cannot be verified: {field} refers to "
+                f"{current_path}, which is missing or unreadable. The manifest "
+                f"records {recorded[:16]}..., but the current file cannot be "
+                "hashed, so staleness cannot be ruled out. Restore the source "
+                "or re-run 'cls-trainer dataset pack'."
+            )
+        if current != recorded:
             raise RuntimeError(
                 f"Packed data is stale: {field} changed since packing "
                 f"(manifest {recorded[:16]}..., current {current[:16]}...). "
@@ -76,6 +113,73 @@ def verify_packed_provenance(
         "split_manifest_fingerprint"
     ):
         _check("split_manifest_fingerprint", split_manifest_path)
+
+    # Audit P0-9: the file hashes above can all agree while the shards still
+    # belong to a superseded generation of the split bundle -- re-preparing
+    # rewrites the bundle and mints a new bundle_id, and only comparing that id
+    # catches shards packed from the previous one.
+    recorded_bundle = str(manifest.get("source_bundle_id") or "")
+    if recorded_bundle:
+        current_bundle = _source_bundle_id(current_frame_index)
+        if current_bundle and current_bundle != recorded_bundle:
+            raise RuntimeError(
+                f"Packed data is stale: it was packed from split bundle "
+                f"{recorded_bundle}, but the index directory now holds bundle "
+                f"{current_bundle}. The split was re-prepared without "
+                "repacking, so the shards belong to a superseded generation; "
+                "re-run 'cls-trainer dataset pack'."
+            )
+
+
+def verify_packed_shards(manifest_path: str | Path) -> None:
+    """Verify every shard's bytes against the manifest hash (audit P0-6).
+
+    ``pack_frame_index`` records a ``shard_sha256`` map, but nothing ever read
+    it back, so a truncated, half-written or silently corrupted shard reached
+    the DataLoader as garbage pixels and surfaced only as unexplained loss.
+    Provenance (which sources the shards came from) and integrity (whether the
+    shard bytes are still intact) are separate failures, so this is a separate
+    check with its own message.
+    """
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Packed shard manifest is missing: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Packed manifest is unreadable: {manifest_path}: {exc}"
+        ) from exc
+    shards = list(manifest.get("shards") or ())
+    recorded = manifest.get("shard_sha256")
+    if shards and not recorded:
+        raise RuntimeError(
+            f"Packed manifest {manifest_path} records {len(shards)} shard(s) "
+            "but no shard_sha256 map; it predates shard integrity checking. "
+            "Re-run 'cls-trainer dataset pack'."
+        )
+    for name in shards:
+        shard_path = manifest_path.parent / name
+        if not shard_path.is_file():
+            raise RuntimeError(
+                f"Packed shard is missing: {shard_path}. The manifest lists "
+                f"{len(shards)} shard(s); re-run 'cls-trainer dataset pack'."
+            )
+        expected = str(recorded.get(name) or "")
+        if not expected:
+            raise RuntimeError(
+                f"Packed manifest {manifest_path} has no shard_sha256 entry "
+                f"for {name}; its integrity cannot be verified. Re-run "
+                "'cls-trainer dataset pack'."
+            )
+        actual = _file_sha256(shard_path)
+        if actual != expected:
+            raise RuntimeError(
+                f"Packed shard is corrupt: {name} does not match its recorded "
+                f"hash (manifest {expected[:16]}..., current {actual[:16]}...). "
+                "The shard changed or was truncated after packing; re-run "
+                "'cls-trainer dataset pack'."
+            )
 
 
 class PackedUint8Backend:
@@ -257,6 +361,8 @@ def pack_frame_index(
     images_per_shard: int = 4096,
     audit_path: str | Path | None = None,
     split_manifest_path: str | Path | None = None,
+    source_video_index: str | Path | None = None,
+    source_bundle_id: str | None = None,
 ) -> Path:
     try:
         import numpy as np
@@ -381,8 +487,19 @@ def pack_frame_index(
     if packed_groups:
         from game_cls.data.video_index import (
             VideoEntry,
+            read_video_entries_parquet,
             write_video_entries_parquet,
         )
+
+        # Audit P0-5: carry identity across from the source video index rather
+        # than recomputing it. Keyed on (game, label, video_id), which is
+        # exactly how packed_groups is keyed, so the join is exact.
+        source_identity: dict[tuple[str, int, str], VideoEntry] = {}
+        if source_video_index is not None and Path(source_video_index).is_file():
+            source_identity = {
+                (entry.game, int(entry.label), entry.video_id): entry
+                for entry in read_video_entries_parquet(source_video_index)
+            }
 
         entries = []
         for (game, label, video_id), values in sorted(packed_groups.items()):
@@ -405,6 +522,7 @@ def pack_frame_index(
                 )
                 for delta in (1, 2, 3)
             }
+            inherited = source_identity.get((game, label, video_id))
             entries.append(
                 VideoEntry(
                     game=game,
@@ -413,6 +531,24 @@ def pack_frame_index(
                     frame_ids=frame_ids,
                     valid_start_positions=valid,
                     frame_locations=locations,
+                    # Audit P0-5: the canonical uid is content-anchored and is
+                    # computed once in build_video_entries() from per-frame
+                    # content hashes, which the packed frame index does not
+                    # carry. Rebuilding VideoEntry without it silently demoted
+                    # source_video_uid to the game::label::video_id fallback,
+                    # so the packed backend and the PNG backend disagreed on
+                    # identity and every sidecar/mining/subtype join keyed on
+                    # it drifted. Inherit it (and the sidecar-joined fields)
+                    # from the source video index instead of recomputing.
+                    canonical_source_video_uid=(
+                        inherited.canonical_source_video_uid if inherited else ""
+                    ),
+                    negative_subtype=(
+                        inherited.negative_subtype if inherited else None
+                    ),
+                    sample_weight=(
+                        inherited.sample_weight if inherited else 1.0
+                    ),
                 )
             )
         write_video_entries_parquet(

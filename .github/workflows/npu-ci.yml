@@ -30,6 +30,29 @@ on:
         description: "Run the data-dependent 1P/8P jobs (needs a provisioned runner)"
         required: false
         default: "true"
+      # The production recipe is a TEMPLATE: it ships
+      # model.factory=REPLACE_ME_PACKAGE.module:build_model and
+      # model.checkpoint_path=REPLACE_ME/path/to/base_model.pt. A clean checkout
+      # therefore cannot pass the production tier no matter how well the runner
+      # is provisioned -- provisioning supplies data, not config. These inputs
+      # are how the real values reach the job. Each falls back to a repository
+      # variable so a provisioned runner does not retype them every dispatch.
+      production_config:
+        description: "Production recipe path (default: vars.NPU_PRODUCTION_CONFIG or the in-repo template)"
+        required: false
+        default: ""
+      model_factory:
+        description: "model.factory override, e.g. my_pkg.models:build_model (default: vars.NPU_MODEL_FACTORY)"
+        required: false
+        default: ""
+      checkpoint_path:
+        description: "model.checkpoint_path override (default: vars.NPU_CHECKPOINT_PATH)"
+        required: false
+        default: ""
+      index_root:
+        description: "Directory holding the index bundle; rebases data.*_index and data.audit_path (default: vars.NPU_INDEX_ROOT)"
+        required: false
+        default: ""
   schedule:
     # Preflight only: run_production is unset on a schedule.
     - cron: "43 18 * * 0"
@@ -151,17 +174,37 @@ jobs:
       - name: Install package (do not replace torch/torch_npu)
         # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
         run: python -m pip install -e . --no-deps
+      - name: Resolve production overrides
+        # The recipe ships REPLACE_ME placeholders, so a clean checkout cannot
+        # train no matter how well the runner is provisioned. Fail here, in
+        # under a second, naming the input to set -- rather than dying on an
+        # import error or FileNotFound halfway through training.
+        id: resolve
+        env:
+          CONFIG: ${{ github.event.inputs.production_config || vars.NPU_PRODUCTION_CONFIG || 'configs/recipes/game_cls_production.yaml' }}
+          FACTORY: ${{ github.event.inputs.model_factory || vars.NPU_MODEL_FACTORY }}
+          CHECKPOINT: ${{ github.event.inputs.checkpoint_path || vars.NPU_CHECKPOINT_PATH }}
+          INDEX_ROOT: ${{ github.event.inputs.index_root || vars.NPU_INDEX_ROOT }}
+        run: bash scripts/resolve_npu_production_overrides.sh
       - name: Assert the runner is provisioned
         # doctor already FAILs on a missing index / audit / checkpoint, so it
         # names the missing path before any training starts.
-        run: cls-trainer doctor --config configs/recipes/game_cls_production.yaml profile=npu_1p experiment.output_dir=runs/game_cls_1p
+        run: |
+          cls-trainer doctor --config "${{ steps.resolve.outputs.config }}" \
+            profile=npu_1p experiment.output_dir=runs/game_cls_1p \
+            ${{ steps.resolve.outputs.overrides }}
       - name: 1P staged smoke (forward/backward/BF16/eval/save+resume)
+        env:
+          CONFIG: ${{ steps.resolve.outputs.config }}
+          EXTRA_OVERRIDES: ${{ steps.resolve.outputs.overrides }}
         run: bash scripts/smoke_npu_1p.sh
       - name: 1P full training smoke
         run: |
-          python tools/train.py --config configs/recipes/game_cls_production.yaml profile=npu_1p \
+          python tools/train.py --config "${{ steps.resolve.outputs.config }}" profile=npu_1p \
             train.max_steps=${{ github.event.inputs.max_steps }} \
-            experiment.output_dir=runs/npu_ci_1p
+            scheduler.warmup_steps=${{ github.event.inputs.warmup_steps }} \
+            experiment.output_dir=runs/npu_ci_1p \
+            ${{ steps.resolve.outputs.overrides }}
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -185,16 +228,35 @@ jobs:
       - name: Install package (do not replace torch/torch_npu)
         # --no-deps: never let pip swap the runner's pinned torch/torch_npu.
         run: python -m pip install -e . --no-deps
+      - name: Resolve production overrides
+        id: resolve
+        env:
+          CONFIG: ${{ github.event.inputs.production_config || vars.NPU_PRODUCTION_CONFIG || 'configs/recipes/game_cls_production.yaml' }}
+          FACTORY: ${{ github.event.inputs.model_factory || vars.NPU_MODEL_FACTORY }}
+          CHECKPOINT: ${{ github.event.inputs.checkpoint_path || vars.NPU_CHECKPOINT_PATH }}
+          INDEX_ROOT: ${{ github.event.inputs.index_root || vars.NPU_INDEX_ROOT }}
+        run: bash scripts/resolve_npu_production_overrides.sh
       - name: Assert the runner is provisioned
-        run: cls-trainer doctor --config configs/recipes/game_cls_production.yaml
+        # Must carry the SAME profile and output_dir the training step below
+        # uses. Without them this validated the default profile while the next
+        # step trained 8P, so doctor green-lit a config that was never run.
+        run: |
+          cls-trainer doctor --config "${{ steps.resolve.outputs.config }}" \
+            profile=npu_8p experiment.output_dir=runs/npu_ci_8p \
+            ${{ steps.resolve.outputs.overrides }}
       - name: 8P HCCL smoke (DDP / group metrics / checkpoint)
+        env:
+          CONFIG: ${{ steps.resolve.outputs.config }}
+          EXTRA_OVERRIDES: ${{ steps.resolve.outputs.overrides }}
         run: bash scripts/smoke_npu_8p.sh
       - name: 8P full training smoke
         run: |
           torchrun --standalone --nnodes=1 --nproc_per_node=8 \
-            tools/train.py --config configs/recipes/game_cls_production.yaml \
+            tools/train.py --config "${{ steps.resolve.outputs.config }}" profile=npu_8p \
             train.max_steps=${{ github.event.inputs.max_steps }} \
-            experiment.output_dir=runs/npu_ci_8p
+            scheduler.warmup_steps=${{ github.event.inputs.warmup_steps }} \
+            experiment.output_dir=runs/npu_ci_8p \
+            ${{ steps.resolve.outputs.overrides }}
       - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4

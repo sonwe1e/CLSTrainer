@@ -143,6 +143,84 @@ def _prepare_dataset(base: Path) -> tuple[Path, Path]:
     return config, output_dir
 
 
+class DatasetSealTests(unittest.TestCase):
+    """``dataset seal`` adopts a pre-transaction index directory (audit P0-9).
+
+    Bundles built before the transactional writer carry no commit record, so
+    the read path cannot rule out that they are a mixed generation and refuses
+    them. Rebuilding is the safe route; sealing is the explicit alternative for
+    an operator who knows the directory is one generation -- a claim the
+    framework cannot infer from files that all happen to exist.
+    """
+
+    def _seal(self, config: Path, index_dir: Path | None = None) -> int:
+        from game_cls.cli.dataset import cmd_dataset_seal
+
+        return cmd_dataset_seal(
+            argparse.Namespace(
+                config=str(config),
+                index_dir=str(index_dir) if index_dir else None,
+                overrides=[],
+            )
+        )
+
+    def _legacy(self, base: Path) -> tuple[Path, Path]:
+        """A real prepared bundle with its commit record removed."""
+        config, output_dir = _prepare_dataset(base)
+        (output_dir / "bundle_manifest.json").unlink()
+        return config, output_dir
+
+    def test_seal_adopts_a_legacy_bundle(self) -> None:
+        from game_cls.data.indexing import (
+            SplitBundleError,
+            verify_split_bundle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config, output_dir = self._legacy(base)
+            with self.assertRaises(SplitBundleError):
+                verify_split_bundle(output_dir)
+            self.assertEqual(self._seal(config, output_dir), 0)
+            # Sealing is only worth anything if the read path now accepts it.
+            self.assertIsNotNone(verify_split_bundle(output_dir))
+
+    def test_seal_stamps_one_generation_across_both_json_artifacts(self) -> None:
+        from game_cls.data.indexing import read_bundle_manifest
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config, output_dir = self._legacy(base)
+            # Leave a foreign id behind: sealing must restamp it, or the very
+            # bundle it just committed would read as a mixed generation.
+            audit_path = output_dir / "audit.json"
+            payload = json.loads(audit_path.read_text(encoding="utf-8"))
+            payload["bundle_id"] = "some-older-generation"
+            audit_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(self._seal(config, output_dir), 0)
+            manifest = read_bundle_manifest(output_dir)
+            assert manifest is not None
+            for name in ("audit.json", "split_summary.json"):
+                stamped = json.loads((output_dir / name).read_text(encoding="utf-8"))
+                self.assertEqual(stamped["bundle_id"], manifest["bundle_id"], name)
+
+    def test_seal_refuses_an_incomplete_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config, output_dir = self._legacy(base)
+            (output_dir / "val_frames.parquet").unlink()
+            # Sealing here would commit a bundle already known to be broken,
+            # which is worse than leaving it unsealed.
+            self.assertEqual(self._seal(config, output_dir), 2)
+            self.assertFalse((output_dir / "bundle_manifest.json").exists())
+
+    def test_seal_reports_a_missing_index_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config, _ = self._legacy(base)
+            self.assertEqual(self._seal(config, base / "does_not_exist"), 2)
+
+
 class DatasetCliTests(unittest.TestCase):
     def test_dataset_prepare_writes_split_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -337,16 +415,50 @@ class DatasetCliTests(unittest.TestCase):
         self.assertIn("data.val_index=", message)
 
     def test_prepare_if_missing_is_a_noop_when_the_bundle_is_complete(self) -> None:
+        from game_cls.cli.dataset import _split_bundle_artifacts
+
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             config = _prepare_if_missing_config(base)
-            for path in config["data"].values():
-                if isinstance(path, str) and path.startswith(str(base)):
-                    Path(path).parent.mkdir(parents=True, exist_ok=True)
-                    Path(path).write_text("stub", encoding="utf-8")
+            # Audit P0-9 widened the bundle to the split summary, so stub every
+            # declared artifact rather than only the config's own values.
+            for path in _split_bundle_artifacts(config["data"]).values():
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text("stub", encoding="utf-8")
             self.assertEqual(_missing_split_artifacts(config["data"]), [])
-            # Complete bundle: even eight ranks must pass straight through
-            # without preparing anything.
+            # Nothing is missing, but the bundle carries no commit record, so it
+            # cannot prove it is one generation. "All files present" is exactly
+            # what a mixed generation looks like, so this must refuse rather than
+            # skip silently into training (audit P0-9).
+            with (
+                mock.patch.dict(os.environ, {"WORLD_SIZE": "8"}, clear=False),
+                self.assertRaises(SystemExit) as caught,
+            ):
+                _maybe_prepare_split(config)
+            self.assertIn("bundle_manifest.json", str(caught.exception))
+            self.assertIn("dataset seal", str(caught.exception))
+
+    def test_a_sealed_complete_bundle_passes_straight_through(self) -> None:
+        """The sealed counterpart: no prepare, no refusal, even on 8 ranks."""
+        from game_cls.cli.dataset import _split_bundle_artifacts
+        from game_cls.data.indexing import write_bundle_manifest
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            config = _prepare_if_missing_config(base)
+            for path in _split_bundle_artifacts(config["data"]).values():
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text("stub", encoding="utf-8")
+            index_dir = base / "indexes"
+            write_bundle_manifest(
+                index_dir,
+                "sealed-generation",
+                artifact_names=[
+                    path.name
+                    for path in index_dir.iterdir()
+                    if path.is_file() and path.name != "bundle_manifest.json"
+                ],
+            )
             with mock.patch.dict(os.environ, {"WORLD_SIZE": "8"}, clear=False):
                 _maybe_prepare_split(config)
 
@@ -364,9 +476,11 @@ class DatasetCliTests(unittest.TestCase):
             self.assertEqual(
                 sorted(item.split("=")[0] for item in missing),
                 [
+                    # Audit P0-9 widened the bundle to the split summary too.
                     "data.test_video_index",
                     "data.train_video_index",
                     "data.val_video_index",
+                    "split_summary",
                 ],
             )
             with (

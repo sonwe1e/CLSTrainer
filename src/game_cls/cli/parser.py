@@ -40,6 +40,7 @@ from game_cls.cli.dataset import (
     cmd_dataset_audit,
     cmd_dataset_pack,
     cmd_dataset_prepare,
+    cmd_dataset_seal,
 )
 from game_cls.cli.doctor import cmd_doctor
 from game_cls.cli.evaluate import cmd_evaluate
@@ -274,6 +275,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit.add_argument("overrides", nargs="*", metavar="key=value")
     audit.set_defaults(func=cmd_dataset_audit)
+    seal = dataset_sub.add_parser(
+        "seal",
+        help="Adopt an existing index directory as one bundle generation "
+        "(writes bundle_manifest.json).",
+    )
+    seal.add_argument("--config", required=True)
+    seal.add_argument(
+        "--index-dir",
+        default=None,
+        help="Index directory to seal (default: the parent of data.train_index).",
+    )
+    seal.add_argument("overrides", nargs="*", metavar="key=value")
+    seal.set_defaults(func=cmd_dataset_seal)
     pack = dataset_sub.add_parser(
         "pack", help="Pack decoded CHW uint8 frames into memmapped shards."
     )

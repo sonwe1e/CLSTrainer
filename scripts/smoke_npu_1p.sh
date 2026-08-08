@@ -2,13 +2,26 @@
 set -euo pipefail
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
+# Audit P0-10: the config and its placeholder fields are overridable, so a
+# provisioned runner can point this at a real recipe/factory/checkpoint without
+# editing the script. Defaults reproduce the previous hard-coded behaviour, so
+# existing local invocations keep working unchanged.
+#
+#   CONFIG=configs/recipes/my_prod.yaml \
+#   EXTRA_OVERRIDES="model.factory=pkg.mod:build model.checkpoint_path=/w.pt" \
+#     bash scripts/smoke_npu_1p.sh
+CONFIG="${CONFIG:-configs/recipes/game_cls_production.yaml}"
+PROFILE="${PROFILE:-npu_1p}"
+# Word-split on purpose: EXTRA_OVERRIDES carries several key=value pairs.
+read -r -a EXTRA <<<"${EXTRA_OVERRIDES:-}"
+
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 unset ASCEND_LAUNCH_BLOCKING || true
 
 # Establish that the model and NPU operators work without worker processes.
 python -u tools/train.py --run-mode fixed \
-  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
+  --config "$CONFIG" "profile=$PROFILE" "${EXTRA[@]}" \
   experiment.smoke_mode=true \
   train.max_steps=5 \
   train.steps_per_epoch=5 \
@@ -27,7 +40,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Start with one spawned worker before increasing worker concurrency.
 python -u tools/train.py --run-mode fixed \
-  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
+  --config "$CONFIG" "profile=$PROFILE" "${EXTRA[@]}" \
   experiment.smoke_mode=true \
   train.max_steps=10 \
   train.steps_per_epoch=10 \
@@ -44,7 +57,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Validate spawn worker startup and the augmented training path.
 python -u tools/train.py --run-mode fixed \
-  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
+  --config "$CONFIG" "profile=$PROFILE" "${EXTRA[@]}" \
   experiment.smoke_mode=true \
   train.max_steps=50 \
   train.steps_per_epoch=50 \
@@ -61,7 +74,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Add quick evaluation with non-persistent eval workers.
 python -u tools/train.py --run-mode fixed \
-  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
+  --config "$CONFIG" "profile=$PROFILE" "${EXTRA[@]}" \
   experiment.smoke_mode=true \
   train.max_steps=20 \
   train.steps_per_epoch=20 \
@@ -78,7 +91,7 @@ python -u tools/train.py --run-mode fixed \
 
 # Run full evaluation only after the preceding stages have passed.
 python -u tools/train.py --run-mode fixed \
-  --config configs/recipes/game_cls_production.yaml profile=npu_1p \
+  --config "$CONFIG" "profile=$PROFILE" "${EXTRA[@]}" \
   experiment.smoke_mode=true \
   train.max_steps=20 \
   train.steps_per_epoch=20 \

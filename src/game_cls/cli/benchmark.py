@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -264,6 +263,31 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Audit P0-2: the release identity must be computed from the config as
+    # LOADED, before the single-process override below mutates it. Hashing the
+    # mutated config recorded a config no run ever used, and -- because
+    # 'release check' hashes the config as loaded -- made the two sides
+    # disagree for every distributed config (the release recipe uses
+    # profile=npu_8p, which sets distributed.enabled=true), so release check
+    # could never pass. The challenge fingerprint is taken here for the same
+    # reason: one identity, captured at one point in time.
+    from game_cls.reports.benchmark import (
+        canonical_config_sha256,
+        challenge_bundle_fingerprint,
+    )
+
+    resolved_config_sha256 = canonical_config_sha256(config)
+    challenge_dataset_fingerprint, challenge_components = challenge_bundle_fingerprint(
+        config
+    )
+    if challenge_components.get("covers_content") is False:
+        print(
+            "note: the challenge frame index carries no per-frame content "
+            "hashes, so challenge_dataset_fingerprint cannot detect a "
+            "same-size frame edit. Rebuild the challenge index with content "
+            "hashing enabled for a fingerprint that covers pixel content.",
+            file=sys.stderr,
+        )
     import logging
 
     logging.getLogger(__name__).info(
@@ -331,23 +355,14 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
         # on, so a later run's checkpoint can never borrow this PASS. The
         # release identity tuple is (run_id, checkpoint_sha256,
         # resolved_config_sha256, challenge_dataset_fingerprint,
-        # gate_spec_fingerprint).
+        # gate_spec_fingerprint). resolved_config_sha256 and the challenge
+        # fingerprint were captured above, before the single-process override.
         from game_cls.reports.benchmark import (
             file_sha256,
             gate_spec_fingerprint,
         )
 
         checkpoint_sha256 = file_sha256(checkpoint_path)
-        # P0-3: hash the finalized in-memory config, not the on-disk file.
-        # When --config points to a different YAML than the training run,
-        # file_sha256(run_dir/"resolved_config.json") would silently record
-        # the wrong provenance. Shared with release check via
-        # canonical_config_sha256 so both sides hash identically (P0-2);
-        # an inlined copy here would silently diverge.
-        resolved_config_sha256 = canonical_config_sha256(config)
-        challenge_dataset_fingerprint = file_sha256(
-            challenge_packed_video_index or challenge_video_index
-        )
         gate_spec_hash = gate_spec_fingerprint(gate_metrics)
         # Persist the gate verdict to run_dir so export and CI can read it
         # without re-running evaluation.
@@ -360,6 +375,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             "checkpoint_sha256": checkpoint_sha256,
             "resolved_config_sha256": resolved_config_sha256,
             "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
+            "challenge_bundle_components": challenge_components,
             "gate_spec_fingerprint": gate_spec_hash,
             "gate_metrics": gate_metrics,
             "actual_metrics": {
@@ -391,6 +407,7 @@ def cmd_benchmark_evaluate(args: argparse.Namespace) -> int:
             checkpoint_sha256=checkpoint_sha256,
             resolved_config_sha256=resolved_config_sha256,
             challenge_dataset_fingerprint=challenge_dataset_fingerprint,
+            challenge_bundle_components=challenge_components,
             gate_spec_fingerprint=gate_spec_hash,
         )
         print(f"challenge_metadata: {challenge_metadata}", file=sys.stderr)

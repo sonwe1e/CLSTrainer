@@ -553,11 +553,37 @@ class ReleaseCheckTests(unittest.TestCase):
             "gate_metrics": {"global_fpr_at_decision_threshold": 0.01},
         }
         config.setdefault("evaluation", {})["minimum_worst_game_f1"] = 0.75
+        # A release-gated config must carry a challenge set: 'benchmark
+        # evaluate' refuses to run without one, so a report whose challenge
+        # fingerprint is empty cannot exist in practice, and release check is
+        # right to refuse it. Writing the bundle keeps the fixture on the path
+        # the command is actually designed for (audit P0-4).
+        challenge = base / "challenge"
+        challenge.mkdir(parents=True, exist_ok=True)
+        frame_index = challenge / "challenge_frames.parquet"
+        video_index = challenge / "challenge_video_entries.parquet"
+        frame_index.write_bytes(b"challenge-frames")
+        video_index.write_bytes(b"challenge-videos")
+        config["data"]["challenge_index"] = str(frame_index)
+        config["data"]["challenge_video_index"] = str(video_index)
         return config
 
-    def _bound_report(self, base: Path, checkpoint_sha: str, gate_metrics: dict) -> None:
-        from game_cls.reports.benchmark import check_gates, write_benchmark_report
+    def _bound_report(
+        self, base: Path, checkpoint_sha: str, gate_metrics: dict, config: dict
+    ) -> None:
+        from game_cls.reports.benchmark import (
+            canonical_config_sha256,
+            challenge_bundle_fingerprint,
+            check_gates,
+            gate_spec_fingerprint,
+            write_benchmark_report,
+        )
 
+        # Audit P0-4: the challenge fingerprint covers the whole bundle, so the
+        # fixture must derive it from the config the same way both production
+        # sides do rather than pin a literal -- a hard-coded digest would drift
+        # the moment the fingerprint definition changes.
+        fingerprint, components = challenge_bundle_fingerprint(config)
         metrics = {"sample_count": 100, "global_fpr_at_decision_threshold": 0.004}
         write_benchmark_report(
             base / "benchmarks",
@@ -568,6 +594,14 @@ class ReleaseCheckTests(unittest.TestCase):
             grouped_metrics=None,
             gate_metrics=gate_metrics,
             checkpoint_sha256=checkpoint_sha,
+            # Audit P0-2: release check compares the FULL identity tuple, not
+            # just the checkpoint sha. A report missing these fields cannot
+            # prove it was earned under this config/challenge/gate contract, so
+            # the fixture must write what 'benchmark evaluate' writes.
+            resolved_config_sha256=canonical_config_sha256(config),
+            challenge_dataset_fingerprint=fingerprint,
+            challenge_bundle_components=components,
+            gate_spec_fingerprint=gate_spec_fingerprint(gate_metrics),
         )
 
     def test_release_check_passes_only_for_the_bound_checkpoint(self) -> None:
@@ -585,6 +619,7 @@ class ReleaseCheckTests(unittest.TestCase):
                 base,
                 hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
                 gate_metrics,
+                config,
             )
             args = type(
                 "Args",

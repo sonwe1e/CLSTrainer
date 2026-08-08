@@ -129,6 +129,23 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
         audit_path = data_cfg.get("audit_path")
         if not audit_path:
             audit_path = str(Path(data_cfg["train_index"]).parent / "audit.json")
+        # Audit P0-9: the split bundle used to be overwritten in place, so a
+        # crash partway through a re-prepare could leave train from the new
+        # generation and test from the old one with every file present.
+        # validate_audit_file below cannot detect that -- a stale audit.json
+        # describes a self-consistent OLDER bundle -- so the commit record is
+        # checked first.
+        #
+        # Scoped to split.mode == "from_train" on purpose: only that path runs
+        # through write_split_bundle and publishes a commit record. A directory
+        # built by write_index_bundle is a different, legitimate artifact shape
+        # with no split summary and no split manifest, so demanding a bundle
+        # manifest there would refuse valid setups -- it broke
+        # 'cls-trainer evaluate' on exactly such a directory.
+        if (data_cfg.get("split") or {}).get("mode") == "from_train":
+            from game_cls.data.indexing import verify_split_bundle
+
+            verify_split_bundle(Path(audit_path).parent)
         audit = validate_audit_file(
             audit_path,
             image_spec=image_spec,
@@ -219,6 +236,7 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
         from game_cls.data.packed_backend import (
             PackedUint8Backend,
             verify_packed_provenance,
+            verify_packed_shards,
         )
 
         # Audit P0-6: refuse stale shards before a DataLoader is built. A
@@ -237,6 +255,13 @@ def _build_real_data_components(config: dict, rank: int, world_size: int) -> dic
                 data_cfg.get(f"{split}_index"),
                 audit_path=provenance_audit_path,
                 split_manifest_path=(data_cfg.get("split") or {}).get("manifest"),
+            )
+            # Integrity is a separate failure from provenance: the shards can
+            # come from the right sources and still be truncated or corrupt.
+            verify_packed_shards(
+                Path(data_cfg[f"{split}_packed_index"]).with_name(
+                    "packed_manifest.json"
+                )
             )
             decoders[split] = PackedUint8Backend(
                 data_cfg[f"{split}_packed_index"],
@@ -503,9 +528,19 @@ def build_external_pool_loader(
 
     decoder = None
     if packed:
-        from game_cls.data.packed_backend import PackedUint8Backend
+        from game_cls.data.packed_backend import (
+            PackedUint8Backend,
+            verify_packed_shards,
+        )
 
         assert packed_index is not None
+        # Audit P0-6: the train/val/test path verifies its shards, but this
+        # path built the backend with no check at all -- so a corrupt shard
+        # was caught for training data and waved through for the challenge
+        # set that gates a release. Provenance needs the source frame index,
+        # which an external pool config does not carry; integrity needs only
+        # the manifest, so it applies here unconditionally.
+        verify_packed_shards(Path(packed_index).with_name("packed_manifest.json"))
         decoder = PackedUint8Backend(
             packed_index,
             image_spec=ImageSpec.from_config(data_cfg),

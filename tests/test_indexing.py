@@ -488,5 +488,208 @@ class SplitBundleTests(unittest.TestCase):
                 )
 
 
+class SplitBundleTransactionTests(SplitBundleTests):
+    """The bundle must be provably ONE generation (audit P0-9).
+
+    ``write_split_bundle`` used to overwrite artifacts in place, in order:
+    train, val, test, video indexes, summary, audit. A crash partway through,
+    over a directory that already held a complete older bundle, left
+    ``train=NEW, test=OLD, audit=OLD`` with *every file present* -- so an
+    existence check reported nothing missing and training silently proceeded on
+    a mixed split. Existence checks cannot close that, because existence is
+    exactly what the mixed state satisfies.
+    """
+
+    def _prepare(self, root: Path) -> Path:
+        from game_cls.data.indexing import write_split_bundle
+
+        data_config = self._data_config()
+        self._write_roots(root)
+        output = root / "indexes"
+        write_split_bundle(
+            root / "train_all",
+            root / "test",
+            output,
+            ImageSpec.from_config(data_config),
+            ScanPolicy.from_config(data_config),
+            DuplicatePolicy.from_config(data_config),
+            split_config=self._split_config(),
+        )
+        return output
+
+    def test_prepare_commits_a_bundle_manifest_that_verifies(self) -> None:
+        from game_cls.data.indexing import (
+            BUNDLE_ARTIFACT_NAMES,
+            read_bundle_manifest,
+            verify_split_bundle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            manifest = read_bundle_manifest(output)
+            self.assertIsNotNone(manifest)
+            assert manifest is not None
+            self.assertTrue(manifest["bundle_id"])
+            # Every published artifact is committed.
+            for name in BUNDLE_ARTIFACT_NAMES:
+                self.assertIn(name, manifest["artifacts"], name)
+            # The split manifest is deliberately NOT hash-committed:
+            # resolve_split mutates it before the parquets are staged, so
+            # hashing it would report MIXED GENERATION on a bundle whose
+            # train/val/test are still one internally consistent set.
+            self.assertNotIn("split_manifest.parquet", manifest["artifacts"])
+            self.assertIsNotNone(verify_split_bundle(output))
+
+    def test_extending_the_split_manifest_alone_is_not_a_mixed_generation(self) -> None:
+        """The false positive this relaxation exists to prevent.
+
+        resolve_split may extend the manifest before the parquets are staged. A
+        crash in that window leaves the manifest moved and the parquets intact,
+        which is not a mixed bundle and must not be reported as one.
+        """
+        from game_cls.data.indexing import verify_split_bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = self._prepare(Path(directory))
+            manifest_file = output / "split_manifest.parquet"
+            manifest_file.write_bytes(manifest_file.read_bytes() + b"\x00extended")
+            # Still one generation as far as the split artifacts go.
+            self.assertIsNotNone(verify_split_bundle(output))
+
+    def test_the_generation_is_stamped_into_audit_and_summary(self) -> None:
+        import json
+
+        from game_cls.data.indexing import read_bundle_manifest
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            manifest = read_bundle_manifest(output)
+            assert manifest is not None
+            bundle_id = manifest["bundle_id"]
+            for name in ("audit.json", "split_summary.json"):
+                payload = json.loads((output / name).read_text(encoding="utf-8"))
+                self.assertEqual(payload.get("bundle_id"), bundle_id, name)
+
+    def test_mixed_generation_is_refused_though_every_file_exists(self) -> None:
+        """The audit's exact scenario: test_* left over from an older prepare."""
+        from game_cls.data.indexing import SplitBundleError, verify_split_bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            stale = (output / "test_frames.parquet").read_bytes() + b"older-generation"
+            (output / "test_frames.parquet").write_bytes(stale)
+            # Nothing is missing -- that is the whole point of the bug.
+            for name in ("train_frames.parquet", "test_frames.parquet", "audit.json"):
+                self.assertTrue((output / name).is_file())
+            with self.assertRaises(SplitBundleError) as caught:
+                verify_split_bundle(output)
+            message = str(caught.exception)
+            self.assertIn("MIXED GENERATION", message)
+            # The operator needs to know WHICH artifact disagrees.
+            self.assertIn("test_frames.parquet", message)
+
+    def test_an_audit_swapped_from_another_bundle_is_refused(self) -> None:
+        from game_cls.data.indexing import (
+            SplitBundleError,
+            verify_split_bundle,
+            write_bundle_manifest,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            # Re-commit so the hashes match, but leave audit.json stamped with a
+            # different generation: the hash check alone would pass.
+            import json
+
+            payload = json.loads((output / "audit.json").read_text(encoding="utf-8"))
+            payload["bundle_id"] = "a-different-generation"
+            (output / "audit.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            write_bundle_manifest(output, "the-committed-generation")
+            with self.assertRaises(SplitBundleError) as caught:
+                verify_split_bundle(output)
+            message = str(caught.exception)
+            self.assertIn("MIXED GENERATION", message)
+            self.assertIn("audit.json", message)
+
+    def test_a_missing_artifact_is_reported_as_incomplete_not_mixed(self) -> None:
+        """Three distinct failures need three distinct operator actions."""
+        from game_cls.data.indexing import SplitBundleError, verify_split_bundle
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            (output / "val_video_entries.parquet").unlink()
+            with self.assertRaises(SplitBundleError) as caught:
+                verify_split_bundle(output)
+            message = str(caught.exception)
+            self.assertIn("incomplete", message)
+            self.assertIn("val_video_entries.parquet", message)
+
+    def test_an_unsealed_directory_is_refused_but_can_be_tolerated(self) -> None:
+        from game_cls.data.indexing import (
+            BUNDLE_MANIFEST_FILENAME,
+            SplitBundleError,
+            verify_split_bundle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            (output / BUNDLE_MANIFEST_FILENAME).unlink()
+            with self.assertRaises(SplitBundleError) as caught:
+                verify_split_bundle(output)
+            message = str(caught.exception)
+            # Both ways forward must be named, since only the operator knows
+            # whether a legacy directory is really one generation.
+            self.assertIn("dataset prepare", message)
+            self.assertIn("dataset seal", message)
+            # Callers that only want "was anything built" opt out explicitly.
+            self.assertIsNone(verify_split_bundle(output, require_manifest=False))
+
+    def test_no_staging_directory_survives_a_successful_prepare(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            self.assertEqual(
+                [path.name for path in output.iterdir() if path.name.startswith(".staging")],
+                [],
+            )
+
+    def test_re_preparing_commits_a_new_generation_that_still_verifies(self) -> None:
+        from game_cls.data.indexing import (
+            read_bundle_manifest,
+            verify_split_bundle,
+            write_split_bundle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = self._prepare(root)
+            first = read_bundle_manifest(output)
+            assert first is not None
+            data_config = self._data_config()
+            write_split_bundle(
+                root / "train_all",
+                root / "test",
+                output,
+                ImageSpec.from_config(data_config),
+                ScanPolicy.from_config(data_config),
+                DuplicatePolicy.from_config(data_config),
+                split_config=self._split_config(),
+            )
+            second = read_bundle_manifest(output)
+            assert second is not None
+            self.assertNotEqual(first["bundle_id"], second["bundle_id"])
+            # A re-prepare must leave a bundle that still verifies, not one that
+            # trips its own mixed-generation check.
+            self.assertIsNotNone(verify_split_bundle(output))
+
+
 if __name__ == "__main__":
     unittest.main()

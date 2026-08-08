@@ -275,25 +275,25 @@ def _release_identity_mismatches(
     """
     from game_cls.reports.benchmark import (
         canonical_config_sha256,
-        file_sha256,
+        challenge_bundle_fingerprint,
+        challenge_component_differences,
         gate_spec_fingerprint,
     )
 
     payload = _read_report_payload(report)
     if payload is None:
         return [f"benchmark report {report} is unreadable"]
-    data_cfg = config.get("data") or {}
-    # Must mirror cmd_benchmark_evaluate's own fingerprint definition exactly,
-    # or identical inputs would compare unequal.
-    challenge_source = data_cfg.get("challenge_packed_video_index") or data_cfg.get(
-        "challenge_video_index"
-    )
+    # Audit P0-4: the challenge fingerprint covers the whole bundle (frame and
+    # video indexes, metadata sidecar, packed manifest and therefore every
+    # shard, image geometry, evaluation preprocessing) rather than a single
+    # video-index file. Routed through the shared helper that
+    # cmd_benchmark_evaluate also calls: an inlined copy on either side would
+    # drift and turn every identity comparison into an unconditional failure.
+    challenge_fingerprint, challenge_components = challenge_bundle_fingerprint(config)
     expected = {
         "run_id": run_id,
         "resolved_config_sha256": canonical_config_sha256(config),
-        "challenge_dataset_fingerprint": (
-            file_sha256(challenge_source) if challenge_source else ""
-        ),
+        "challenge_dataset_fingerprint": challenge_fingerprint,
         "gate_spec_fingerprint": gate_spec_fingerprint(gate_metrics),
     }
     problems: list[str] = []
@@ -316,10 +316,25 @@ def _release_identity_mismatches(
                 "bundle and config used for the benchmark are present."
             )
         elif str(recorded) != str(current):
-            problems.append(
+            detail = (
                 f"{field} differs: report={recorded} current={current}. This "
                 "PASS was earned under a different release identity."
             )
+            if field == "challenge_dataset_fingerprint":
+                # Name the leg that moved instead of leaving an operator to
+                # compare two opaque digests.
+                differences = challenge_component_differences(
+                    payload.get("challenge_bundle_components"), challenge_components
+                )
+                if differences:
+                    detail += " Changed: " + "; ".join(differences) + "."
+                else:
+                    detail += (
+                        " The report records no challenge_bundle_components, so "
+                        "it predates the widened challenge fingerprint; re-run "
+                        "'cls-trainer benchmark evaluate'."
+                    )
+            problems.append(detail)
     return problems
 
 

@@ -40,6 +40,209 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Split bundle transaction (audit P0-9).
+# ---------------------------------------------------------------------------
+
+BUNDLE_MANIFEST_FILENAME = "bundle_manifest.json"
+BUNDLE_MANIFEST_VERSION = 1
+
+# Every artifact a complete split bundle publishes, relative to the index dir.
+# Order is the publish order; the manifest is deliberately NOT in this list
+# because it is the commit record written after all of them.
+BUNDLE_ARTIFACT_NAMES: tuple[str, ...] = (
+    "train_frames.parquet",
+    "val_frames.parquet",
+    "test_frames.parquet",
+    "train_videos.parquet",
+    "val_videos.parquet",
+    "test_videos.parquet",
+    "train_video_entries.parquet",
+    "val_video_entries.parquet",
+    "test_video_entries.parquet",
+    "split_summary.json",
+    "audit.json",
+)
+
+
+class SplitBundleError(RuntimeError):
+    """A split bundle is unsealed, incomplete, corrupt, or mixed-generation."""
+
+
+def _bundle_manifest_payload(
+    index_dir: Path, bundle_id: str, artifact_names: Iterable[str]
+) -> dict:
+    import datetime
+
+    artifacts = {}
+    for name in artifact_names:
+        path = index_dir / name
+        if path.is_file():
+            artifacts[name] = _sha256(path)
+    return {
+        "format_version": BUNDLE_MANIFEST_VERSION,
+        "bundle_id": bundle_id,
+        "created_at": datetime.datetime.now(datetime.UTC)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "artifacts": artifacts,
+    }
+
+
+def write_bundle_manifest(
+    index_dir: str | Path,
+    bundle_id: str,
+    *,
+    artifact_names: Iterable[str] | None = None,
+) -> Path:
+    """Write ``bundle_manifest.json`` atomically -- the bundle's commit record.
+
+    This is written LAST, after every artifact is in place, and via a temp file
+    plus ``os.replace`` so it either exists complete or not at all. That
+    ordering is what makes a mixed-generation bundle detectable: a crash partway
+    through publishing leaves the PREVIOUS manifest (or none), whose recorded
+    hashes no longer match the files on disk, so ``verify_split_bundle`` refuses
+    instead of training on a train=NEW/test=OLD mixture in which every file
+    exists (audit P0-9).
+    """
+    import os
+
+    index_dir = Path(index_dir)
+    payload = _bundle_manifest_payload(
+        index_dir, bundle_id, artifact_names or BUNDLE_ARTIFACT_NAMES
+    )
+    target = index_dir / BUNDLE_MANIFEST_FILENAME
+    temp = target.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, target)
+    return target
+
+
+def read_bundle_manifest(index_dir: str | Path) -> dict | None:
+    """The bundle manifest, or ``None`` when the directory is unsealed."""
+    path = Path(index_dir) / BUNDLE_MANIFEST_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SplitBundleError(
+            f"Bundle manifest is unreadable: {path}: {exc}. Re-run "
+            "'cls-trainer dataset prepare' or 'cls-trainer dataset seal'."
+        ) from exc
+    return payload if isinstance(payload, dict) else None
+
+
+def _stamped_bundle_id(path: Path) -> str | None:
+    """``bundle_id`` recorded inside a JSON artifact, when present."""
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("bundle_id")
+    return str(value) if value else None
+
+
+def verify_split_bundle(
+    index_dir: str | Path, *, require_manifest: bool = True
+) -> dict | None:
+    """Refuse a bundle that is not provably one generation (audit P0-9).
+
+    ``write_split_bundle`` used to overwrite artifacts in place, in order:
+    train, val, test, video indexes, summary, audit. A crash partway through,
+    over a directory that already held a complete older bundle, left
+    ``train=NEW, test=OLD, audit=OLD`` with *every file present* -- so an
+    existence check reported nothing missing and training proceeded on a
+    silently mixed generation.
+
+    Existence checks cannot detect that, because existence is exactly what the
+    mixed state satisfies. This verifies the commit record instead:
+
+    * the manifest exists (the bundle was published, not interrupted),
+    * every artifact it lists is present and hashes to the recorded value,
+    * ``audit.json`` and ``split_summary.json`` agree on ``bundle_id``.
+
+    Each failure gets its own message because each implies a different operator
+    action: seal an unsealed legacy directory, re-prepare a mixed one,
+    re-prepare or restore a corrupt artifact.
+    """
+    index_dir = Path(index_dir)
+    manifest = read_bundle_manifest(index_dir)
+    if manifest is None:
+        if not require_manifest:
+            return None
+        raise SplitBundleError(
+            f"Index bundle {index_dir} has no {BUNDLE_MANIFEST_FILENAME}, so a "
+            "mixed-generation bundle (e.g. train from a new prepare, test left "
+            "from an older one) cannot be ruled out -- every file can be "
+            "present and still disagree. Either rebuild the bundle:\n"
+            "    cls-trainer dataset prepare --config <config> "
+            "--train-root <train_all> --test-root <test>\n"
+            "or, if you know this directory is one consistent generation, "
+            "adopt it:\n"
+            "    cls-trainer dataset seal --config <config>"
+        )
+    version = int(manifest.get("format_version", 0))
+    if version != BUNDLE_MANIFEST_VERSION:
+        raise SplitBundleError(
+            f"Unsupported bundle manifest version {version} in {index_dir} "
+            f"(expected {BUNDLE_MANIFEST_VERSION}). Re-run "
+            "'cls-trainer dataset prepare'."
+        )
+    bundle_id = str(manifest.get("bundle_id") or "")
+    if not bundle_id:
+        raise SplitBundleError(
+            f"Bundle manifest in {index_dir} records no bundle_id, so its "
+            "artifacts cannot be tied to one generation. Re-run "
+            "'cls-trainer dataset prepare' or 'cls-trainer dataset seal'."
+        )
+    artifacts = manifest.get("artifacts") or {}
+    if not artifacts:
+        raise SplitBundleError(
+            f"Bundle manifest in {index_dir} lists no artifacts; it cannot "
+            "prove the bundle is intact. Re-run 'cls-trainer dataset seal'."
+        )
+    missing: list[str] = []
+    corrupt: list[str] = []
+    for name, expected in sorted(artifacts.items()):
+        path = index_dir / name
+        if not path.is_file():
+            missing.append(name)
+            continue
+        if _sha256(path) != str(expected):
+            corrupt.append(name)
+    if missing:
+        raise SplitBundleError(
+            f"Index bundle {index_dir} is incomplete: the manifest lists "
+            f"{', '.join(missing)}, which is missing from disk. The bundle was "
+            "partially deleted or partially copied; re-run "
+            "'cls-trainer dataset prepare'."
+        )
+    if corrupt:
+        raise SplitBundleError(
+            f"Index bundle {index_dir} is a MIXED GENERATION or corrupt: "
+            f"{', '.join(corrupt)} does not match the hash recorded when the "
+            "bundle was committed. Some artifacts come from a different "
+            "prepare than the rest, so train/val/test are not one consistent "
+            "split. Re-run 'cls-trainer dataset prepare' to rebuild the whole "
+            "bundle."
+        )
+    for name in ("audit.json", "split_summary.json"):
+        stamped = _stamped_bundle_id(index_dir / name)
+        if stamped is not None and stamped != bundle_id:
+            raise SplitBundleError(
+                f"Index bundle {index_dir} is a MIXED GENERATION: {name} "
+                f"carries bundle_id {stamped} but the manifest commits "
+                f"{bundle_id}. This file came from a different prepare; "
+                "re-run 'cls-trainer dataset prepare'."
+            )
+    return manifest
+
+
 def iter_frame_candidates(
     root: Path,
     policy: ScanPolicy,
@@ -935,38 +1138,77 @@ def write_split_bundle(
         "test": test.findings,
     }
 
-    for split, frames in frames_by_split.items():
-        write_parquet(frames, output_dir / f"{split}_frames.parquet")
-        write_parquet(
-            summarize_videos(frames),
-            output_dir / f"{split}_videos.parquet",
-        )
-        from .video_index import (
-            build_video_entries,
-            write_video_entries_parquet,
-        )
+    # Audit P0-9: publish the bundle as a transaction. Writing artifacts
+    # straight into output_dir overwrote them one at a time (train, val, test,
+    # video indexes, summary, audit), so a crash partway through -- over a
+    # directory that already held a complete older bundle -- left
+    # train=NEW/test=OLD with every file present, which no existence check can
+    # detect. Instead: stage everything, move it into place, then write the
+    # commit record LAST. A crash before the commit leaves the previous manifest
+    # (or none), whose hashes no longer match, so verify_split_bundle refuses.
+    import os
+    import shutil
+    from uuid import uuid4
 
-        write_video_entries_parquet(
-            build_video_entries(frames),
-            output_dir / f"{split}_video_entries.parquet",
-        )
+    from .video_index import build_video_entries, write_video_entries_parquet
 
-    audit = make_audit(
-        frames_by_split,
-        findings_by_split,
-        image_spec,
-        duplicate_policy,
-        identity_mode=identity_mode,
-        namespaces_by_split=namespaces_by_split,
-    )
-    # The source identity precheck rides along on the returned audit dict.
-    audit["source_identity_precheck"] = source_identity_report
-    audit["policies"]["scan_policy"] = scan_policy.to_dict()
-    write_split_summary(summary, output_dir / "split_summary.json")
-    audit["split"] = {**summary, "manifest": str(manifest_path)}
+    bundle_id = uuid4().hex
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "audit.json").write_text(
-        json.dumps(audit, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    staging = output_dir / f".staging-{bundle_id}"
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        for split, frames in frames_by_split.items():
+            write_parquet(frames, staging / f"{split}_frames.parquet")
+            write_parquet(
+                summarize_videos(frames),
+                staging / f"{split}_videos.parquet",
+            )
+            write_video_entries_parquet(
+                build_video_entries(frames),
+                staging / f"{split}_video_entries.parquet",
+            )
+
+        audit = make_audit(
+            frames_by_split,
+            findings_by_split,
+            image_spec,
+            duplicate_policy,
+            identity_mode=identity_mode,
+            namespaces_by_split=namespaces_by_split,
+        )
+        # The source identity precheck rides along on the returned audit dict.
+        audit["source_identity_precheck"] = source_identity_report
+        audit["policies"]["scan_policy"] = scan_policy.to_dict()
+        # Stamp the generation into both JSON artifacts, so an audit or summary
+        # swapped in from another prepare is caught by ID disagreement even if
+        # its recorded hash somehow matched.
+        audit["bundle_id"] = bundle_id
+        audit["split"] = {**summary, "manifest": str(manifest_path)}
+        write_split_summary(
+            {**summary, "bundle_id": bundle_id}, staging / "split_summary.json"
+        )
+        (staging / "audit.json").write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # Publish. Still not a single atomic step -- POSIX gives no atomic
+        # multi-file rename -- but every intermediate state is now *detectable*,
+        # which is the property that was missing.
+        for name in BUNDLE_ARTIFACT_NAMES:
+            staged = staging / name
+            if staged.is_file():
+                os.replace(staged, output_dir / name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    # The split manifest is deliberately NOT hash-committed. resolve_split
+    # writes/extends it BEFORE any parquet is staged, so a crash in that window
+    # leaves a manifest that moved while the parquets did not -- and hashing it
+    # would report MIXED GENERATION even though train/val/test are still one
+    # internally consistent set. That is a false positive on a bundle that is
+    # actually fine, so the manifest is checked for existence only (see
+    # cli.dataset._split_bundle_artifacts); its assignments are already
+    # protected by resolve_split's own on_new_groups contract.
+    write_bundle_manifest(output_dir, bundle_id)
     return audit

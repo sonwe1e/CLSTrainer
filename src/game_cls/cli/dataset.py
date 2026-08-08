@@ -90,13 +90,38 @@ def _run_split_prepare(
     )
 
 
+def _split_index_dir(data_config: dict[str, Any]) -> Path:
+    """The index directory a split bundle is published into."""
+    return Path(data_config.get("train_index") or "indexes/train_frames.parquet").parent
+
+
+def _split_manifest_path(data_config: dict[str, Any]) -> Path | None:
+    """``data.split.manifest``, resolved relative to the index dir when needed."""
+    manifest = (data_config.get("split") or {}).get("manifest")
+    if not manifest:
+        return None
+    path = Path(manifest)
+    if not path.is_absolute():
+        path = _split_index_dir(data_config) / path
+    return path
+
+
 def _split_bundle_artifacts(data_config: dict[str, Any]) -> dict[str, str]:
-    """Config keys -> paths that a complete split bundle must produce.
+    """Display label -> path for every artifact a complete split bundle produces.
 
     Checking only ``val_index`` was not enough: a prepare that died partway
     (or a partially copied index directory) leaves val_frames.parquet on disk
     while the video-entry parquets are missing, and training then fails much
     later with a confusing read error.
+
+    Audit P0-9 widened this to the split manifest and split summary, which the
+    bundle also publishes and which were previously unchecked.
+
+    Existence is all this reports. It deliberately cannot detect a *mixed*
+    generation (train from a new prepare, test left from an older one), because
+    every file exists in exactly that case -- that is what the bundle manifest
+    and ``indexing.verify_split_bundle`` are for. This answers the narrower
+    question "was anything built at all".
     """
     keys = (
         "train_index",
@@ -107,14 +132,22 @@ def _split_bundle_artifacts(data_config: dict[str, Any]) -> dict[str, str]:
         "test_video_index",
         "audit_path",
     )
-    artifacts = {key: data_config.get(key) for key in keys}
-    return {key: str(path) for key, path in artifacts.items() if path}
+    artifacts: dict[str, str] = {
+        f"data.{key}": str(data_config[key]) for key in keys if data_config.get(key)
+    }
+    manifest_path = _split_manifest_path(data_config)
+    if manifest_path is not None:
+        artifacts["data.split.manifest"] = str(manifest_path)
+    artifacts["split_summary"] = str(
+        _split_index_dir(data_config) / "split_summary.json"
+    )
+    return artifacts
 
 
 def _missing_split_artifacts(data_config: dict[str, Any]) -> list[str]:
     return [
-        f"data.{key}={path}"
-        for key, path in _split_bundle_artifacts(data_config).items()
+        f"{label}={path}"
+        for label, path in _split_bundle_artifacts(data_config).items()
         if not Path(path).is_file()
     ]
 
@@ -139,7 +172,18 @@ def _maybe_prepare_split(config: dict[str, Any]) -> None:
         return
     missing = _missing_split_artifacts(data_config)
     if not missing:
-        return  # the whole split bundle already exists
+        # Audit P0-9: "nothing missing" is NOT "one consistent bundle" -- a
+        # mixed generation (train from a new prepare, test left from an older
+        # one) satisfies every existence check. Verify the commit record before
+        # treating the bundle as usable, or prepare_if_missing silently skips
+        # straight into training on a mixed split.
+        from game_cls.data.indexing import SplitBundleError, verify_split_bundle
+
+        try:
+            verify_split_bundle(_split_index_dir(data_config))
+        except SplitBundleError as exc:
+            raise SystemExit(str(exc)) from exc
+        return  # the whole split bundle already exists and is one generation
 
     world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
     if world_size > 1:
@@ -294,6 +338,109 @@ def cmd_dataset_audit(args: argparse.Namespace) -> int:
             namespaces_by_split=namespaces_by_split,
         )
         print("Strict dataset audit passed.")
+    return 0
+
+
+def cmd_dataset_seal(args: argparse.Namespace) -> int:
+    """Adopt an existing index directory as one bundle generation (audit P0-9).
+
+    Bundles built before the transactional writer carry no
+    ``bundle_manifest.json``, so nothing can rule out that they are a mixed
+    generation -- and the read path refuses them rather than guessing. Rebuilding
+    with ``dataset prepare`` is the safe route; this command is the alternative
+    for an operator who knows the directory is one consistent generation.
+
+    That knowledge is genuinely the operator's: the framework cannot infer it
+    from files that all exist. So sealing is explicit, and it refuses when an
+    artifact is missing rather than committing a known-incomplete bundle.
+    """
+    from game_cls.config import load_config
+    from game_cls.config_schema import ConfigSchemaError
+    from game_cls.data.indexing import (
+        BUNDLE_ARTIFACT_NAMES,
+        SplitBundleError,
+        verify_split_bundle,
+        write_bundle_manifest,
+    )
+
+    try:
+        config = load_config(args.config, args.overrides)
+    except ConfigSchemaError as exc:
+        for problem in exc.problems:
+            print(f"Config error: {problem}", file=sys.stderr)
+        return 2
+    data_config = config["data"]
+    index_dir = (
+        Path(args.index_dir) if args.index_dir else _split_index_dir(data_config)
+    )
+    if not index_dir.is_dir():
+        print(f"Index directory not found: {index_dir}", file=sys.stderr)
+        return 2
+
+    absent = [
+        name for name in BUNDLE_ARTIFACT_NAMES if not (index_dir / name).is_file()
+    ]
+    if absent:
+        print(
+            f"Refusing to seal {index_dir}: it is missing {', '.join(absent)}. "
+            "Sealing would commit a bundle that is already known to be "
+            "incomplete. Rebuild it instead:\n"
+            "    cls-trainer dataset prepare --config <config> "
+            "--train-root <train_all> --test-root <test>",
+            file=sys.stderr,
+        )
+        return 2
+
+    # A pre-existing bundle_id inside audit.json/split_summary.json would
+    # disagree with the new manifest and read as a mixed generation, so restamp
+    # both to the generation being committed now.
+    from uuid import uuid4
+
+    bundle_id = uuid4().hex
+    for name in ("audit.json", "split_summary.json"):
+        path = index_dir / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(
+                f"Cannot seal {index_dir}: {name} is unreadable: {exc}", file=sys.stderr
+            )
+            return 2
+        if not isinstance(payload, dict):
+            print(
+                f"Cannot seal {index_dir}: {name} is not a JSON object.",
+                file=sys.stderr,
+            )
+            return 2
+        payload["bundle_id"] = bundle_id
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    # The split manifest is not hash-committed here either -- write_split_bundle
+    # leaves it out because resolve_split mutates it before the parquets are
+    # staged, and seal must produce a manifest the same shape or a sealed bundle
+    # and a prepared one would verify under different rules.
+    manifest = write_bundle_manifest(index_dir, bundle_id)
+    try:
+        verify_split_bundle(index_dir)
+    except SplitBundleError as exc:
+        # Sealing then failing verification means the directory changed under
+        # us; surface it rather than reporting a success that does not hold.
+        print(f"Sealed {manifest} but verification failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "index_dir": str(index_dir),
+                "bundle_id": bundle_id,
+                "bundle_manifest": str(manifest),
+                "artifacts": len(BUNDLE_ARTIFACT_NAMES),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 

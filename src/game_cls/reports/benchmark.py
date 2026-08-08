@@ -76,6 +76,178 @@ def canonical_config_sha256(config: dict[str, Any] | None) -> str:
         json.dumps(config or {}, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
 
+
+# ---------------------------------------------------------------------------
+# Challenge bundle fingerprint (audit P0-4).
+# ---------------------------------------------------------------------------
+
+CHALLENGE_FINGERPRINT_VERSION = 2
+
+# Component keys that are per-file SHA-256 digests, in the order they are
+# reported. Used to decide "did any leg resolve at all" and to diff two
+# recorded component sets.
+_CHALLENGE_FILE_LEGS: tuple[str, ...] = (
+    "challenge_index_sha256",
+    "challenge_video_index_sha256",
+    "challenge_packed_index_sha256",
+    "challenge_packed_video_index_sha256",
+    "challenge_metadata_sha256",
+    "packed_manifest_sha256",
+)
+
+
+def challenge_bundle_fingerprint(config: dict[str, Any] | None) -> tuple[str, dict]:
+    """Fingerprint the whole challenge bundle, not just its video index (P0-4).
+
+    The previous definition was ``file_sha256(packed_video_index or
+    video_index)`` -- a single file. That left the release identity blind to
+    changes that provably move the gated numbers: editing the metadata sidecar
+    changes ``worst_subtype_fpr`` while the video index stays byte-identical,
+    and PNGs can be replaced in place as long as the index is not regenerated.
+
+    Returns ``(digest, components)``. ``components`` is recorded alongside the
+    digest so a mismatch can name the leg that moved instead of leaving an
+    operator to compare two opaque hashes.
+
+    Paths are read off ``config["data"]`` here rather than passed in, because
+    the writer (``benchmark evaluate``) and the reader (``release check``)
+    compare these digests for equality. An inlined copy on either side would
+    silently drift and turn every comparison into an unconditional failure --
+    the same failure mode ``canonical_config_sha256`` documents.
+
+    ``packed_manifest.json`` is hashed rather than the shards themselves: the
+    manifest already carries a ``shard_sha256`` map, so every shard's bytes are
+    transitively pinned without re-reading gigabytes of shard data.
+
+    Pixel content is covered transitively too. The challenge frame index
+    carries a per-frame ``content_sha256``, so hashing the index file detects an
+    edited PNG -- but only for a bundle built with content hashing enabled.
+    ``components["covers_content"]`` records whether that held rather than
+    assuming it, so a bundle indexed without content hashes is visibly weaker
+    instead of quietly weaker.
+
+    When no leg resolves at all the digest is ``""``, which keeps the existing
+    fail-closed behaviour in ``release check``: an identity this side cannot
+    recompute is refused rather than implicitly accepted.
+    """
+    config = config or {}
+    data_cfg = config.get("data") or {}
+
+    def _hash(key: str) -> str:
+        path = data_cfg.get(key)
+        return file_sha256(path) if path else ""
+
+    packed_index = data_cfg.get("challenge_packed_index")
+    packed_manifest = ""
+    if packed_index:
+        packed_manifest = file_sha256(
+            Path(packed_index).with_name("packed_manifest.json")
+        )
+
+    components: dict[str, Any] = {
+        "fingerprint_version": CHALLENGE_FINGERPRINT_VERSION,
+        "challenge_index_sha256": _hash("challenge_index"),
+        "challenge_video_index_sha256": _hash("challenge_video_index"),
+        "challenge_packed_index_sha256": _hash("challenge_packed_index"),
+        "challenge_packed_video_index_sha256": _hash("challenge_packed_video_index"),
+        "challenge_metadata_sha256": _hash("challenge_metadata"),
+        "packed_manifest_sha256": packed_manifest,
+    }
+
+    # Preprocessing: the same weights on the same frames produce different
+    # metrics under a different image geometry, pair delta or decision
+    # threshold, so these belong to the challenge identity.
+    image_spec: dict[str, Any] = {}
+    try:
+        from game_cls.data.image_spec import ImageSpec
+
+        spec = ImageSpec.from_config(data_cfg)
+        image_spec = {
+            "channels": spec.channels,
+            "height": spec.height,
+            "width": spec.width,
+        }
+    except (KeyError, ValueError, ImportError):
+        # A config without width/height cannot describe a geometry; leaving it
+        # empty is honest and still hashes distinctly from a real spec.
+        image_spec = {}
+    components["image_spec"] = image_spec
+    components["preprocessing"] = {
+        "test_delta": (config.get("pair") or {}).get("test_delta"),
+        "decision_threshold": (config.get("decision") or {}).get("threshold"),
+        "group_by_negative_subtype": (config.get("evaluation") or {}).get(
+            "group_by_negative_subtype"
+        ),
+    }
+
+    # Whether the index's own content hashes back the digest. Derived, so it is
+    # reported but deliberately NOT hashed: it is a property of the recorded
+    # legs, not an independent input.
+    components["covers_content"] = _challenge_covers_content(
+        data_cfg.get("challenge_index")
+    )
+
+    if not any(components[leg] for leg in _CHALLENGE_FILE_LEGS):
+        return "", components
+
+    payload = {key: components[key] for key in components if key != "covers_content"}
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return digest, components
+
+
+def _challenge_covers_content(challenge_index: str | Path | None) -> bool | None:
+    """Whether every frame in the challenge index carries a content hash.
+
+    ``None`` when it cannot be determined (no index configured, absent file, or
+    an unreadable/foreign parquet) -- distinct from ``False``, which is a
+    positive finding that the index was built without content hashing.
+    """
+    if not challenge_index or not Path(challenge_index).is_file():
+        return None
+    try:
+        from game_cls.data.indexing import read_frame_parquet
+        from game_cls.data.splitter import fingerprint_covers_content
+
+        frames = read_frame_parquet(challenge_index)
+    except Exception:
+        # Reading the index is a best-effort diagnostic; it must never be the
+        # reason a benchmark or a release check crashes.
+        return None
+    if not frames:
+        return None
+    return fingerprint_covers_content(frames)
+
+
+def challenge_component_differences(
+    recorded: dict[str, Any] | None, current: dict[str, Any] | None
+) -> list[str]:
+    """Name the challenge-bundle legs that differ between two component sets.
+
+    Turns "two digests differ" into "challenge_metadata_sha256 differs", which
+    is the difference between an operator knowing what to re-run and guessing.
+    """
+    recorded = recorded or {}
+    current = current or {}
+    if not recorded:
+        return []
+    differences: list[str] = []
+    keys = [
+        "fingerprint_version",
+        *_CHALLENGE_FILE_LEGS,
+        "image_spec",
+        "preprocessing",
+    ]
+    for key in keys:
+        if key not in recorded and key not in current:
+            continue
+        was, now = recorded.get(key), current.get(key)
+        if was != now:
+            differences.append(f"{key}: report={was!r} current={now!r}")
+    return differences
+
+
 # ---------------------------------------------------------------------------
 # Gate contract (step6): explicit metric name + comparison operator.
 # ---------------------------------------------------------------------------
@@ -523,6 +695,7 @@ def write_benchmark_report(
     resolved_config_sha256: str = "",
     challenge_dataset_fingerprint: str = "",
     gate_spec_fingerprint: str = "",
+    challenge_bundle_components: dict[str, Any] | None = None,
 ) -> Path:
     """Write ``benchmarks/<run>_<alias>/report.json`` and return its path.
 
@@ -533,6 +706,11 @@ def write_benchmark_report(
     ``checkpoint_sha256`` is the released model's hash, and the config /
     challenge-dataset / gate-spec fingerprints pin the other three legs of the
     release identity tuple.
+
+    ``challenge_bundle_components`` is the per-leg breakdown behind
+    ``challenge_dataset_fingerprint``. It is recorded so a release check that
+    sees a differing digest can name the leg that moved (the sidecar, the frame
+    index, the image geometry) rather than reporting two opaque hashes.
     """
     report_dir = output_dir / f"{run_id or 'run'}_{checkpoint_alias}"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -542,6 +720,7 @@ def write_benchmark_report(
         "checkpoint_sha256": checkpoint_sha256,
         "resolved_config_sha256": resolved_config_sha256,
         "challenge_dataset_fingerprint": challenge_dataset_fingerprint,
+        "challenge_bundle_components": challenge_bundle_components or {},
         "gate_spec_fingerprint": gate_spec_fingerprint,
         "scores": _scores_from_metrics(metrics, gate_metrics),
         "gate_metrics": gate_metrics or {},

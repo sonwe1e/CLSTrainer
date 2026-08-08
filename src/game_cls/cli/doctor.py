@@ -107,6 +107,39 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 f"data.{key}",
                 str(path),
             )
+        # Audit P0-9: existence of every index file does NOT prove they are one
+        # generation -- a bundle whose train came from a new prepare and whose
+        # test was left from an older one passes every check above. The bundle
+        # manifest is the commit record that settles it.
+        #
+        # Scoped to split.mode == "from_train": only that path publishes a
+        # commit record. An index directory built by write_index_bundle is a
+        # different, legitimate shape with no split summary or split manifest,
+        # so it is reported as not-applicable rather than failed.
+        if (data_cfg.get("split") or {}).get("mode") == "from_train":
+            from game_cls.data.indexing import SplitBundleError, verify_split_bundle
+
+            bundle_dir = Path(
+                data_cfg.get("train_index") or "indexes/train_frames.parquet"
+            ).parent
+            try:
+                bundle = verify_split_bundle(bundle_dir)
+                check(
+                    True,
+                    "index bundle generation",
+                    f"bundle_id={(bundle or {}).get('bundle_id', '?')}",
+                )
+            except SplitBundleError as exc:
+                # First line only: the full guidance is long, and doctor prints
+                # one line per check.
+                check(False, "index bundle generation", str(exc).splitlines()[0])
+        else:
+            check(
+                None,
+                "index bundle generation",
+                "data.split.mode is not 'from_train'; no split bundle to verify",
+            )
+
         migration = data_cfg.get("split_migration") or {}
         if migration.get("test_used_as_validation"):
             check(
