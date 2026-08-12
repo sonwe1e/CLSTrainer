@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0
+# CPU-only development/test environment. On Ascend, use your matching torch + torch_npu stack instead.
+torch>=2.2

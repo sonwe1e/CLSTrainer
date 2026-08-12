@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clstrainer-lite"
+version = "0.4.0"
+description = "Small dual-frame binary classification trainer with HCCL DDP"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10.0",
+  "PyYAML>=6.0",
+  "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+cpu = ["torch>=2.2"]
+dev = ["pytest>=8.0", "torch>=2.2"]
+
+[project.scripts]
+clstrainer-lite = "clstrainer_lite.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"

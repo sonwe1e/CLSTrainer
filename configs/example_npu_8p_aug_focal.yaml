@@ -1,0 +1,87 @@
+experiment:
+  name: npu_8p_aug_focal_balanced
+  output_dir: runs
+  seed: 20260728
+
+data:
+  backend: image
+  image:
+    train_root: REPLACE_ME/train
+    test_root: REPLACE_ME/test
+    strict_filenames: true
+  video:
+    train_root: null
+    test_root: null
+    extensions: [".mp4"]
+    chunk_frames: 128
+    cache_chunks: 2
+    ffmpeg_bin: ffmpeg
+    ffprobe_bin: ffprobe
+    ffmpeg_threads: 2
+  val_ratio: 0.10
+  # Delta is sampled online in __getitem__; the dataset index is not expanded 3x.
+  train_delta_range: [1, 3]
+  train_delta_probabilities: [0.15, 0.70, 0.15]
+  eval_delta: 2
+  image_size: [208, 448]
+
+augment:
+  enabled: true
+  horizontal_flip_p: 0.0
+  crop_scale: [0.92, 1.0]
+  brightness: 0.10
+  contrast: 0.10
+  saturation: 0.08
+  gamma: [0.92, 1.08]
+  color_shared: true
+  noise_std: 0.01
+  erase_p: 0.05
+  erase_scale: [0.02, 0.06]
+
+loss:
+  type: focal
+  gamma: 1.5
+  # Replace after running tools/count_class_distribution.py.
+  alpha: [1.0, 1.0]
+
+sampler:
+  enabled: true
+  class_probability: [0.5, 0.5]
+  game_balance_alpha: 0.5
+  samples_per_epoch: null
+
+diagnostics:
+  enabled: true
+  histogram_bins: 20
+
+model:
+  factory: clstrainer_lite.models:build_tiny_model
+  kwargs:
+    channels: 3
+    width: 32
+    num_classes: 2
+  init_weights: null
+
+train:
+  epochs: 10
+  batch_size: 128
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: false
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  min_learning_rate: 0.00001
+  gradient_clip_norm: 5.0
+  decision_threshold: 0.5
+  log_every_steps: 50
+  n_val_step: 2000
+  n_test_step: 5000
+
+runtime:
+  accelerator: npu
+  backend: hccl
+  amp: true
+  amp_dtype: bfloat16
+  find_unused_parameters: true

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build
+build/
+dist/
+*.whl
+
+# Environments
+.venv/
+venv/
+
+# Training artifacts
+runs/
+demo_data/
+dataset_stats/
+
+# Incremental transcode artifacts
+*.partial.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
